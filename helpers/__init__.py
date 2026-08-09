@@ -1,0 +1,1 @@
+"""SkillOpt plugin - shared helpers."""

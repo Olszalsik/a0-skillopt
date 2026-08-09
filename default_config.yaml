@@ -1,0 +1,276 @@
+# SkillOpt plugin - default configuration
+#
+# These are the AUTOMATION defaults. The auto-loop runs in the
+# background as a daemon thread started by the `agent_init`
+# extension. Set these once in the WebUI and forget.
+
+# --- Backend selection ---
+# `auto` picks the first backend whose key is in the env (openai, anthropic, qwen, minimax).
+backend: auto
+
+# =====================================================================
+# AUTOMATION DEFAULTS — the bot learns by itself, you don't have to
+# remember anything. Change these in Settings → Developer → SkillOpt.
+# =====================================================================
+
+# Master kill switch for the background loop. Default ON.
+auto_loop_enabled: true
+
+# How often the loop wakes up to check for new rollouts.
+# 30 minutes is a good default — frequent enough to learn quickly,
+# infrequent enough not to waste API calls.
+auto_loop_interval_sec: 1800
+
+# Minimum number of NEW rollouts that must accumulate before the
+# loop will launch a Sleep cycle. Prevents premature cycles on
+# tiny datasets (SkillOpt needs a few sessions to mine patterns).
+auto_loop_min_rollouts: 10
+
+# Which skill to focus the loop on. Empty = optimize all skills.
+auto_loop_skill_target: ""
+
+# Auto-adopt proposals that pass the validation gate.
+# OFF by default for safety — first run with this OFF, watch the
+# staged proposals in the WebUI, then turn it ON once you trust the output.
+auto_adopt: false
+
+# =====================================================================
+# VALIDATION GATE — last-mile safety check on staged proposals
+# =====================================================================
+
+# Minimum content length (chars) for a staged proposal to be adoptable.
+gate_min_chars: 200
+
+# Maximum allowed shrinkage (0.5 = reject proposals smaller than 50%
+# of the current skill's size). v1.1.0 — added to prevent the LLM
+# from "improving" a skill by silently truncating it.
+gate_max_shrink_ratio: 0.5
+
+# Minimum held-out improvement (percentage points) to accept a
+# proposal. v1.1.0 — now actually wired: the auto-loop parses the
+# Sleep engine's `held-out X -> Y` line and rejects if delta < this.
+# 5pp is a reasonable default; set to 0 to disable (legacy behavior).
+gate_min_improvement_pp: 5.0
+
+# =====================================================================
+# STORAGE
+# =====================================================================
+
+# Cap on how many historical run directories to keep under logs/.
+max_runs_retained: 10
+
+# Where to keep per-cycle critique files (one Markdown file per
+# successful Sleep run; tells the user what changed and why).
+# v1.1.0 — added for transparency. User reviews before auto-adopt.
+critique_dir: "logs/runs/critiques"
+
+# =====================================================================
+# MODEL DEFAULTS — v1.1.0 tuned to match what A0 actually runs
+# =====================================================================
+
+# Optimizer = the strong reasoning model that proposes skill edits.
+# Pick the strongest reasoning model you have wired in production.
+# (Override via SKILLOPT_OPTIMIZER_MODEL env or `.skillopt-env`.)
+optimizer_model: "minimax-m3"
+
+# Target = the cheap model A0 actually runs in production (the one
+# that uses the skill). Held-out replay is run against this model
+# to measure real-world impact.
+target_model: "minimax-m3"
+
+# =====================================================================
+# FAILURE MEMORY (v1.3.0 - Day-4 item 6)
+# =====================================================================
+#
+# Records per-skill failure attributions ("proposal X failed because
+# Y") and injects them into the next outer-loop prompt so the
+# optimizer doesn't re-try something that already failed.
+#
+# Uses A0's existing  vector store by default;
+# falls back to a local JSON file store at
+#  when A0 memory
+# is not importable. The local store is exact-match (not semantic),
+# but is enough to keep the feature working in dev / test runtimes.
+
+# Master kill switch. Default ON. Set to false to make the module a
+# pure no-op: record_failure returns {skipped: True} and the prompt
+# injection is skipped.
+failure_memory_enabled: true
+
+# How many recent failures to inject into the next targeted prompt.
+# Cap this so the prompt does not bloat. Default 5.
+failure_memory_max_items_in_prompt: 5
+
+# Minimum similarity score (0..1) for an entry to be loaded. The A0
+# vector store filters by this. The local JSON store ignores it
+# (no real similarity score; all matches pass through). Default 0.0
+# so anything we recorded is included.
+failure_memory_min_similarity: 0.0
+
+# Failures older than this are pruned on the next cleanup pass.
+# Default 30 days. Set to 0 to disable cleanup entirely.
+failure_memory_max_age_days: 30
+
+# Cap on how many failures to keep per skill in the local store. The
+# A0 store is unbounded; this only affects the local JSON fallback.
+# Default 100.
+failure_memory_max_per_skill: 100
+
+# =====================================================================
+# REWARD MODEL (v1.2.0 — Day-3, item 3)
+# =====================================================================
+# The harvester calls a 3-class DistilBERT classifier after the
+# v1.1.0 heuristic. The classifier lives under models/reward_model/
+# by default; the training script (scripts/train_reward_model.py)
+# writes it there. Until the model exists, the harvester falls back
+# to the v1.1.0 heuristic (logged + surfaced on the dashboard).
+#
+# Override the on-disk model location with SKILLOPT_REWARD_MODEL_DIR.
+#
+# Confidence threshold above which the harvester prefers the model
+# output over the v1.1.0 heuristic. 0.6 is the v1.2.0 default and
+# will be re-calibrated once 5K labelled rollouts exist.
+reward_model_path: "models/reward_model"
+reward_model_prefer_above: 0.6
+
+# =====================================================================
+# A/B HARNESS (v1.2.0 — Day-3, item 2)
+# =====================================================================
+# The harness runs a paired statistical test on the agent's own
+# past rollouts before the Sleep engine's held-out score. If the
+# harness can't run (no rollouts, no judge) it falls through to
+# the existing structural gate. If the harness DOES run and the
+# proposed skill loses the A/B test, the gate rejects.
+#
+# ab_harness_n        : max rollouts to load for the paired test
+# ab_harness_min_n    : below this count the harness skips (can_run=False)
+# ab_harness_min_lift_pp : B must beat A by at least this many pp
+# ab_harness_min_confidence : judge mean confidence must be >= this
+# ab_harness_enabled  : set false to disable the harness (debug only)
+# judge_model         : model id used for the LLM judge (default target_model)
+# judge_endpoint      : HTTP URL of the judge (set SKILLOPT_JUDGE_ENDPOINT env var)
+ab_harness_n: 30
+ab_harness_min_n: 6
+ab_harness_min_lift_pp: 5.0
+ab_harness_min_confidence: 0.6
+ab_harness_enabled: true
+judge_model: "minimax-m3"
+
+# =====================================================================
+# LEGACY / v1 FIELDS (kept for backwards compat)
+# =====================================================================
+
+# =====================================================================
+# FRAGMENT STORE (v1.2.0 — Day-3, item 3)
+# =====================================================================
+# The fragment store lets a SKILL.md be authored as a set of named,
+# addressed spans (declared in a YAML frontmatter block) so we can
+# attribute per-fragment lift to per-fragment rollouts and roll back
+# the individual paragraph that caused a regression.
+#
+# fragment_snapshot_dir   : where per-fragment version snapshots live
+#                            (relative to the plugin root)
+# fragment_max_history_per_id : per-fragment snapshot cap (oldest dropped)
+# fragment_per_fragment_gate : when true, validate_proposal() runs its
+#                            structural checks PER FRAGMENT (additive to
+#                            the whole-file gate). When false, the
+#                            fragment store is read-only metadata; the
+#                            gate uses the whole-file check unchanged.
+fragment_snapshot_dir: "fragments"
+fragment_max_history_per_id: 10
+fragment_per_fragment_gate: true
+
+# =====================================================================
+# INNER LOOP (v1.3.0 — Day-4, item 4)
+# =====================================================================
+# A second, faster background thread that produces per-rollout
+# suggestions (one sentence each) instead of full skill rewrites.
+# The auto-loop (above) reads these suggestions at the start of
+# each cycle and feeds the LLM a targeted "minimal edit" prompt
+# instead of the generic "rewrite the whole skill" prompt.
+#
+# inner_loop_enabled                  : master kill switch (default ON)
+# inner_loop_interval_seconds         : how often to scan for new rollouts
+# inner_loop_max_suggestion_age_seconds : drain threshold (default 7 days)
+# inner_loop_min_rollout_confidence   : only suggest on rollouts the
+#                                       reward model is somewhat
+#                                       confident about (>= this)
+# inner_loop_llm_model                : model used for the tiny LLM call
+#                                       (defaults to target_model)
+inner_loop_enabled: true
+inner_loop_interval_seconds: 60
+inner_loop_max_suggestion_age_seconds: 604800
+inner_loop_min_rollout_confidence: 0.4
+inner_loop_llm_model: ""
+
+sleep_schedule: "02:00"
+skill_target: "all"
+log_level: INFO
+
+
+# ----------------------------------------------------------------------- #
+# Cadence (Day-4 item 5)
+# ----------------------------------------------------------------------- #
+cadence:
+  enabled: true
+  target_rollouts: 20
+  floor_seconds: 60
+  ceiling_seconds: 3600
+
+# ----------------------------------------------------------------------- #
+# Budget (Day-4 item 5)
+# ----------------------------------------------------------------------- #
+budget:
+  enabled: true
+  daily_cap_cents: 100
+  cost_per_call_cents: 1
+  reset_hour_utc: 0
+
+# ----------------------------------------------------------------------- #
+# Cycle history (Day-5 item 7)
+# ----------------------------------------------------------------------- #
+# Every Sleep cycle writes one JSON line to logs/runs/cycle_history.jsonl
+# (`cycle_history.record_cycle_entry()`), plus one row to the companion
+# cycle_history.log so the file size stays human-readable. This block
+# controls the on-disk history. The per-cycle dashboard mount reads it
+# via /api/plugins/skillopt/cycles and /audit_log.
+#
+# cycle_history_enabled         : master kill switch (default ON)
+# cycle_history_max_entries     : cap on entries kept in the JSONL file
+#                                 (older entries would be moved to a cold
+#                                 file by a future compaction job)
+# cycle_history_min_outcome     : filter on what is written to the
+#                                 dashboard's per-cycle companion log
+#                                 (values: all | adopted | rejected)
+# cycle_history_include_skipped : when false, don't append "skipped"
+#                                 cycles (no staged proposals etc.)
+cycle_history_enabled: true
+cycle_history_max_entries: 500
+cycle_history_min_outcome: "all"
+cycle_history_include_skipped: true
+
+# ----------------------------------------------------------------------- #
+# Governance (Day-5 item 8)
+# ----------------------------------------------------------------------- #
+# Per-skill policies + opt-out. The auto-loop calls
+# `governance.check_skill_eligible(skill_name)` at the start of each
+# per-skill cycle. If ineligible, the cycle is skipped with the
+# reason written to logs/runs/governance.log and surfaced on the
+# dashboard's new `governance` block.
+#
+# Modes:
+#   opt_out    : SAFEST default - no auto-loop unless the skill has
+#                usr/skills/<name>/.skillopt.optin present
+#   opt_in     : requires the per-skill .skillopt.optin marker
+#   rate_limited : always allowed, but respect min_interval_seconds + daily_budget_cents
+#   immutable  : never allow the auto-loop to touch this skill
+#
+# Per-skill override: usr/skills/<name>/.skillopt.policy.json
+# Per-skill opt-out marker: usr/skills/<name>/.skillopt.optout
+# Per-skill opt-in marker: usr/skills/<name>/.skillopt.optin
+governance:
+  default_policy:
+    mode: opt_out
+    min_interval_seconds: 3600
+    daily_budget_cents: 100
+    require_human_approval: false

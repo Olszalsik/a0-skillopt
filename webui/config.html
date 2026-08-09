@@ -1,0 +1,259 @@
+<html>
+<head>
+  <title>SkillOpt Settings</title>
+  <script type="module">
+    // Do NOT import the global store — it triggers MisformatGuardDashboard
+    // dependencies in the host dashboard. We use plain fetch instead.
+  </script>
+  <style>
+    .so-card { background: rgba(0,0,0,0.2); padding: 12px; border-radius: 6px; margin-bottom: 12px; border: 1px solid rgba(255,255,255,0.08); }
+    .so-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+    .so-row label { display: block; font-size: 12px; margin-bottom: 4px; }
+    .so-row input, .so-row select { padding: 4px 8px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.3); color: inherit; font-size: 12px; }
+    .so-btn { padding: 6px 12px; border-radius: 4px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.25); color: inherit; cursor: pointer; font-size: 12px; }
+    .so-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .so-btn-primary { border-color: rgba(120,200,120,0.4); background: rgba(40,120,40,0.2); }
+    .so-msg { display: block; margin-top: 8px; opacity: 0.8; font-size: 11px; word-break: break-all; }
+    .so-on { color: #6c6; }
+    .so-err { color: #c66; }
+    .so-stat { display: flex; gap: 12px; font-size: 12px; opacity: 0.9; line-height: 1.7; flex-wrap: wrap; }
+    .so-stat > div { min-width: 140px; }
+    h3 { margin: 0 0 8px 0; }
+    h4 { margin: 12px 0 6px 0; }
+    .so-green { background: rgba(40,120,40,0.12); padding: 12px; border-radius: 6px; border: 1px solid rgba(120,200,120,0.25); }
+  </style>
+</head>
+<body>
+<div id="skillopt-root" x-data="skilloptSettings()" x-init="init()">
+
+  <h3>SkillOpt Self-Evolution Engine</h3>
+  <p style="opacity: 0.7; font-size: 12px; margin: 0 0 12px 0;">
+    The bot learns from every task you run and improves its own skills in the background. Toggle the settings below and click Save — your values are written to disk and applied immediately.
+  </p>
+
+  <!-- AUTOMATION -->
+  <div class="so-card so-green">
+    <h4>
+      <span x-text="cfg.auto_loop_enabled ? '🟢' : '🔴'"></span>
+      Auto-loop
+      <small style="opacity: 0.6; font-weight: normal;">— background daemon, no manual steps needed</small>
+    </h4>
+    <label style="display: block; margin: 4px 0;">
+      <input type="checkbox" x-model="cfg.auto_loop_enabled" />
+      <strong>Run the auto-loop in the background</strong>
+    </label>
+    <small style="opacity: 0.8;">When ON, the plugin periodically harvests rollouts, runs a direct optimizer cycle, and (if auto-adopt is also ON) promotes improvements that pass the validation gate.</small>
+
+    <div class="so-row" style="margin-top: 8px;">
+      <div style="flex: 1; min-width: 180px;">
+        <label>Loop interval (sec)</label>
+        <input type="number" min="60" step="60" x-model.number="cfg.auto_loop_interval_sec" style="width: 100%;" />
+      </div>
+      <div style="flex: 1; min-width: 180px;">
+        <label>Min new rollouts per cycle</label>
+        <input type="number" min="1" step="1" x-model.number="cfg.auto_loop_min_rollouts" style="width: 100%;" />
+      </div>
+    </div>
+
+    <div style="margin-top: 8px;">
+      <label>Skill to focus on (blank = all)</label>
+      <input type="text" x-model="cfg.auto_loop_skill_target" placeholder="e.g. code-review" style="width: 100%;" />
+    </div>
+
+    <label style="display: block; margin: 8px 0 0 0;">
+      <input type="checkbox" x-model="cfg.auto_adopt" />
+      <strong>Auto-adopt proposals that pass the gate</strong>
+    </label>
+    <small style="opacity: 0.8;">OFF by default for safety. First run with this OFF, watch the staged proposals, then turn it ON.</small>
+  </div>
+
+  <!-- LOOP STATUS -->
+  <div class="so-card">
+    <h4>Loop status</h4>
+    <div class="so-stat">
+      <div>Running: <strong x-text="loopState.running ? '🟢 yes' : '⚪ idle'"></strong></div>
+      <div>Cycles: <strong x-text="loopState.cycles_run ?? 0"></strong></div>
+      <div>Adopted: <strong x-text="loopState.proposals_adopted ?? 0"></strong></div>
+      <div>Rejected: <strong x-text="loopState.proposals_rejected ?? 0"></strong></div>
+      <div>Rollouts: <strong x-text="rollouts"></strong></div>
+      <div>Staged: <strong x-text="staged"></strong></div>
+    </div>
+  </div>
+
+  <!-- MANUAL TRIGGERS -->
+  <div class="so-card">
+    <h4>Manual triggers</h4>
+    <small style="opacity: 0.7;">You don't need these if auto-loop is ON.</small>
+    <div class="so-row" style="margin-top: 8px;">
+      <button type="button" class="so-btn" :disabled="busy" @click="runSleep('dry-run')">Dry-run</button>
+      <button type="button" class="so-btn" :disabled="busy" @click="runSleep('run')">Run</button>
+      <button type="button" class="so-btn so-btn-primary" :disabled="busy || !staged" @click="adopt()">Adopt latest</button>
+      <button type="button" class="so-btn" :disabled="busy" @click="refresh()">Refresh</button>
+    </div>
+    <small x-show="lastMsg" x-text="lastMsg" class="so-msg" :class="{ 'so-err': !!lastErr, 'so-on': !lastErr && lastOk }"></small>
+  </div>
+
+  <!-- BACKEND -->
+  <div class="so-card">
+    <h4>Backend</h4>
+    <label>SkillOpt LLM backend</label>
+    <select x-model="cfg.backend" style="width: 100%;">
+      <option value="auto">auto (use A0 chat-LLM credentials)</option>
+      <option value="openai_compatible">OpenAI-compatible</option>
+      <option value="azure_openai">Azure OpenAI</option>
+      <option value="claude">Anthropic Claude</option>
+      <option value="qwen">Local Qwen (vLLM)</option>
+      <option value="minimax">MiniMax</option>
+    </select>
+    <small style="opacity: 0.8;">The optimizer LLM is separate from the agent's chat LLM. Set AZURE_OPENAI_API_KEY / ANTHROPIC_API_KEY in your env, or run the <code>skillopt_setup</code> tool once to auto-translate A0's existing env vars.</small>
+  </div>
+
+  <!-- SAVE -->
+  <div class="so-card">
+    <div class="so-row">
+      <button type="button" class="so-btn so-btn-primary" :disabled="busy" @click="save()">Save settings</button>
+      <button type="button" class="so-btn" :disabled="busy" @click="refresh()">Refresh</button>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// Self-contained Alpine.js component. Does NOT depend on the host
+// dashboard's MisformatGuardDashboard or any global store — that
+// dependency was the cause of the "MisformatGuardDashboard not loaded"
+// error on Save.
+function skilloptSettings() {
+  return {
+    busy: false,
+    lastMsg: '',
+    lastOk: false,
+    lastErr: false,
+    cfg: {
+      auto_loop_enabled: true,
+      auto_loop_interval_sec: 1800,
+      auto_loop_min_rollouts: 10,
+      auto_loop_skill_target: '',
+      auto_adopt: false,
+      backend: 'auto',
+    },
+    skills: [],
+    rollouts: 0,
+    staged: 0,
+    loopState: {},
+
+    async init() {
+      await this.refresh();
+    },
+
+    async api(path, opts) {
+      opts = opts || {};
+      opts.method = opts.method || 'POST';
+      opts.headers = Object.assign({ 'content-type': 'application/json' }, opts.headers || {});
+      if (opts.body && typeof opts.body !== 'string') {
+        opts.body = JSON.stringify(opts.body);
+      }
+      const r = await fetch('/api/plugins/skillopt' + path, opts);
+      const txt = await r.text();
+      try { return JSON.parse(txt); } catch (e) { return { ok: false, error: 'bad json', raw: txt }; }
+    },
+
+    setMsg(msg, ok) {
+      this.lastMsg = msg;
+      this.lastOk = !!ok;
+      this.lastErr = !ok;
+    },
+
+    async refresh() {
+      this.busy = true;
+      try {
+        const s = await this.api('/status');
+        this.skills = (s && s.skills_available) || [];
+        this.rollouts = (s && s.rollout_count) || 0;
+        this.staged = (s && s.staged_proposals) ? s.staged_proposals.length : 0;
+      } catch (e) { this.setMsg('status: ' + e, false); }
+      try {
+        const c = await this.api('/config');
+        if (c && c.ok && c.config) {
+          for (const k of Object.keys(c.config)) {
+            if (k in this.cfg) this.cfg[k] = c.config[k];
+          }
+        }
+      } catch (e) { this.setMsg('config: ' + e, false); }
+      try {
+        const l = await this.api('/loop');
+        if (l && l.loop) this.loopState = l.loop || {};
+      } catch (e) { /* loop endpoint may not be wired */ }
+      this.busy = false;
+    },
+
+    async save() {
+      this.busy = true;
+      this.setMsg('saving...', true);
+      try {
+        // Send only the keys the user can change in the UI
+        const payload = {
+          auto_loop_enabled: this.cfg.auto_loop_enabled,
+          auto_loop_interval_sec: this.cfg.auto_loop_interval_sec,
+          auto_loop_min_rollouts: this.cfg.auto_loop_min_rollouts,
+          auto_loop_skill_target: this.cfg.auto_loop_skill_target,
+          auto_adopt: this.cfg.auto_adopt,
+          backend: this.cfg.backend,
+        };
+        const r = await this.api('/config', { body: payload });
+        if (r && r.ok) {
+          // Pull the persisted values back so the UI reflects them
+          if (r.config) {
+            for (const k of Object.keys(r.config)) {
+              if (k in this.cfg) this.cfg[k] = r.config[k];
+            }
+          }
+          this.setMsg('saved: ' + JSON.stringify(r.updated || Object.keys(payload)), true);
+        } else {
+          this.setMsg('save failed: ' + ((r && r.error) || 'unknown'), false);
+        }
+      } catch (e) {
+        this.setMsg('save: ' + e, false);
+      }
+      this.busy = false;
+    },
+
+    async runSleep(verb) {
+      this.busy = true;
+      this.setMsg('launching ' + verb + '...', true);
+      try {
+        const r = await this.api('/sleep', { body: { verb } });
+        if (r && r.ok !== false) {
+          this.setMsg('sleep: pid=' + r.pid + ' log=' + r.log_path, true);
+        } else {
+          this.setMsg('sleep: ' + ((r && r.error) || 'unknown'), false);
+        }
+      } catch (e) { this.setMsg('sleep: ' + e, false); }
+      this.busy = false;
+      await this.refresh();
+    },
+
+    async adopt() {
+      this.busy = true;
+      this.setMsg('adopting...', true);
+      try {
+        const r = await this.api('/adopt');
+        if (r && r.ok) {
+          this.setMsg('adopted: ' + r.skill, true);
+        } else {
+          this.setMsg('adopt: ' + ((r && r.error) || 'unknown'), false);
+        }
+      } catch (e) { this.setMsg('adopt: ' + e, false); }
+      this.busy = false;
+      await this.refresh();
+    },
+
+    formatTime(ts) {
+      if (!ts) return 'never';
+      try { return new Date(ts * 1000).toLocaleString(); } catch (e) { return '—'; }
+    },
+  };
+}
+</script>
+</body>
+</html>
