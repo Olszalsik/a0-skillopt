@@ -294,7 +294,10 @@ def t_v110_heuristic() -> None:
         ("Task complete. Here is the result.", "success"),
     ]
     for text, expected in cases:
-        got = mod._heuristic_outcome([], text)
+        # v1.7.0: _heuristic_outcome is now (last_response) only — the old
+        # (messages, last_response) form passed messages=[] (the bug this
+        # version fixes), so the arg was always unused and removed.
+        got = mod._heuristic_outcome(text)
         assert got == expected, f"harvester heuristic: {text[:40]!r} -> {got!r}, want {expected!r}"
         # The reward-model copy must agree (so fallback is identical to v1.1.0)
         from helpers.reward_model import _heuristic_outcome as rm_heur
@@ -3222,6 +3225,239 @@ def t_v161_docstring_verified() -> None:
     assert "--target-skill-path" in src
 
 
+# ======================================================================= #
+# v1.7.0 — Solution C, Phase C1: ground-truth skill attribution
+# (fixes the broken-harvester bug: loop_data.messages never existed)
+# ======================================================================= #
+
+_section_v170_c1 = "v1.7.0 NEW (C1): ground-truth skill attribution + broken-harvester fix"
+
+
+def _load_harvester_module():
+    """Load the harvester extension as a fresh module (importlib) and return it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "harvester_c1",
+        PLUGIN_ROOT / "extensions" / "python" / "monologue_end" / "_60_skillopt_harvest_rollout.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)  # type: ignore
+    return mod
+
+
+def _install_fake_skills(mod_skills):
+    """Inject a fake `helpers.skills` (A0 repo-root helper, not on test path)
+    so the harvester's `from helpers import skills` resolves. Returns the
+    prior sys.modules entry (or None) for restoration."""
+    import types
+    # Ensure the plugin's `helpers` package is loaded so attribute set works.
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import helpers as helpers_pkg  # type: ignore
+    prev = sys.modules.get("helpers.skills")
+    sys.modules["helpers.skills"] = mod_skills
+    helpers_pkg.skills = mod_skills  # type: ignore[attr-defined]
+    return prev
+
+
+def _restore_skills(prev):
+    sys.modules.pop("helpers.skills", None)
+    if prev is not None:
+        sys.modules["helpers.skills"] = prev
+    import helpers as helpers_pkg  # type: ignore
+    if hasattr(helpers_pkg, "skills"):
+        try:
+            del helpers_pkg.skills  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
+
+
+def _fake_skills_module(*, instruction_names=None, loaded_names=None):
+    """Build a fake helpers.skills module.
+
+    instruction_names: list of names the per-message skill_instruction_name
+      should return, one per call (cycled). If None, the real-shape matcher
+      below is used (reads msg["content"]["skill_instructions"]).
+    loaded_names: list returned by get_loaded_skill_names(agent).
+    """
+    import types
+    mod = types.ModuleType("helpers.skills")
+
+    def skill_instruction_name(message):
+        if instruction_names is not None:
+            # cycle through the provided list per call
+            name = instruction_names.pop(0) if instruction_names else ""
+            return name
+        # real-shape matcher (mirrors helpers.skills.skill_instruction_name)
+        try:
+            content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+            if isinstance(content, dict):
+                si = content.get("skill_instructions")
+                if isinstance(si, dict) and si.get("content_included"):
+                    return str(si.get("name") or "").strip()
+        except Exception:
+            pass
+        return ""
+
+    def get_loaded_skill_names(agent):
+        return list(loaded_names or [])
+
+    mod.skill_instruction_name = skill_instruction_name
+    mod.get_loaded_skill_names = get_loaded_skill_names
+    return mod
+
+
+def _fake_sleep_runner(captured):
+    """A fake sleep_runner module exposing write_rollout (captures the record)
+    + a0_skills_dir (tmp path, unused when fragment_store import fails)."""
+    import types, tempfile
+    from pathlib import Path
+    mod = types.ModuleType("sleep_runner_fake")
+
+    def write_rollout(record):
+        captured.append(record)
+        return Path(record["id"] + ".json")
+
+    def a0_skills_dir():
+        return Path(tempfile.gettempdir())
+
+    mod.write_rollout = write_rollout
+    mod.a0_skills_dir = a0_skills_dir
+    return mod
+
+
+@test("v1.7.0 C1: harvester reads loop_data.history_output (not nonexistent .messages)")
+def t_c1_harvest_uses_history_output_not_messages() -> None:
+    """The v1.1.0 bug: the harvester read loop_data.messages, which does NOT
+    exist on Agent Zero's LoopData, so messages=[] and it early-returned on
+    every turn (zero rollouts written). With history_output present and NO
+    messages attribute at all, the fixed harvester must still write a rollout."""
+    mod = _load_harvester_module()
+    captured = []
+    mod._sleep_runner = _fake_sleep_runner(captured)
+    prev = _install_fake_skills(_fake_skills_module(loaded_names=["agent-browser"]))
+    try:
+        import types
+        # user_message is a framework Message-like object with .content
+        user_message = types.SimpleNamespace(content="Refactor the parser to handle nested groups.")
+        history_output = [
+            {"ai": True, "content": "Done. Tests pass."},
+        ]
+        loop_data = types.SimpleNamespace(
+            history_output=history_output,
+            user_message=user_message,
+            last_response="Done. Tests pass.",
+            start_time=time.time(),
+        )
+        agent = types.SimpleNamespace(loop_data=loop_data, config=types.SimpleNamespace(chat_model="smoke"))
+        mod.execute(agent, loop_data=loop_data)
+        assert len(captured) == 1, f"expected one rollout written, got {len(captured)}: {captured}"
+        rec = captured[0]
+        assert rec["task"] == "Refactor the parser to handle nested groups.", rec
+        # history_output had no skill-instructions message; loaded_names has
+        # agent-browser -> skill_used falls back to the session ledger.
+        assert rec["skill_used"] == "agent-browser", rec
+        assert rec["task_type"] == "agent-browser", rec
+        assert rec["outcome"] == "success", rec
+        assert rec["last_response"] == "Done. Tests pass.", rec
+    finally:
+        _restore_skills(prev)
+
+
+@test("v1.7.0 C1: skill_instruction_name per-turn match wins over session ledger")
+def t_c1_harvest_skill_instruction_name_fallback() -> None:
+    """When a history_output message carries skill_instructions with
+    content_included=True (a skill whose content was injected THIS turn),
+    the per-turn match is preferred over the session-level ledger. This is
+    the exact signal tools/skills_tool.py:_visible_skill_loaded reads."""
+    mod = _load_harvester_module()
+    captured = []
+    mod._sleep_runner = _fake_sleep_runner(captured)
+    # Session ledger says "old-skill"; the per-turn message says "coding-fast".
+    prev = _install_fake_skills(_fake_skills_module(loaded_names=["old-skill"]))
+    try:
+        import types
+        user_message = types.SimpleNamespace(content="Write a unit test for the parser.")
+        history_output = [
+            # An earlier turn loaded a different skill (content_included=True).
+            {"ai": False, "content": {"skill_instructions": {"name": "earlier-skill", "content_included": True}}},
+            # This turn loaded coding-fast.
+            {"ai": False, "content": {"skill_instructions": {"name": "coding-fast", "content_included": True}}},
+            {"ai": True, "content": "Done. Wrote 3 tests."},
+        ]
+        loop_data = types.SimpleNamespace(
+            history_output=history_output,
+            user_message=user_message,
+            last_response="Done. Wrote 3 tests.",
+            start_time=time.time(),
+        )
+        agent = types.SimpleNamespace(loop_data=loop_data, config=types.SimpleNamespace(chat_model="smoke"))
+        mod.execute(agent, loop_data=loop_data)
+        assert len(captured) == 1, captured
+        rec = captured[0]
+        # The LAST content_included=True match wins (coding-fast), not the
+        # session ledger (old-skill).
+        assert rec["skill_used"] == "coding-fast", rec
+        assert rec["task_type"] == "coding-fast", rec
+    finally:
+        _restore_skills(prev)
+
+
+@test("v1.7.0 C1: SKILLOPT_REPLAY_MODE skips harvest (recursion guard)")
+def t_c1_harvest_replay_mode_skips() -> None:
+    """When the local replay harness (C2) sets SKILLOPT_REPLAY_MODE, the
+    replayed agent's own monologue_end must NOT write a synthetic rollout."""
+    mod = _load_harvester_module()
+    captured = []
+    mod._sleep_runner = _fake_sleep_runner(captured)
+    prev = _install_fake_skills(_fake_skills_module(loaded_names=["x"]))
+    old = os.environ.get("SKILLOPT_REPLAY_MODE")
+    os.environ["SKILLOPT_REPLAY_MODE"] = "1"
+    try:
+        import types
+        loop_data = types.SimpleNamespace(
+            history_output=[{"ai": True, "content": "synthetic"}],
+            user_message=types.SimpleNamespace(content="replay task"),
+            last_response="synthetic",
+            start_time=time.time(),
+        )
+        agent = types.SimpleNamespace(loop_data=loop_data, config=types.SimpleNamespace(chat_model="smoke"))
+        mod.execute(agent, loop_data=loop_data)
+        assert captured == [], f"replay-mode must skip write_rollout, got {captured}"
+    finally:
+        if old is None:
+            os.environ.pop("SKILLOPT_REPLAY_MODE", None)
+        else:
+            os.environ["SKILLOPT_REPLAY_MODE"] = old
+        _restore_skills(prev)
+
+
+@test("v1.7.0 C1: no skill at all falls back to task_type='general'")
+def t_c1_harvest_no_skill_falls_back_to_general() -> None:
+    """A chat turn with no skill loaded (no skill_instructions message, empty
+    session ledger) still writes a rollout with skill_used='' and
+    task_type='general' — the dataset keeps unspecialised turns too."""
+    mod = _load_harvester_module()
+    captured = []
+    mod._sleep_runner = _fake_sleep_runner(captured)
+    prev = _install_fake_skills(_fake_skills_module(loaded_names=[]))
+    try:
+        import types
+        loop_data = types.SimpleNamespace(
+            history_output=[{"ai": True, "content": "Hello there."}],
+            user_message=types.SimpleNamespace(content="Just chatting."),
+            last_response="Hello there.",
+            start_time=time.time(),
+        )
+        agent = types.SimpleNamespace(loop_data=loop_data, config=types.SimpleNamespace(chat_model="smoke"))
+        mod.execute(agent, loop_data=loop_data)
+        assert len(captured) == 1, captured
+        rec = captured[0]
+        assert rec["skill_used"] == "", rec
+        assert rec["task_type"] == "general", rec
+    finally:
+        _restore_skills(prev)
+
+
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
     print(_section_v110)
@@ -3229,4 +3465,5 @@ if __name__ == "__main__":
     print(_section_v121)
     print(_section_v160)
     print(_section_v161)
+    print(_section_v170_c1)
     sys.exit(main())

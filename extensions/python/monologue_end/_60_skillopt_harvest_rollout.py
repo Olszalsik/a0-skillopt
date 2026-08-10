@@ -8,16 +8,35 @@ persists a small JSON record of the completed task into the
 plugin's logs/rollouts/ directory, so the Sleep engine's `harvest`
 verb has something to read.
 
+v1.7.0 (Solution C, Phase C1) — ground-truth attribution + bug fix.
+The v1.1.0 harvester read `loop_data.messages`, which does NOT exist
+on Agent Zero's `LoopData` (the real attributes are `user_message`,
+`history_output`, `last_response`). Because the framework dispatches
+`monologue_end` as `(agent, loop_data=...)` — with NO `messages`
+kwarg — `messages` was always `[]`, so this hook early-returned on
+every turn and **zero rollouts were ever written**. The fix reads
+`loop_data.history_output` (a `list[OutputMessage]`) and attributes
+the active skill authoritatively from A0's `loaded_skills` ledger
+(`helpers.skills.get_loaded_skill_names`) and the per-message skill
+signal (`helpers.skills.skill_instruction_name`) — the same source
+`tools/skills_tool.py:_visible_skill_loaded` already uses — instead
+of a regex on the user prompt.
+
 What we record (the minimum SkillOpt needs to mine patterns):
 - id            — uuid4 hex
 - ts            — epoch seconds
 - task          — the user's original message
-- task_type     — best-effort skill hint (from the prompt + tools used)
-- skill_used    — first skill explicitly named in the prompt, or empty
+- task_type     — the authoritative skill name, or "general"
+- skill_used    — authoritative skill active in THIS turn, or empty
 - outcome       — 'success' | 'partial' | 'failure' (heuristic)
 - trajectory    — list of tool/response steps (truncated for size)
 - model         — model name from the agent
 - duration_s    — wall-clock seconds the monologue took
+
+Recursion guard: when `SKILLOPT_REPLAY_MODE` is set (by the local
+replay harness's real executor — Phase C2), this hook returns
+immediately so a replayed agent's own monologue_end does not pollute
+the training set with synthetic rollouts.
 
 Idempotency: we never write a duplicate id; if the same chat ends
 twice (retries), the second write is a no-op.
@@ -27,7 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
-import re
+import os
 import time
 import uuid
 from pathlib import Path
@@ -54,8 +73,61 @@ def _sr():
     return _sleep_runner or None
 
 
-def _heuristic_outcome(messages: list, last_response: str) -> str:
-    """Best-effort outcome classification from the conversation.
+def _flatten_content(content: Any) -> str:
+    """Flatten an Agent Zero `MessageContent` (str | list | dict | RawMessage)
+    to a single text string. Handles the shapes carried by
+    `loop_data.history_output` entries and `loop_data.user_message.content`.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            s = _flatten_content(item)
+            if s:
+                parts.append(s)
+        return " ".join(parts)
+    if isinstance(content, dict):
+        # RawMessage shape: {"raw_content": ..., "preview": ...}
+        if "raw_content" in content:
+            return _flatten_content(content.get("raw_content"))
+        # A skill-instructions / tool-result content dict: prefer the
+        # text-ish fields, skip nested skill_instructions metadata.
+        for key in ("text", "content", "tool_result", "message", "preview"):
+            if key in content and isinstance(content[key], (str, list, dict)):
+                s = _flatten_content(content[key])
+                if s:
+                    return s
+        return ""
+    return str(content)
+
+
+def _output_text(output_msg: Any) -> str:
+    """Extract the human/ai text of a single `OutputMessage` (dict-like)."""
+    if output_msg is None:
+        return ""
+    # OutputMessage is a TypedDict (a dict at runtime); a framework
+    # Message object also exposes `.content`. Handle both.
+    content = None
+    if isinstance(output_msg, dict):
+        content = output_msg.get("content")
+    else:
+        content = getattr(output_msg, "content", None)
+    return _flatten_content(content)
+
+
+def _output_ai(output_msg: Any) -> bool:
+    if output_msg is None:
+        return False
+    if isinstance(output_msg, dict):
+        return bool(output_msg.get("ai", False))
+    return bool(getattr(output_msg, "ai", False))
+
+
+def _heuristic_outcome(last_response: str) -> str:
+    """Best-effort outcome classification from the final assistant response.
 
     Order of checks (each can return early):
     1. Empty -> failure
@@ -68,10 +140,14 @@ def _heuristic_outcome(messages: list, last_response: str) -> str:
     5. Default -> success (a chat turn that produced any non-trivial
        response is a success for learning purposes; we'll let the
        reward model downgrade it later if needed).
+
+    v1.7.0: signature is `(last_response)` only — the v1.1.0 `(messages,
+    last_response)` form passed `messages=[]` (the bug this file fixes),
+    so the arg was always unused.
     """
     if not last_response:
         return "failure"
-    text = (last_response or "").lower()
+    text = last_response.lower()
     # Hard failure: explicit traceback / fatal / unhandled exception
     if any(kw in text for kw in (
         "traceback (most recent call last)",
@@ -95,33 +171,48 @@ def _heuristic_outcome(messages: list, last_response: str) -> str:
     return "success"
 
 
-def _extract_skill_hint(user_text: str) -> str:
-    """If the user's prompt explicitly names a skill, return its name.
+def _authoritative_skill_used(agent: Any, history_output: list) -> str:
+    """Return the skill active in THIS monologue, from authoritative sources.
 
-    Order of patterns (first match wins):
-    1. Inline `skill: <name>` / `skill # <name>`.
-    2. `the X skill` / `X skill`.
-    3. Hyphenated token with 2+ hyphens (e.g. trading-veto-gate-system) —
-       normal English words rarely have 2+ hyphens, so this is a strong
-       signal for an Agent Zero skill name.
+    Order (first non-empty wins):
+    1. Per-turn: the last `history_output` message carrying
+       `skill_instructions` with `content_included` truthy (a skill
+       whose content was actually injected this turn) — matched via
+       `helpers.skills.skill_instruction_name`. This is the exact
+       signal `tools/skills_tool.py:_visible_skill_loaded` already
+       reads, so it agrees with what the agent actually saw.
+    2. Session-level: the most recently loaded skill from
+       `helpers.skills.get_loaded_skill_names` (the `loaded_skills`
+       ledger updated by `skills_tool` on every load).
+
+    Both sources are pure-Python and never call the LLM. Any import or
+    attribute failure degrades gracefully to "" (the rollout is still
+    written with an empty `skill_used`).
     """
-    if not user_text:
+    try:
+        from helpers import skills  # type: ignore  # noqa: E402
+    except Exception as e:
+        log.debug("[skillopt] cannot import helpers.skills: %s", e)
         return ""
-    # 1. Inline "skill: <name>" or "skill # <name>"
-    m = re.search(r"\bskill\s*[:#]\s*[`\"]?([A-Za-z0-9_\-]+)[`\"]?", user_text, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    # 2. "the X skill" / "X skill"
-    m = re.search(r"\bthe\s+([A-Za-z0-9_\-]+)\s+skill\b", user_text, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    m = re.search(r"\b([A-Za-z0-9_\-]+)\s+skill\b", user_text, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    # 3. Hyphenated token with 2+ hyphens (very strong skill-name signal)
-    m = re.search(r"\b([A-Za-z0-9]+(?:-[A-Za-z0-9]+){2,})\b", user_text)
-    if m:
-        return m.group(1)
+    # 1. Per-turn attribution from the message stream.
+    last_from_message = ""
+    for msg in (history_output or []):
+        try:
+            name = skills.skill_instruction_name(msg)
+        except Exception:
+            name = ""
+        if name:
+            last_from_message = str(name)
+    if last_from_message:
+        return last_from_message
+    # 2. Session-level ledger.
+    try:
+        names = skills.get_loaded_skill_names(agent) or []
+    except Exception as e:
+        log.debug("[skillopt] get_loaded_skill_names failed: %s", e)
+        names = []
+    if names:
+        return str(names[-1])
     return ""
 
 
@@ -130,7 +221,7 @@ def _truncate(s: str, n: int = 400) -> str:
         return ""
     if len(s) <= n:
         return s
-    return s[: n - 1] + "\u2026"
+    return s[: n - 1] + "…"
 
 
 def _safe_call(*fns):
@@ -145,13 +236,49 @@ def _safe_call(*fns):
     return None
 
 
+def _tool_step_from_output(output_msg: Any) -> dict[str, Any] | None:
+    """Build one trajectory step from an OutputMessage whose content dict
+    carries tool metadata (tool_name / tool_result), as written by
+    `Agent.hist_add_tool_result`. Returns None for plain text messages."""
+    content = None
+    if isinstance(output_msg, dict):
+        content = output_msg.get("content")
+    else:
+        content = getattr(output_msg, "content", None)
+    if not isinstance(content, dict):
+        return None
+    tool_name = content.get("tool_name") or ""
+    tool_result = content.get("tool_result")
+    if not tool_name and tool_result is None:
+        return None
+    name = str(tool_name or "")
+    # hist_add_tool_result stores tool_result under content; some tool
+    # calls also carry 'tool_args'/'arguments'. Capture a compact form.
+    args = content.get("tool_args") or content.get("arguments") or ""
+    return {
+        "role": "tool",
+        "name": name,
+        "args": _truncate(_flatten_content(args), 120) if args else "",
+        "result": _truncate(_flatten_content(tool_result), 200) if tool_result is not None else "",
+    }
+
+
 def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
     """monologue_end hook entry point.
 
     The framework passes a single positional arg (the agent context)
-    in most versions, and/or kwargs like `agent`, `loop_data`,
-    `messages`. We accept both shapes for v2.5 + legacy compat.
+    plus `loop_data=...`. We accept both shapes for v2.5 + legacy compat.
+
+    v1.7.0: reads `loop_data.history_output` (the real attribute) and
+    `loop_data.user_message` / `loop_data.last_response` instead of the
+    nonexistent `loop_data.messages`.
     """
+    # Recursion guard: stay silent during local counterfactual replay so
+    # the replayed agent's own monologue_end does not pollute the training
+    # set. Set by helpers/replay_harness.py (Phase C2) around communicate().
+    if os.environ.get("SKILLOPT_REPLAY_MODE"):
+        return
+
     sr = _sr()
     if sr is None:
         return
@@ -159,38 +286,41 @@ def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
     # Extract what we can from the framework's context.
     agent = kwargs.get("agent") or (args[0] if args else None)
     loop_data = kwargs.get("loop_data") or getattr(agent, "loop_data", None)
-    messages = kwargs.get("messages") or (getattr(loop_data, "messages", None) if loop_data else None) or []
 
-    # Find the first user message (the task) and the last assistant message (the outcome).
+    # v1.7.0: the real conversation lives on loop_data.history_output
+    # (list[OutputMessage]) + loop_data.user_message + loop_data.last_response.
+    # The v1.1.0 code read loop_data.messages which does not exist, so it
+    # always saw [] and early-returned — writing zero rollouts.
+    history_output = []
     user_msg = ""
     asst_msg = ""
-    for m in (messages or []):
-        role = (m.get("role") if isinstance(m, dict) else getattr(m, "role", None)) or ""
-        content = (m.get("content") if isinstance(m, dict) else getattr(m, "content", "")) or ""
-        if isinstance(content, list):
-            content = " ".join(str(c.get("text", "")) if isinstance(c, dict) else str(c) for c in content)
-        if role == "user" and not user_msg:
-            user_msg = content
-        if role == "assistant":
-            asst_msg = content
+    if loop_data is not None:
+        history_output = list(getattr(loop_data, "history_output", None) or [])
+        # The user's task is the current user message (a framework Message).
+        um = getattr(loop_data, "user_message", None)
+        if um is not None:
+            user_msg = _flatten_content(getattr(um, "content", None) if not isinstance(um, dict) else um.get("content"))
+        # The assistant's final answer is the last ai=True output entry,
+        # falling back to loop_data.last_response (the framework's own
+        # convenience string for the final response).
+        for msg in reversed(history_output):
+            if _output_ai(msg):
+                asst_msg = _output_text(msg)
+                if asst_msg:
+                    break
+        if not asst_msg:
+            asst_msg = _flatten_content(getattr(loop_data, "last_response", None))
 
     if not user_msg:
         # Empty conversations don't teach the engine anything.
         return
 
-    # Build a compact trajectory from tool calls (cap at 5 to keep rollouts small).
+    # Build a compact trajectory from tool/result messages (cap at 5).
     traj: list[dict[str, Any]] = []
-    for m in (messages or [])[-12:]:
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role") or ""
-        if role in ("tool", "function"):
-            traj.append({"role": role, "content": _truncate(m.get("content") or "", 200)})
-        elif role == "assistant":
-            tool_calls = m.get("tool_calls") or []
-            for tc in tool_calls[:3]:
-                fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
-                traj.append({"role": "tool_call", "name": fn.get("name", ""), "args": _truncate(fn.get("arguments", "") or "", 120)})
+    for msg in history_output[-12:]:
+        step = _tool_step_from_output(msg)
+        if step is not None:
+            traj.append(step)
     traj = traj[:5]
 
     model = _safe_call(
@@ -203,13 +333,14 @@ def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
     ) or time.time()
     duration_s = round(time.time() - float(start_ts), 1) if start_ts else 0.0
 
-    heuristic_label = _heuristic_outcome(messages, asst_msg)
+    skill_used = _authoritative_skill_used(agent, history_output)
+    heuristic_label = _heuristic_outcome(asst_msg)
     record = {
         "id": uuid.uuid4().hex,
         "ts": time.time(),
         "task": _truncate(user_msg, 600),
-        "task_type": _extract_skill_hint(user_msg) or "general",
-        "skill_used": _extract_skill_hint(user_msg),
+        "task_type": skill_used or "general",
+        "skill_used": skill_used,
         "outcome": heuristic_label,
         "last_response": _truncate(asst_msg, 1200),
         "trajectory": traj,
@@ -234,7 +365,6 @@ def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
     # ["_default"] (the implicit single fragment).
     try:
         from usr.plugins.skillopt.helpers import fragment_store  # type: ignore
-        skill_used = record.get("skill_used") or ""
         if skill_used:
             skill_md = sr.a0_skills_dir() / skill_used / "SKILL.md"
             if skill_md.is_file():
