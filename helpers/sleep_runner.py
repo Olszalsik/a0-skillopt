@@ -171,6 +171,32 @@ def list_rollouts() -> list[Path]:
     return sorted(p for p in rollouts_dir().glob("*.json") if p.is_file())
 
 
+def _load_held_out(skill_name: str) -> list[dict[str, Any]]:
+    """Return the most recent rollouts attributed to `skill_name`, newest
+    first, capped at `replay_held_out_n` (default 8). These are the
+    counterfactual replay set the local replay gate (stage 0.7) re-scores
+    under the current vs proposed skill.
+
+    Filters on the authoritative `skill_used` field written by the v1.7.0
+    harvester (C1). Rollouts that fail to parse are skipped. Returns []
+    when no rollouts match (the replay gate then returns ok=False and the
+    structural gate runs).
+    """
+    cfg = merged_config()
+    n = int(cfg.get("replay_held_out_n", 8) or 0)
+    out: list[dict[str, Any]] = []
+    for p in reversed(list_rollouts()):
+        if n and len(out) >= n:
+            break
+        try:
+            rec = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(rec, dict) and rec.get("skill_used") == skill_name:
+            out.append(rec)
+    return out
+
+
 def list_skills_available() -> list[dict[str, str]]:
     """Enumerate the skills currently installed for A0, with their SKILL.md path."""
     out: list[dict[str, str]] = []
@@ -354,6 +380,48 @@ def validate_proposal(
                 import logging as _logging
                 _logging.getLogger("skillopt.sleep_runner").debug(
                     "[skillopt] ab_harness raised in validate_proposal: %s", e
+                )
+            except Exception:
+                pass
+
+    # v1.7.0: stage 0.7 - local replay gate (Solution C, Phase C2). The
+    # authoritative counterfactual gate for the LOCAL / direct-optimizer
+    # path. Runs only when the skill is known, the official engine did
+    # NOT already gate this proposal (official_gated=False — the upstream
+    # gate is authoritative and we must not double-count), and the local
+    # replay gate is enabled (replay_local_gate_enabled, default true).
+    # Uses a deterministic mock executor (no LLM); a real A0-agent-loop
+    # executor is stubbed behind replay_real_executor_enabled. As with
+    # stage 0, a harness bug can never crash the gate — on ok=False
+    # (insufficient rollouts / executor unavailable) we fall through to
+    # the structural stages; on ok=True + accepted=False we REJECT.
+    if skill_name and not official_gated:
+        try:
+            _cfg = merged_config()
+            if bool(_cfg.get("replay_local_gate_enabled", True)):
+                from helpers import replay_harness  # type: ignore  # noqa: E402
+                _held = _load_held_out(skill_name)
+                _replay = replay_harness.run_counterfactual(
+                    skill_name=skill_name,
+                    current_skill_md=current or "",
+                    proposed_skill_md=proposed or "",
+                    held_out_tasks=_held,
+                    executor="mock",
+                    config=_cfg,
+                )
+                if _replay.get("ok"):
+                    if not _replay.get("accepted"):
+                        return False, (
+                            f"replay_gate_rejected: {_replay.get('reason', 'unknown')}"
+                        )
+                    # accepted=True: continue to the structural stages.
+                # ok=False: insufficient rollouts / executor unavailable ->
+                # fall through to the structural gate (loud-not-crash).
+        except Exception as e:
+            try:
+                import logging as _logging
+                _logging.getLogger("skillopt.sleep_runner").debug(
+                    "[skillopt] local replay gate raised: %s", e
                 )
             except Exception:
                 pass

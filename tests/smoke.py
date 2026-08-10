@@ -3458,6 +3458,183 @@ def t_c1_harvest_no_skill_falls_back_to_general() -> None:
         _restore_skills(prev)
 
 
+# ======================================================================= #
+# v1.7.0 — Solution C, Phase C2: local replay harness
+# (deterministic mock executor + real-executor stub + gate wiring)
+# ======================================================================= #
+
+_section_v170_c2 = "v1.7.0 NEW (C2): local counterfactual replay harness"
+
+
+@test("v1.7.0 C2: mock executor is deterministic + relevance-driven")
+def t_c2_mock_executor_deterministic() -> None:
+    """_mock_score is pure (same inputs -> same output), outcome-driven
+    (failure -> 0), and relevance-driven (a skill whose directive keywords
+    overlap the task scores higher than one that doesn't)."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import replay_harness
+    relevant = "# Refactor Parser\n**nested groups** cleanly\n"
+    irrelevant = "# Cooking Recipes\n**bake cake** slowly\n"
+    task = {"task": "refactor the parser for nested groups", "outcome": "success"}
+    hi = replay_harness._mock_score(task, relevant)
+    lo = replay_harness._mock_score(task, irrelevant)
+    assert hi > lo, f"relevant skill must outscore irrelevant: {hi} vs {lo}"
+    assert hi == 1.0, f"full overlap success should score 1.0, got {hi}"
+    assert lo == 0.5, f"no-overlap success should score 0.5, got {lo}"
+    # failure outcome -> 0 regardless of relevance
+    fail = replay_harness._mock_score(
+        {"task": "refactor parser nested groups", "outcome": "failure"}, relevant,
+    )
+    assert fail == 0.0, f"failure base must be 0, got {fail}"
+    # determinism
+    assert replay_harness._mock_score(task, relevant) == hi
+    # directive keywords are headings + bold, stopwords dropped
+    kws = replay_harness._directive_keywords("# Refactor Parser\n**nested groups** here")
+    assert "refactor" in kws and "parser" in kws
+    assert "nested" in kws and "groups" in kws
+    assert "here" not in kws, "'here' is not a heading/bold span"
+
+
+@test("v1.7.0 C2: _decide is strict-monotonic (lift >= min_pp to accept)")
+def t_c2_gate_monotonic_strict() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import replay_harness
+    cfg = {"gate_min_improvement_pp": 5.0, "replay_min_n": 3}
+    # strict lift >= 5pp -> accept
+    v = replay_harness._decide(0.5, 0.6, 5, cfg)
+    assert v["accepted"] is True, v
+    assert v["reason"].startswith("ok_lift"), v
+    # no lift -> reject
+    assert replay_harness._decide(0.5, 0.5, 5, cfg)["accepted"] is False
+    # regression -> reject
+    assert replay_harness._decide(0.6, 0.5, 5, cfg)["accepted"] is False
+    # positive but below the bar -> reject
+    v2 = replay_harness._decide(0.5, 0.54, 5, cfg)  # 4pp < 5pp
+    assert v2["accepted"] is False and "insufficient_lift" in v2["reason"], v2
+    # insufficient n -> reject (checked first)
+    v3 = replay_harness._decide(0.5, 0.6, 2, cfg)
+    assert v3["accepted"] is False and "insufficient_n" in v3["reason"], v3
+
+
+@test("v1.7.0 C2: run_counterfactual returns ok=False on insufficient n")
+def t_c2_gate_insufficient_n() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import replay_harness
+    r0 = replay_harness.run_counterfactual(
+        "s", "cur", "prop", [], executor="mock", config={"replay_min_n": 3},
+    )
+    assert r0["ok"] is False and r0["reason"] == "no_held_out_tasks", r0
+    r1 = replay_harness.run_counterfactual(
+        "s", "cur", "prop",
+        [{"task": "t", "outcome": "success"}] * 2,
+        executor="mock", config={"replay_min_n": 3},
+    )
+    assert r1["ok"] is False and r1["reason"].startswith("insufficient_n"), r1
+    # enough tasks -> ok=True with per_task scores
+    r2 = replay_harness.run_counterfactual(
+        "s", "# A\n**b**\n", "# A\n**b c**\n",
+        [{"task": "task b", "outcome": "success"}] * 3,
+        executor="mock", config={"replay_min_n": 3, "gate_min_improvement_pp": 0.0},
+    )
+    assert r2["ok"] is True, r2
+    assert r2["n"] == 3 and len(r2["per_task"]) == 3, r2
+    assert "hard_current" in r2 and "hard_proposed" in r2 and "lift_pp" in r2, r2
+
+
+@test("v1.7.0 C2: real executor is a guarded stub (not enabled -> ok=False)")
+def t_c2_real_executor_stub_disabled() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import replay_harness
+    tasks = [{"task": "t", "outcome": "success"}] * 3
+    # default: flag off -> real_executor_not_enabled
+    r = replay_harness.run_counterfactual(
+        "s", "cur", "prop", tasks, executor="real", config={"replay_min_n": 3},
+    )
+    assert r["ok"] is False, r
+    assert r["reason"] == "real_executor_not_enabled", r
+    # flag on -> stub raises -> real_executor_unavailable (never a fake score)
+    r2 = replay_harness.run_counterfactual(
+        "s", "cur", "prop", tasks, executor="real",
+        config={"replay_min_n": 3, "replay_real_executor_enabled": True},
+    )
+    assert r2["ok"] is False, r2
+    assert r2["reason"].startswith("real_executor_unavailable"), r2
+    # unknown executor -> ok=False
+    r3 = replay_harness.run_counterfactual(
+        "s", "cur", "prop", tasks, executor="quantum", config={"replay_min_n": 3},
+    )
+    assert r3["ok"] is False and "unknown_executor" in r3["reason"], r3
+
+
+@test("v1.7.0 C2: validate_proposal local replay gate rejects a losing proposal")
+def t_c2_validate_proposal_local_gate_rejects() -> None:
+    """On the direct path (official_gated=False), with enough held-out
+    rollouts, a proposed skill that scores WORSE than the current skill
+    under the mock replay is rejected with 'replay_gate_rejected'. The
+    A/B harness env is disabled for this test so stage 0 falls through
+    and the replay stage 0.7 is the authoritative gate (the A/B stage
+    would otherwise pick up leftover rollouts with empty skill_used)."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import ab_harness
+    from helpers.sleep_runner import validate_proposal
+    ab_harness.reset_for_tests()
+    old_ab = os.environ.get("SKILLOPT_AB_HARNESS_ENABLED")
+    os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)  # A/B disabled -> stage 0 falls through
+    skill = "c2_replay_skill_5"
+    rollouts = _write_fake_rollouts(skill, n=3)
+    try:
+        # Current skill's directive keywords (refactor/module/nested/groups)
+        # overlap the rollout task text -> high score. Proposed skill's
+        # keywords (cooking/bake/cake) do not -> low score -> regression.
+        current = "# Refactor Module\n**nested groups** parse trees\n\n```example\nrefactor module\n```\n" + ("x" * 180)
+        proposed = "# Cooking Recipes\n**bake cake** slowly\n\n```example\nbake a cake\n```\n" + ("y" * 180)
+        ok, reason = validate_proposal(
+            proposed, current, min_chars=200, min_improvement_pp=5.0,
+            max_shrink_ratio=0.5, held_out=None, skill_name=skill,
+        )
+        assert not ok, f"replay gate should reject a losing proposal, got ok={ok} reason={reason!r}"
+        assert reason.startswith("replay_gate_rejected"), f"unexpected reason: {reason!r}"
+    finally:
+        _cleanup_rollouts(rollouts)
+        if old_ab is None:
+            os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
+        else:
+            os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = old_ab
+
+
+@test("v1.7.0 C2: official_gated=True skips the local replay gate")
+def t_c2_validate_proposal_official_gated_skips_replay() -> None:
+    """When official_gated=True, the local replay gate (stage 0.7) is
+    SKIPPED — the upstream held-out gate is authoritative and we must not
+    double-count. With the same rollouts that would make the replay gate
+    reject (test 5), a structurally-valid proposal must PASS when
+    official_gated=True."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import ab_harness
+    from helpers.sleep_runner import validate_proposal
+    ab_harness.reset_for_tests()
+    old_ab = os.environ.get("SKILLOPT_AB_HARNESS_ENABLED")
+    os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
+    skill = "c2_replay_skill_6"
+    rollouts = _write_fake_rollouts(skill, n=3)
+    try:
+        current = "# Refactor Module\n**nested groups** parse trees\n\n```example\nrefactor module\n```\n" + ("x" * 180)
+        proposed = "# Cooking Recipes\n**bake cake** slowly\n\n```example\nbake a cake\n```\n" + ("y" * 180)
+        ok, reason = validate_proposal(
+            proposed, current, min_chars=200, min_improvement_pp=5.0,
+            max_shrink_ratio=0.5, held_out=None, skill_name=skill,
+            official_gated=True,
+        )
+        assert ok, f"official_gated should skip replay + accept structurally; got {ok!r} {reason!r}"
+        assert "replay_gate" not in reason, f"replay gate must be skipped under official_gated: {reason!r}"
+    finally:
+        _cleanup_rollouts(rollouts)
+        if old_ab is None:
+            os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
+        else:
+            os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = old_ab
+
+
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
     print(_section_v110)
@@ -3466,4 +3643,5 @@ if __name__ == "__main__":
     print(_section_v160)
     print(_section_v161)
     print(_section_v170_c1)
+    print(_section_v170_c2)
     sys.exit(main())

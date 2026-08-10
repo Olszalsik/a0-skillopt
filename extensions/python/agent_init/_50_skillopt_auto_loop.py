@@ -20,6 +20,7 @@ automatically" — set the toggles in the WebUI once and forget.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
@@ -165,5 +166,13 @@ def execute(**kwargs):  # type: ignore[no-untyped-def]
     of starting the loop thread itself, and keeps it alive across the
     many failure modes that would otherwise leave the user with a silent,
     non-firing auto-loop.
+
+    Recursion guard (v1.7.0 / Solution C, Phase C2): when
+    `SKILLOPT_REPLAY_MODE` is set (by the local replay harness's real
+    executor), the replayed agent's own agent_init must NOT start the
+    auto-loop / watchdog — that would spawn a nested optimizer loop
+    inside a counterfactual replay. Return immediately.
     """
+    if os.environ.get("SKILLOPT_REPLAY_MODE"):
+        return
     _start_watchdog()

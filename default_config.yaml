@@ -53,6 +53,31 @@ gate_max_shrink_ratio: 0.5
 gate_min_improvement_pp: 5.0
 
 # =====================================================================
+# LOCAL REPLAY GATE (v1.7.0 — Solution C, Phase C2)
+# =====================================================================
+# The authoritative counterfactual gate for the LOCAL / direct-optimizer
+# path (replaces the synthetic A/B stage as the authoritative replay).
+# Runs as stage 0.7 in validate_proposal, ONLY when the skill is known
+# AND the official engine did NOT already gate the proposal
+# (official_gated=False — the upstream held-out gate is authoritative
+# and we must not double-count).
+#
+# The mock executor is deterministic (no LLM) — a relevance heuristic,
+# not a real agent replay. The real A0-agent-loop executor is a STUB
+# behind replay_real_executor_enabled (default false); it is the live
+# follow-up. See helpers/replay_harness.py.
+#
+# replay_local_gate_enabled   : master kill switch (default ON)
+# replay_min_n                : below this many held-out rollouts the gate
+#                               returns ok=False and the structural gate runs
+# replay_held_out_n           : how many recent rollouts to re-score (per skill)
+# replay_real_executor_enabled: opt into the real (stub) executor. OFF by default.
+replay_local_gate_enabled: true
+replay_min_n: 3
+replay_held_out_n: 8
+replay_real_executor_enabled: false
+
+# =====================================================================
 # STORAGE
 # =====================================================================
 
