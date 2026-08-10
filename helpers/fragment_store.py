@@ -219,6 +219,22 @@ def _snapshots_dir_for_skill(skill_path: str | os.PathLike) -> Path:
     return p
 
 
+def _snapshots_dir_for_skill_name(skill_name: str) -> Path:
+    """Snapshot dir keyed on the skill-name STRING explicitly (v1.7.0).
+
+    The older `_snapshots_dir_for_skill` uses `Path(skill_path).stem`, but
+    every SKILL.md has stem ``SKILL`` — so all whole-file skills' snapshots
+    collided under ``fragments/SKILL/`` (side-finding #4). The whole-file
+    snapshot/restore helpers below key on the skill NAME so a caveman
+    snapshot never overwrites a code-review snapshot. The name is
+    sanitised to a filesystem-safe segment.
+    """
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(skill_name or "").strip()) or "_unnamed"
+    p = _plugin_root() / "fragments" / safe
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def _fragment_log_path() -> Path:
     p = _plugin_root() / "logs" / "runs" / "fragments.log"
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -454,6 +470,90 @@ def rollback_fragment(
         "current_version": result.get("version"),
         "bytes_written": result.get("bytes_written"),
     }
+
+
+# ----------------------------------------------------------------------- #
+# v1.7.0 (Solution C, Phase C3): whole-file _default snapshot/restore
+# ----------------------------------------------------------------------- #
+# The v1.2.0 `write_fragment` `_default` branch overwrites the SKILL.md
+# with NO snapshot — there is no pre-edit history for whole-file skills,
+# so an adopt could not be rolled back to the byte-for-byte prior file.
+# These two helpers give the adopt UI a reversible whole-file snapshot.
+# They key on the skill NAME (not Path.stem) so skills don't collide.
+
+
+def snapshot_default(skill_name: str, current_bytes: str) -> dict[str, Any]:
+    """Snapshot the whole-file SKILL.md bytes BEFORE an adopt overwrites
+    it, so the adopt is reversible via `restore_default_snapshot`.
+
+    Writes ``<plugin>/fragments/<skill>/_default.pre_adopt.md``. If one
+    already exists (a previous adopt's snapshot that was never restored
+    past), the existing file is versioned aside to ``_default.vN.md`` so
+    the chain of pre-adopt states is preserved. Keys on the skill-name
+    string (see `_snapshots_dir_for_skill_name`). Never raises — a
+    snapshot failure returns ``{ok: False, error}`` and the caller decides
+    whether to proceed with the adopt anyway.
+    """
+    try:
+        d = _snapshots_dir_for_skill_name(skill_name)
+        primary = d / "_default.pre_adopt.md"
+        if primary.is_file():
+            n = 1
+            for p in d.glob("_default.v*.md"):
+                m = re.match(r"_default\.v(\d+)\.md$", p.name)
+                if m:
+                    n = max(n, int(m.group(1)) + 1)
+            primary.rename(d / f"_default.v{n}.md")
+        primary.write_text(current_bytes, encoding="utf-8")
+        _append_fragment_log(
+            f"action=snapshot_default skill={skill_name!r} bytes={len(current_bytes)}"
+        )
+        return {"ok": True, "snapshot_path": str(primary),
+                "bytes": len(current_bytes)}
+    except Exception as e:
+        log.debug("[skillopt] snapshot_default failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+def restore_default_snapshot(skill_name: str) -> dict[str, Any]:
+    """Restore the most recent whole-file ``_default`` snapshot to
+    ``<a0>/usr/skills/<skill_name>/SKILL.md``.
+
+    The CURRENT (pre-rollback) bytes are snapshotted FIRST (via
+    `snapshot_default`) so the rollback is itself reversible — rolling
+    back does not destroy the state you rolled back from. Returns
+    ``{ok, restored_from, bytes}`` or ``{ok: False, error}`` when there is
+    no snapshot to restore. Never raises.
+    """
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
+        d = _snapshots_dir_for_skill_name(skill_name)
+        snap = d / "_default.pre_adopt.md"
+        if not snap.is_file():
+            vers = sorted(d.glob("_default.v*.md"), key=lambda p: p.name)
+            if not vers:
+                return {"ok": False,
+                        "error": f"no _default snapshot for skill {skill_name!r}"}
+            snap = vers[-1]
+        restored = snap.read_text(encoding="utf-8")
+        target = sleep_runner.a0_skills_dir() / skill_name / "SKILL.md"
+        # Snapshot the current (pre-rollback) bytes first so the rollback
+        # is reversible. snapshot_default moves the existing pre_adopt
+        # aside and writes `current` as the new pre_adopt.
+        if target.is_file():
+            current = target.read_text(encoding="utf-8")
+            snapshot_default(skill_name, current)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(restored, encoding="utf-8")
+        _append_fragment_log(
+            f"action=restore_default skill={skill_name!r} "
+            f"bytes={len(restored)} from={snap.name}"
+        )
+        return {"ok": True, "restored_from": str(snap),
+                "bytes": len(restored)}
+    except Exception as e:
+        log.debug("[skillopt] restore_default_snapshot failed: %s", e)
+        return {"ok": False, "error": str(e)}
 
 
 def list_fragment_history(

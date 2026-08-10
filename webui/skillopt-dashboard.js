@@ -56,6 +56,33 @@
     setConfig(overrides) { return call('/config', { body: overrides }); },
 
     /**
+     * v1.7.0 (Solution C, Phase C3): human-in-the-loop adopt UI.
+     *   - staged()                      -> POST /staged : list staged
+     *     proposals with gate evidence (skill, proposal_id, lift_pp,
+     *     n_held_out, gate_reason, last_outcome, diff_summary).
+     *   - adoptProposal(id)             -> POST /adopt  : adopt a specific
+     *     staged proposal by its stem (falls back to latest when id empty).
+     *   - reject(id, reason)             -> POST /reject : record a human
+     *     reject decision (audit only; does not delete the staged file).
+     *   - rollback(skill)               -> POST /rollback: restore the
+     *     most recent whole-file _default snapshot for <skill>.
+     *   - renderStagedProposals(result)  -> pure fn: shape a /staged
+     *     response into rows the WebUI config page can render.
+     */
+    staged() { return call('/staged'); },
+    adoptProposal(proposalId) {
+      const body = proposalId ? { proposal_id: String(proposalId) } : {};
+      return call('/adopt', { body });
+    },
+    reject(proposalId, reason) {
+      return call('/reject', { body: { proposal_id: String(proposalId || ''),
+                                        reason: String(reason || '') } });
+    },
+    rollback(skill) {
+      return call('/rollback', { body: { skill: String(skill || '') } });
+    },
+
+    /**
      * Per-cycle dashboard — Day-5 item 7.
      * Reads the most recent N cycle_history.jsonl entries (newest-first)
      * from /api/plugins/skillopt/cycles. Filters: skill name, ISO since
@@ -198,9 +225,41 @@
         'data-fetched-at': fetchedAt,
       };
     },
-  };
 
-  window.SkillOptDashboard = SkillOptDashboard;
+    /**
+     * v1.7.0 (Phase C3): shape a /staged response into render-ready rows.
+     * Pure: no fetch, no DOM. Each row carries the gate evidence the
+     * config.html "Staged proposals" cards render (skill, proposal_id,
+     * lift_pp, n_held_out, gate_reason, last_outcome, size) plus the
+     * Approve/Reject/Rollback actions the UI binds to.
+     */
+    renderStagedProposals(stagedResult) {
+      const fetchedAt = new Date().toISOString();
+      const empty = {
+        'data-staged': [],
+        'data-staged-count': 0,
+        'data-fetched-at': fetchedAt,
+      };
+      if (!stagedResult || stagedResult.ok !== true) return empty;
+      const items = Array.isArray(stagedResult.proposals) ? stagedResult.proposals : [];
+      const rows = items.map((p) => ({
+        skill: String((p && p.skill) || ''),
+        proposal_id: String((p && p.proposal_id) || ''),
+        size: Number((p && p.size) || 0),
+        mtime: Number((p && p.mtime) || 0),
+        lift_pp: (p && p.lift_pp != null) ? Number(p.lift_pp) : null,
+        n_held_out: (p && p.n_held_out != null) ? Number(p.n_held_out) : null,
+        gate_reason: String((p && p.gate_reason) || ''),
+        last_outcome: String((p && p.last_outcome) || ''),
+        diff_summary: String((p && p.diff_summary) || ''),
+      }));
+      return {
+        'data-staged': rows,
+        'data-staged-count': rows.length,
+        'data-fetched-at': fetchedAt,
+      };
+    },
+  };
 
   // Convenience: log availability on load (helps debugging in DevTools)
   console.log('[skillopt] dashboard loaded; API at ' + ENDPOINT_BASE);

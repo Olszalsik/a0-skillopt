@@ -3635,6 +3635,266 @@ def t_c2_validate_proposal_official_gated_skips_replay() -> None:
             os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = old_ab
 
 
+# ======================================================================= #
+# v1.7.0 — Solution C, Phase C3: human-in-the-loop adopt UI
+# (Approve/Reject/Rollback + whole-file snapshot + gate evidence)
+# ======================================================================= #
+
+_section_v170_c3 = "v1.7.0 NEW (C3): human-in-the-loop adopt UI"
+
+
+def _c3_mirror_helpers():
+    """Mirror the plugin helpers under usr.plugins.skillopt.helpers.* so the
+    api modules' `from usr.plugins.skillopt.helpers import X` resolves in
+    the standalone smoke env. Idempotent. Returns (sleep_runner,
+    cycle_history, fragment_store)."""
+    _install_helpers_api_stub()
+    import types as _types
+    for dotted in ("usr", "usr.plugins", "usr.plugins.skillopt",
+                   "usr.plugins.skillopt.helpers"):
+        if dotted not in sys.modules:
+            sys.modules[dotted] = _types.ModuleType(dotted)
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import sleep_runner, cycle_history, fragment_store  # type: ignore
+    pkg = sys.modules["usr.plugins.skillopt.helpers"]
+    for name, mod in (("sleep_runner", sleep_runner),
+                      ("cycle_history", cycle_history),
+                      ("fragment_store", fragment_store)):
+        setattr(pkg, name, mod)
+        sys.modules["usr.plugins.skillopt.helpers." + name] = mod
+    return sleep_runner, cycle_history, fragment_store
+
+
+def _c3_import_api_class(module_name, class_name):
+    _c3_mirror_helpers()
+    try:
+        mod = __import__("usr.plugins.skillopt.api." + module_name,
+                         fromlist=[class_name])
+    except Exception:
+        mod = __import__("api." + module_name, fromlist=[class_name])
+    return getattr(mod, class_name)
+
+
+def _c3_cleanup_fragments(skill_names):
+    """Remove the whole-file snapshot dirs created by snapshot_default
+    (fragments/<skill>/ is NOT gitignored, so tests must clean up)."""
+    from pathlib import Path
+    import shutil
+    frags = Path(PLUGIN_ROOT) / "fragments"
+    for s in skill_names:
+        d = frags / s
+        if d.is_dir():
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def _c3_valid_skill_md(seed: str) -> str:
+    """A structurally valid SKILL.md proposal (>=200 chars, headers,
+    example block) the gate will accept. Distinct per seed so proposed !=
+    current and not whitespace-identical."""
+    return (
+        f"# {seed} Skill v2\n\n"
+        "```example\n# example block\n```\n\n"
+        + (f"{seed} body line that is long enough to pass the gate. " * 12)
+    )
+
+
+@test("v1.7.0 C3: /staged returns proposals with gate evidence")
+def t_c3_staged_endpoint_returns_evidence() -> None:
+    import asyncio
+    from pathlib import Path
+    sr, ch, _fs = _c3_mirror_helpers()
+    ch.reset_for_tests()
+    skill = "c3_staged_skill"
+    staged_file = sr.staging_dir() / f"{skill}.md"
+    staged_file.write_text(_c3_valid_skill_md(skill), encoding="utf-8")
+    ch.record_cycle_entry({"skill": skill, "outcome": "skipped",
+                           "outcome_detail": "gate ok +8.0pp", "lift_pp": 8.0,
+                           "n_held_out": 5, "proposal_id": skill})
+    try:
+        Staged = _c3_import_api_class("staged", "Staged")
+        resp = asyncio.run(Staged().process({}, None))
+        assert resp.get("ok") is True, resp
+        props = resp.get("proposals") or []
+        mine = [p for p in props if p.get("skill") == skill]
+        assert mine, f"my staged proposal not in /staged response: {props!r}"
+        card = mine[0]
+        assert card["proposal_id"] == skill, card
+        assert "gate ok" in card["gate_reason"], card
+        assert card["lift_pp"] == 8.0, card
+        assert card["n_held_out"] == 5, card
+    finally:
+        staged_file.unlink(missing_ok=True)
+        ch.reset_for_tests()
+
+
+@test("v1.7.0 C3: /adopt with proposal_id adopts that specific proposal")
+def t_c3_adopt_by_proposal_id() -> None:
+    import asyncio, os, time
+    from pathlib import Path
+    import tempfile
+    sr, ch, fs = _c3_mirror_helpers()
+    ch.reset_for_tests()
+    _audit_wipe_local_store()
+    old_skills = os.environ.get("SKILLOPT_SKILLS_DIR")
+    old_ab = os.environ.get("SKILLOPT_AB_HARNESS_ENABLED")
+    tmp_skills = Path(tempfile.mkdtemp(prefix="skillopt_c3_adopt_"))
+    os.environ["SKILLOPT_SKILLS_DIR"] = str(tmp_skills)
+    os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
+    skill_a = "c3a_adopt"
+    skill_b = "c3b_adopt"
+    file_a = sr.staging_dir() / f"{skill_a}.md"
+    file_b = sr.staging_dir() / f"{skill_b}.md"
+    file_a.write_text(_c3_valid_skill_md(skill_a), encoding="utf-8")
+    file_b.write_text(_c3_valid_skill_md(skill_b), encoding="utf-8")
+    os.utime(str(file_a), (time.time() - 100, time.time() - 100))  # a is older
+    (tmp_skills / skill_a / "SKILL.md").parent.mkdir(parents=True, exist_ok=True)
+    (tmp_skills / skill_a / "SKILL.md").write_text("# Old Current\n```\nex\n```\n" + "old\n" * 60, encoding="utf-8")
+    (tmp_skills / skill_b / "SKILL.md").parent.mkdir(parents=True, exist_ok=True)
+    (tmp_skills / skill_b / "SKILL.md").write_text("# Old Current\n```\nex\n```\n" + "old\n" * 60, encoding="utf-8")
+    try:
+        Adopt = _c3_import_api_class("adopt", "Adopt")
+        resp = asyncio.run(Adopt().process({"proposal_id": skill_a}, None))
+        assert resp.get("ok") is True, f"adopt failed: {resp!r}"
+        assert resp["skill"] == skill_a, f"should adopt {skill_a} by id, got {resp['skill']!r}"
+        # The live SKILL.md for skill_a now holds the proposed text
+        live = (tmp_skills / skill_a / "SKILL.md").read_text(encoding="utf-8")
+        assert "Skill v2" in live, f"SKILL.md not overwritten with proposal: {live[:80]!r}"
+        # A whole-file _default snapshot was written (reversible adopt)
+        snap = Path(PLUGIN_ROOT) / "fragments" / skill_a / "_default.pre_adopt.md"
+        assert snap.is_file(), f"expected pre-adopt snapshot at {snap}"
+        assert resp.get("snapshot", {}).get("ok") is True, resp
+    finally:
+        for f in (file_a, file_b):
+            f.unlink(missing_ok=True)
+        _c3_cleanup_fragments([skill_a, skill_b])
+        import shutil
+        shutil.rmtree(tmp_skills, ignore_errors=True)
+        _audit_wipe_local_store()
+        ch.reset_for_tests()
+        if old_skills is None:
+            os.environ.pop("SKILLOPT_SKILLS_DIR", None)
+        else:
+            os.environ["SKILLOPT_SKILLS_DIR"] = old_skills
+        if old_ab is None:
+            os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
+        else:
+            os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = old_ab
+
+
+@test("v1.7.0 C3: /reject records a rejected cycle_history entry + audit row")
+def t_c3_reject_records_cycle_history() -> None:
+    import asyncio, os
+    from pathlib import Path
+    sr, ch, _fs = _c3_mirror_helpers()
+    ch.reset_for_tests()
+    _audit_wipe_local_store()
+    pid = "c3_reject_skill"
+    try:
+        Reject = _c3_import_api_class("reject", "Reject")
+        resp = asyncio.run(Reject().process({"proposal_id": pid, "reason": "bad fit"}, None))
+        assert resp.get("ok") is True, resp
+        assert resp["decision"] == "rejected", resp
+        # cycle_history got a rejected entry for the skill
+        entries = ch.read_cycle_history(limit=50)
+        rej = [e for e in entries if e.get("outcome") == "rejected" and e.get("skill") == pid]
+        assert rej, f"no rejected cycle_history entry: {entries!r}"
+        assert "bad fit" in rej[0].get("outcome_detail", ""), rej[0]
+        # adoptions.log got a row
+        log = sr.runs_dir() / "adoptions.log"
+        assert log.is_file(), "adoptions.log not written"
+        txt = log.read_text(encoding="utf-8")
+        assert pid in txt and "rejected" in txt, f"audit row missing: {txt!r}"
+    finally:
+        _audit_wipe_local_store()
+        ch.reset_for_tests()
+
+
+@test("v1.7.0 C3: /rollback restores the pre-adopt whole-file SKILL.md")
+def t_c3_rollback_restores_default() -> None:
+    import asyncio, os
+    from pathlib import Path
+    import tempfile, shutil
+    sr, ch, fs = _c3_mirror_helpers()
+    ch.reset_for_tests()
+    old_skills = os.environ.get("SKILLOPT_SKILLS_DIR")
+    tmp_skills = Path(tempfile.mkdtemp(prefix="skillopt_c3_rb_"))
+    os.environ["SKILLOPT_SKILLS_DIR"] = str(tmp_skills)
+    skill = "c3_rollback"
+    original = "# Original Skill\n\n```example\norig\n```\n" + "original line\n" * 40
+    target = tmp_skills / skill / "SKILL.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(original, encoding="utf-8")
+    try:
+        # Snapshot the pre-adopt bytes, then overwrite (simulate an adopt)
+        fs.snapshot_default(skill, original)
+        target.write_text("# Adopted Different\n\n```example\nnew\n```\n" + "adopted\n" * 40, encoding="utf-8")
+        assert target.read_text(encoding="utf-8") != original, "precondition: SKILL.md changed"
+        Rollback = _c3_import_api_class("rollback", "Rollback")
+        resp = asyncio.run(Rollback().process({"skill": skill}, None))
+        assert resp.get("ok") is True, f"rollback failed: {resp!r}"
+        restored = target.read_text(encoding="utf-8")
+        assert restored == original, f"SKILL.md not restored to original: {restored[:60]!r}"
+        assert resp["bytes"] == len(original), resp
+    finally:
+        _c3_cleanup_fragments([skill])
+        shutil.rmtree(tmp_skills, ignore_errors=True)
+        ch.reset_for_tests()
+        if old_skills is None:
+            os.environ.pop("SKILLOPT_SKILLS_DIR", None)
+        else:
+            os.environ["SKILLOPT_SKILLS_DIR"] = old_skills
+
+
+@test("v1.7.0 C3: /adopt without proposal_id falls back to the latest staged")
+def t_c3_adopt_without_id_falls_back_to_latest() -> None:
+    import asyncio, os, time
+    from pathlib import Path
+    import tempfile, shutil
+    sr, ch, _fs = _c3_mirror_helpers()
+    ch.reset_for_tests()
+    _audit_wipe_local_store()
+    old_skills = os.environ.get("SKILLOPT_SKILLS_DIR")
+    old_ab = os.environ.get("SKILLOPT_AB_HARNESS_ENABLED")
+    tmp_skills = Path(tempfile.mkdtemp(prefix="skillopt_c3_latest_"))
+    os.environ["SKILLOPT_SKILLS_DIR"] = str(tmp_skills)
+    os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
+    old_skill = "c3e_old"
+    new_skill = "c3e_new"
+    f_old = sr.staging_dir() / f"{old_skill}.md"
+    f_new = sr.staging_dir() / f"{new_skill}.md"
+    f_old.write_text(_c3_valid_skill_md(old_skill), encoding="utf-8")
+    f_new.write_text(_c3_valid_skill_md(new_skill), encoding="utf-8")
+    os.utime(str(f_old), (time.time() - 200, time.time() - 200))  # old is older
+    for s in (old_skill, new_skill):
+        sk = tmp_skills / s / "SKILL.md"
+        sk.parent.mkdir(parents=True, exist_ok=True)
+        sk.write_text("# Old Current\n```\nex\n```\n" + "old\n" * 60, encoding="utf-8")
+    try:
+        Adopt = _c3_import_api_class("adopt", "Adopt")
+        resp = asyncio.run(Adopt().process({}, None))  # no proposal_id
+        assert resp.get("ok") is True, f"adopt failed: {resp!r}"
+        # The newest staged proposal (c3e_new) is adopted, not the older one
+        assert resp["skill"] == new_skill, f"expected latest {new_skill}, got {resp['skill']!r}"
+        assert "Skill v2" in (tmp_skills / new_skill / "SKILL.md").read_text(encoding="utf-8")
+        # The older skill's SKILL.md is untouched
+        assert "Skill v2" not in (tmp_skills / old_skill / "SKILL.md").read_text(encoding="utf-8")
+    finally:
+        for f in (f_old, f_new):
+            f.unlink(missing_ok=True)
+        _c3_cleanup_fragments([old_skill, new_skill])
+        shutil.rmtree(tmp_skills, ignore_errors=True)
+        _audit_wipe_local_store()
+        ch.reset_for_tests()
+        if old_skills is None:
+            os.environ.pop("SKILLOPT_SKILLS_DIR", None)
+        else:
+            os.environ["SKILLOPT_SKILLS_DIR"] = old_skills
+        if old_ab is None:
+            os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
+        else:
+            os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = old_ab
+
+
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
     print(_section_v110)
@@ -3644,4 +3904,5 @@ if __name__ == "__main__":
     print(_section_v161)
     print(_section_v170_c1)
     print(_section_v170_c2)
+    print(_section_v170_c3)
     sys.exit(main())

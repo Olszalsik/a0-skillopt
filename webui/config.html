@@ -93,6 +93,32 @@
     <small x-show="lastMsg" x-text="lastMsg" class="so-msg" :class="{ 'so-err': !!lastErr, 'so-on': !lastErr && lastOk }"></small>
   </div>
 
+  <!-- STAGED PROPOSALS (v1.7.0, Solution C Phase C3: human-in-the-loop) -->
+  <div class="so-card">
+    <h4>Staged proposals <small style="opacity: 0.6; font-weight: normal;">— review, approve, reject, or roll back</small></h4>
+    <small style="opacity: 0.7;">Each card is a gated proposal awaiting your decision. Approve promotes it to the live SKILL.md (with a reversible snapshot); Reject records a no; Roll back restores the prior SKILL.md.</small>
+    <template x-if="stagedProposals.length === 0">
+      <small style="opacity: 0.6; display: block; margin-top: 8px;">No staged proposals right now.</small>
+    </template>
+    <template x-for="p in stagedProposals" :key="p.proposal_id">
+      <div class="so-card" style="margin-top: 8px; background: rgba(0,0,0,0.15);">
+        <div class="so-stat">
+          <div><strong x-text="p.skill"></strong></div>
+          <div>Size: <span x-text="p.size + ' bytes'"></span></div>
+          <div>Gate: <span x-text="p.last_outcome || '—'"></span></div>
+          <div x-show="p.lift_pp != null">Lift: <span x-text="(p.lift_pp != null ? (p.lift_pp > 0 ? '+' : '') + p.lift_pp.toFixed(1) + 'pp' : '—')"></span></div>
+          <div x-show="p.n_held_out != null">Held-out n: <span x-text="p.n_held_out ?? '—'"></span></div>
+        </div>
+        <small style="opacity: 0.7; display: block; margin: 4px 0;" x-text="p.gate_reason || 'no gate reason recorded'"></small>
+        <div class="so-row">
+          <button type="button" class="so-btn so-btn-primary" :disabled="busy" @click="adoptProposal(p.proposal_id)">Approve</button>
+          <button type="button" class="so-btn" :disabled="busy" @click="rejectProposal(p.proposal_id)">Reject</button>
+          <button type="button" class="so-btn" :disabled="busy" @click="rollbackSkill(p.skill)">Roll back</button>
+        </div>
+      </div>
+    </template>
+  </div>
+
   <!-- BACKEND -->
   <div class="so-card">
     <h4>Backend</h4>
@@ -140,6 +166,7 @@ function skilloptSettings() {
     skills: [],
     rollouts: 0,
     staged: 0,
+    stagedProposals: [],
     loopState: {},
 
     async init() {
@@ -184,7 +211,54 @@ function skilloptSettings() {
         const l = await this.api('/loop');
         if (l && l.loop) this.loopState = l.loop || {};
       } catch (e) { /* loop endpoint may not be wired */ }
+      await this.refreshStaged();
       this.busy = false;
+    },
+
+    async refreshStaged() {
+      try {
+        const s = await this.api('/staged');
+        this.stagedProposals = (s && s.ok && Array.isArray(s.proposals)) ? s.proposals : [];
+      } catch (e) { this.stagedProposals = []; }
+    },
+
+    async adoptProposal(proposalId) {
+      this.busy = true;
+      this.setMsg('adopting ' + proposalId + '...', true);
+      try {
+        const r = await this.api('/adopt', { body: { proposal_id: proposalId } });
+        if (r && r.ok) {
+          this.setMsg('adopted: ' + r.skill + ' (snapshot ' + (r.snapshot && r.snapshot.ok ? 'saved' : 'FAILED') + ')', !!(r.snapshot && r.snapshot.ok) || true);
+        } else {
+          this.setMsg('adopt: ' + ((r && r.error) || 'unknown'), false);
+        }
+      } catch (e) { this.setMsg('adopt: ' + e, false); }
+      this.busy = false;
+      await this.refresh();
+    },
+
+    async rejectProposal(proposalId) {
+      this.busy = true;
+      this.setMsg('rejecting ' + proposalId + '...', true);
+      try {
+        const r = await this.api('/reject', { body: { proposal_id: proposalId, reason: 'user rejected via UI' } });
+        if (r && r.ok) { this.setMsg('rejected: ' + proposalId, true); }
+        else { this.setMsg('reject: ' + ((r && r.error) || 'unknown'), false); }
+      } catch (e) { this.setMsg('reject: ' + e, false); }
+      this.busy = false;
+      await this.refresh();
+    },
+
+    async rollbackSkill(skill) {
+      this.busy = true;
+      this.setMsg('rolling back ' + skill + '...', true);
+      try {
+        const r = await this.api('/rollback', { body: { skill } });
+        if (r && r.ok) { this.setMsg('rolled back: ' + skill + ' (' + (r.bytes || 0) + ' bytes)', true); }
+        else { this.setMsg('rollback: ' + ((r && r.error) || 'no snapshot'), false); }
+      } catch (e) { this.setMsg('rollback: ' + e, false); }
+      this.busy = false;
+      await this.refresh();
     },
 
     async save() {
