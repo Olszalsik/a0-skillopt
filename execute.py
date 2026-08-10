@@ -22,7 +22,7 @@ import sys
 
 
 PLUGIN_NAME = "skillopt"
-EXPECTED_VERSION = "1.5.0"
+EXPECTED_VERSION = "1.6.0"
 
 
 def main() -> int:
@@ -54,6 +54,7 @@ def main() -> int:
         "helpers/failure_memory.py",  # v1.3.0 (Day-4 item 6)
         "helpers/cycle_history.py",   # v1.4.0 (Day-5 item 7)
         "helpers/governance.py",      # v1.5.0-Dev (Day-5 item 8)
+        "helpers/official_adapter.py",  # v1.6.0 (Solution B official-engine bridge)
         "api/cycles.py",              # v1.4.0 (Day-5 item 7)
         "api/audit_log.py",           # v1.4.0 (Day-5 item 7)
         "scripts/train_reward_model.py",
@@ -128,9 +129,14 @@ def main() -> int:
     except ImportError as e:
         pkg_info["present"] = False
         pkg_info["import_error"] = str(e)
-        print(f"[{PLUGIN_NAME}] ERROR: skillopt_sleep not importable: {e}")
-        print(f"[{PLUGIN_NAME}] run: pip install 'skillopt'")
-        return 4
+        # v1.6.0: the official package being absent is no longer a hard
+        # failure — the auto-loop falls back to direct_optimizer when
+        # use_official_engine is on but the package isn't importable.
+        # Warn (so the user knows they're on the weaker fallback) but
+        # don't fail the self-check.
+        print(f"[{PLUGIN_NAME}] WARN: skillopt_sleep not importable: {e}")
+        print(f"[{PLUGIN_NAME}]        the auto-loop will use the direct_optimizer fallback.")
+        print(f"[{PLUGIN_NAME}]        install for the research-grade engine: pip install 'skillopt'")
 
     # --- 4. Toggle state ---
     toggle_on = os.path.isfile(os.path.join(here, ".toggle-1"))

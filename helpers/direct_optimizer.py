@@ -30,6 +30,17 @@ v1.1.0 changes:
   `gemma4:31b` placeholder is gone.
 - Writes a per-cycle critique Markdown file so the user can review
   before auto-adopt.
+
+v1.6.0 — FALLBACK ROLE (Solution B):
+- The auto-loop now prefers the official `skillopt_sleep` engine via
+  helpers/official_adapter.py when `use_official_engine` is true and
+  the package is importable. This module is the FALLBACK: it runs when
+  the official package is absent or an official run fails
+  (official_adapter returns fallback_to_direct=True). It is also still
+  used per-skill when only some skills fall back. The function
+  signatures (optimize_skill / run_direct_cycle) are unchanged so the
+  existing tests + adopt path keep working. Do not assume this is the
+  primary optimizer in v1.6.0+; it is the safety net.
 """
 
 from __future__ import annotations

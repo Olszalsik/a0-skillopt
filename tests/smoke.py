@@ -42,6 +42,12 @@ from typing import Callable
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 
+# v1.6.0: the A/B harness now defaults to ADVISORY-OFF (ab_harness_enabled:
+# false). The harness-functionality tests below exercise the harness itself,
+# so they opt in explicitly via this env override (read by ab_harness._config()).
+# Tests that assert the *default* is off unset this for their run.
+os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = "1"
+
 _tests: list[tuple[str, Callable[[], None]]] = []
 
 
@@ -2879,9 +2885,180 @@ def t_v150_governance_auto_loop_skip() -> bool:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ======================================================================= #
+# v1.6.0 — Solution B: official-engine bridge + side-finding fixes
+# ======================================================================= #
+
+_section_v160 = "v1.6.0 NEW (Solution B): official-engine bridge, gate delegation, per-skill gating, side-findings"
+
+
+@test("v1.6.0: version strings aligned across plugin.py / hooks.py / plugin.yaml")
+def t_v160_version_alignment() -> None:
+    import re
+    plugin_py = (PLUGIN_ROOT / "plugin.py").read_text(encoding="utf-8")
+    hooks_py = (PLUGIN_ROOT / "hooks.py").read_text(encoding="utf-8")
+    manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
+    assert 'PLUGIN_VERSION = "1.6.0"' in plugin_py, "plugin.py not 1.6.0"
+    assert 'PLUGIN_VERSION = "1.6.0"' in hooks_py, "hooks.py not 1.6.0"
+    assert re.search(r'^version:\s*1\.6\.0', manifest, re.M), "plugin.yaml not 1.6.0"
+
+
+@test("v1.6.0: default_config.yaml declares the official-engine bridge keys")
+def t_v160_config_keys() -> None:
+    src = (PLUGIN_ROOT / "default_config.yaml").read_text(encoding="utf-8")
+    for key in ["use_official_engine", "official_run_verb", "official_backend",
+                "official_optimizer_model", "official_run_timeout_s"]:
+        assert key in src, f"default_config.yaml missing {key}"
+    # ab_harness is advisory-off by default in v1.6.0
+    assert "ab_harness_enabled: false" in src, "ab_harness_enabled should default to false"
+
+
+@test("v1.6.0: official_adapter probe returns a shaped dict (available bool)")
+def t_v160_probe_official_shape() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import official_adapter
+    info = official_adapter.probe_official(force=True)
+    assert "available" in info and isinstance(info["available"], bool), info
+    assert "py" in info, info
+    assert "error" in info, info
+
+
+@test("v1.6.0: run_official_sleep_cycle falls back to direct when package unavailable")
+def t_v160_official_fallback() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import official_adapter
+    # Force the probe cache to "unavailable" so the run short-circuits
+    # deterministically regardless of whether the package is installed.
+    official_adapter._probe_cache["result"] = {"available": False, "error": "forced by test"}
+    official_adapter._probe_cache["at"] = time.time()
+    try:
+        res = official_adapter.run_official_sleep_cycle(target="x", cfg={})
+        assert res["ok"] is False, res
+        assert res.get("fallback_to_direct") is True, res
+        assert res.get("engine") == "official", res
+        assert "not available" in res.get("reason", ""), res
+    finally:
+        official_adapter._probe_cache["result"] = None
+
+
+@test("v1.6.0: validate_proposal official_gated skips the held-out stage")
+def t_v160_official_gated_skips_heldout() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers.sleep_runner import validate_proposal
+    proposed = "# New Skill\nA substantially different body.\n```\nexample\n```\n" + "y" * 1800
+    current = "# Old Skill\nA completely different body.\n```\nexample\n```\n" + "x" * 1800
+    held = {"before": 0.5, "after": 0.51, "delta_pp": 1.0}  # below 5pp -> normally rejects
+    # Without official_gated: rejects on held-out
+    ok, reason = validate_proposal(
+        proposed, current, min_chars=200, min_improvement_pp=5.0,
+        max_shrink_ratio=0.5, held_out=held,
+    )
+    assert not ok and "held-out" in reason, f"expected held-out reject, got {ok!r} {reason!r}"
+    # With official_gated=True: held-out stage skipped -> accepts (structural passes)
+    ok2, reason2 = validate_proposal(
+        proposed, current, min_chars=200, min_improvement_pp=5.0,
+        max_shrink_ratio=0.5, held_out=held, official_gated=True,
+    )
+    assert ok2, f"official_gated should accept; got {reason2!r}"
+
+
+@test("v1.6.0: validate_proposal official_gated still rejects structural failures")
+def t_v160_official_gated_keeps_structural() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers.sleep_runner import validate_proposal
+    # Byte-identical must still reject even when official_gated
+    text = "# Skill\nA 1904 char block\n```\nexample\n```\n" + "x" * 1700
+    ok, reason = validate_proposal(
+        text, text, min_chars=200, min_improvement_pp=5.0,
+        max_shrink_ratio=0.5, held_out=None, official_gated=True,
+    )
+    assert not ok, f"official_gated must not bypass structural checks; got {ok!r} {reason!r}"
+
+
+@test("v1.6.0: auto-loop _tick wires governance + cadence + budget + official engine")
+def t_v160_tick_wiring() -> None:
+    src = (PLUGIN_ROOT / "helpers" / "auto_loop.py").read_text(encoding="utf-8")
+    assert "check_skill_eligible" in src, "tick must call governance.check_skill_eligible"
+    assert "compute_next_run" in src, "tick must call cadence.compute_next_run"
+    assert "can_spend" in src, "tick must call budget.can_spend"
+    assert "use_official_engine" in src, "tick must branch on use_official_engine"
+    assert "official_adapter" in src, "tick must drive the official adapter"
+    assert "last_engine" in src, "tick must record last_engine for Phase 2"
+    assert "official_gated" in src, "_auto_adopt must pass official_gated to the gate"
+
+
+@test("v1.6.0: ab_harness defaults to advisory-off (env unset)")
+def t_v160_ab_harness_default_off() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import ab_harness
+    saved = os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
+    try:
+        cfg = ab_harness._config()
+        assert cfg["enabled"] is False, (
+            f"ab_harness default should be False (advisory-off), got {cfg['enabled']}"
+        )
+    finally:
+        if saved is not None:
+            os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = saved
+
+
+@test("v1.6.0: cycle_history compaction rotates overflow to .archive.jsonl")
+def t_v160_cycle_history_compaction() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import cycle_history
+    cycle_history.reset_for_tests()
+    archive = cycle_history._runs_dir() / "cycle_history.archive.jsonl"
+    if archive.is_file():
+        archive.unlink()
+    jsonl = cycle_history._jsonl_path()
+    jsonl.parent.mkdir(parents=True, exist_ok=True)
+    # Write 5 entries directly into the JSONL.
+    for i in range(5):
+        with open(jsonl, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"cycle_id": f"c{i}", "skill": f"s{i}", "outcome": "tick"}) + "\n")
+    # Compact to keep 3 -> 2 moved to archive.
+    res = cycle_history._compact_jsonl(3)
+    assert res["ok"], res
+    assert res["compacted"] == 2, res
+    with open(jsonl, "r", encoding="utf-8") as f:
+        hot = [ln for ln in f if ln.strip()]
+    assert len(hot) == 3, f"hot file should retain 3, has {len(hot)}"
+    assert archive.is_file(), "archive file not created"
+    with open(archive, "r", encoding="utf-8") as f:
+        cold = [ln for ln in f if ln.strip()]
+    assert len(cold) == 2, f"archive should have 2, has {len(cold)}"
+    # idempotent: compacting again at max=3 is a no-op
+    res2 = cycle_history._compact_jsonl(3)
+    assert res2["compacted"] == 0, res2
+    # cleanup
+    cycle_history.reset_for_tests()
+    if archive.is_file():
+        archive.unlink()
+
+
+@test("v1.6.0: get_history_status surfaces archive + max_entries")
+def t_v160_cycle_history_status_archive() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import cycle_history
+    cycle_history.reset_for_tests()
+    archive = cycle_history._runs_dir() / "cycle_history.archive.jsonl"
+    if archive.is_file():
+        archive.unlink()
+    try:
+        st = cycle_history.get_history_status()
+        assert "archive_path" in st, st
+        assert "max_entries" in st, st
+        assert "archived_entries" in st, st
+    finally:
+        cycle_history.reset_for_tests()
+        if archive.is_file():
+            archive.unlink()
+
+
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
     print(_section_v110)
     print(_section_v120)
     print(_section_v121)
+    print(_section_v160)
     sys.exit(main())

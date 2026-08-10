@@ -73,6 +73,53 @@ def _enabled() -> bool:
         return True
 
 
+def _max_entries() -> int:
+    """Resolve the cycle_history_max_entries cap (0 = no compaction)."""
+    try:
+        from usr.plugins.skillopt.helpers import config_loader  # type: ignore
+        cfg = config_loader.load_config()
+        return max(0, int(cfg.get("cycle_history_max_entries", 500) or 500))
+    except Exception:
+        return 500
+
+
+def _compact_jsonl(max_entries: int) -> dict:
+    """v1.6.0 compaction: if the JSONL exceeds max_entries lines, move the
+    oldest (total - max_entries) lines to a cold `cycle_history.archive.jsonl`
+    so the hot file stays bounded. The archive is append-only and never
+    re-compacted. Best-effort: a failure returns {ok: False, error} and
+    never raises (compaction must not break recording).
+    """
+    out = {"ok": True, "compacted": 0, "archived": 0}
+    if max_entries <= 0:
+        return out
+    jsonl = _jsonl_path()
+    if not jsonl.is_file():
+        return out
+    try:
+        with open(jsonl, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        total = len(lines)
+        if total <= max_entries:
+            return out
+        overflow = total - max_entries
+        cold = lines[:overflow]
+        hot = lines[overflow:]
+        archive = _runs_dir() / "cycle_history.archive.jsonl"
+        with open(archive, "a", encoding="utf-8") as f:
+            f.writelines(cold)
+        # Atomic-ish rewrite of the hot file with the retained entries.
+        tmp = jsonl.with_suffix(jsonl.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(hot)
+        os.replace(tmp, jsonl)
+        out["compacted"] = overflow
+        out["archived"] = len(cold)
+    except Exception as e:
+        out = {"ok": False, "error": f"compaction failed: {e}"}
+    return out
+
+
 def record_cycle_entry(cycle_entry: dict) -> dict:
     """Append one cycle entry to logs/runs/cycle_history.jsonl.
 
@@ -88,7 +135,7 @@ def record_cycle_entry(cycle_entry: dict) -> dict:
     entry = dict(cycle_entry)
     entry.setdefault("cycle_id", _short_id())
     entry.setdefault("ts", _now_iso())
-    entry.setdefault("version", "1.4.0-dev")
+    entry.setdefault("version", "1.6.0")
     entry.setdefault("skill", "")
     entry.setdefault("outcome", "unknown")
     entry.setdefault("outcome_detail", "")
@@ -111,7 +158,14 @@ def record_cycle_entry(cycle_entry: dict) -> dict:
                 f"skill={entry['skill']}\toutcome={entry['outcome']}\t"
                 f"runtime_s={entry['runtime_seconds']}\n"
             )
-        # Approximate the 1-based line number
+        # v1.6.0: enforce cycle_history_max_entries by rotating overflow
+        # to a cold archive. Best-effort; never raises (a compaction bug
+        # must not break the recording above, which already succeeded).
+        try:
+            compaction = _compact_jsonl(_max_entries())
+        except Exception:
+            compaction = {"ok": False, "error": "compaction raised"}
+        # Approximate the 1-based line number (post-compaction)
         with open(jsonl, "rb") as fr:
             line_no = sum(1 for _ in fr)
         return {
@@ -119,6 +173,7 @@ def record_cycle_entry(cycle_entry: dict) -> dict:
             "cycle_id": entry["cycle_id"],
             "line_no": line_no,
             "path": str(jsonl),
+            "compaction": compaction,
         }
     except Exception as e:
         return {
@@ -200,12 +255,23 @@ def get_history_status() -> dict:
         "enabled": enabled,
         "file_path": str(jsonl),
         "log_path": str(log),
+        "archive_path": str(_runs_dir() / "cycle_history.archive.jsonl"),
         "total_entries": 0,
+        "archived_entries": 0,
+        "max_entries": _max_entries(),
         "file_size_bytes": 0,
         "last_cycle_id": None,
         "last_cycle_ts": None,
         "last_outcome": None,
     }
+    # Count archived entries (cold file), best-effort.
+    archive = _runs_dir() / "cycle_history.archive.jsonl"
+    if archive.is_file():
+        try:
+            with open(archive, "r", encoding="utf-8") as f:
+                out["archived_entries"] = sum(1 for _ in f)
+        except Exception:
+            pass
     if not jsonl.is_file():
         return out
     try:

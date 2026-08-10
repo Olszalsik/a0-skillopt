@@ -83,6 +83,7 @@ def _load_state() -> dict[str, Any]:
         "proposals_rejected": 0,
         "running": False,
         "last_error": None,
+        "last_engine": None,
     }
 
 
@@ -171,52 +172,17 @@ class AutoLoopThread(threading.Thread):
         min_new = int(cfg.get("auto_loop_min_rollouts", 10))
 
         # 2. Maybe launch a Sleep cycle
-        last_log: str | None = None
         if new_rollouts >= min_new:
-            verb = "run"
             target = (cfg.get("auto_loop_skill_target") or "").strip() or None
             self._log(
-                f"auto-loop: launching direct optimizer "
+                f"auto-loop: tick "
                 f"(new_rollouts={new_rollouts}, threshold={min_new}, target={target})"
             )
             try:
-                # Option 3: call the direct optimizer (bypasses the Sleep
-                # engine entirely). Reads rollouts, calls ollama_cloud
-                # directly, writes improved skill to staging/.
-                from usr.plugins.skillopt.helpers import direct_optimizer # type: ignore
-                # v1.3.0 (Day-4 item 4): the inner loop may have
-                # produced targeted suggestions since the last cycle.
-                # If so, build a per-skill targeted_prompts dict and
-                # pass it to the direct optimizer. Skills with no
-                # suggestions keep the generic 'rewrite the whole
-                # skill' prompt. The targeted prompt is the whole
-                # point of the inner loop - one minimal edit instead
-                # of a full rewrite.
-                custom_prompts = self._build_targeted_prompts(target)
-                targeted_skills = sorted(custom_prompts.keys())
-                if targeted_skills:
-                    self._log(
-                        f"auto-loop: inner-loop suggestions present for {len(targeted_skills)} "
-                        f"skill(s): {targeted_skills[:5]}"
-                    )
-                result = direct_optimizer.run_direct_cycle(
-                    target=target or "",
-                    custom_prompts=custom_prompts or None,
-                )
-                # Drain the suggestions we just consumed so the queue
-                # doesn't grow unbounded. drain_suggestions returns
-                # AND deletes the suggestions older than max_age.
-                if targeted_skills:
-                    self._drain_consumed_suggestions(targeted_skills, cfg)
-                self._log(f"auto-loop: direct cycle result: {result}")
-                state["last_cycle_at"] = time.time()
-                state["last_cycle_verb"] = verb
-                state["last_rollout_count_at_cycle"] = rollout_count
-                state["cycles_run"] = int(state.get("cycles_run", 0)) + 1
-                _save_state(state)
+                self._run_cycle_for_eligible_skills(target, cfg, state, rollout_count)
             except Exception as e:
-                self._log(f"direct cycle failed: {e}")
-                _record_error(e, "direct_cycle")
+                self._log(f"cycle failed: {e}")
+                _record_error(e, "cycle")
                 raise
         else:
             self._log(
@@ -224,9 +190,224 @@ class AutoLoopThread(threading.Thread):
                 f"(new_rollouts={new_rollouts} < threshold={min_new})"
             )
 
+        # v1.5.0: Record a tick-level cycle_history entry so the dashboard
+        # has visibility even when no skill is eligible or no cycle fires.
+        # Best-effort: a cycle_history bug can never crash the auto-loop.
+        try:
+            from usr.plugins.skillopt.helpers import cycle_history  # type: ignore # noqa: F401
+        except Exception:
+            from helpers import cycle_history  # type: ignore # noqa: F401
+        try:
+            cycle_history.record_cycle_entry({
+                "skill": "_tick",
+                "outcome": "tick",
+                "outcome_detail": f"rollouts={rollout_count} new={new_rollouts} threshold={min_new}",
+                "gate_reasons": [],
+                "gate_stages_passed": [],
+                "llm_calls": 0,
+                "runtime_seconds": 0.0,
+                "links": {
+                    "rollout_count": rollout_count,
+                    "new_rollouts": new_rollouts,
+                    "min_rollouts": min_new,
+                },
+            })
+        except Exception as e:
+            self._log(f"cycle_history tick entry failed: {e}")
+
         # 3. Maybe auto-adopt
         if cfg.get("auto_adopt", False):
             self._auto_adopt(state, cfg)
+
+    # ----------------------------------------------------------------- #
+    # v1.6.0: engine selection + per-skill gating
+    # ----------------------------------------------------------------- #
+    #
+    # _run_cycle_for_eligible_skills() is the v1.6.0 replacement for the
+    # old "launch direct_optimizer once for all skills" call. It:
+    #   1. enumerates candidate skills (the configured target, or every
+    #      skill that has rollouts),
+    #   2. filters them through governance + cadence + budget (Phase 3),
+    #   3. runs the official engine when `use_official_engine` is on and
+    #      the package is importable, else falls back to direct_optimizer
+    #      (Phase 1),
+    #   4. records `state["last_engine"]` so _auto_adopt knows whether
+    #      the staged proposal was already gated by the official engine
+    #      (Phase 2 — the official_gated flag).
+    #
+    # All gating helpers are defensive: a governance/cadence/budget bug
+    # falls through to "eligible" (matching the existing fall-through in
+    # _auto_adopt), so a helper failure can never stall evolution. The
+    # official-engine path is fail-soft: any error returns
+    # fallback_to_direct and we retry that skill on the direct optimizer.
+
+    def _run_cycle_for_eligible_skills(
+        self, target: str | None, cfg: dict[str, Any],
+        state: dict[str, Any], rollout_count: int,
+    ) -> None:
+        """Gate candidate skills, then run the official or direct engine."""
+        use_official = bool(cfg.get("use_official_engine", True))
+        candidates = self._candidate_skills(target)
+        if not candidates:
+            self._log("auto-loop: no skills with rollouts to optimize")
+            return
+
+        eligible: list[str] = []
+        for skill in candidates:
+            ok, reason = self._skill_eligible_for_cycle(skill, cfg)
+            if ok:
+                eligible.append(skill)
+            else:
+                self._log(f"auto-loop: skip {skill!r} ({reason})")
+        if not eligible:
+            self._log("auto-loop: no eligible skills this tick")
+            return
+
+        # v1.3.0: build targeted prompts from inner-loop suggestions.
+        # Only consumed by the direct path (the official engine does not
+        # take free-form prompts). We still build them so the direct
+        # fallback / direct-only path uses them.
+        custom_prompts = self._build_targeted_prompts(target)
+
+        ran_engine: str | None = None
+        for skill in eligible:
+            result = self._run_engine_for_skill(skill, use_official, cfg, custom_prompts)
+            engine_used = result.get("engine") or "direct"
+            ran_engine = engine_used
+            self._log(
+                f"auto-loop: {skill} cycle via {engine_used}: "
+                f"ok={result.get('ok')} {result.get('reason', '')}"
+            )
+            # Drain inner-loop suggestions only when the direct path
+            # actually consumed them (official path doesn't take prompts).
+            if engine_used == "direct" and result.get("ok"):
+                self._drain_consumed_suggestions([skill], cfg)
+            # Per-skill cadence + budget bookkeeping (best-effort).
+            self._mark_skill_cycle(skill, cfg)
+            state["last_cycle_at"] = time.time()
+            state["last_cycle_verb"] = cfg.get("official_run_verb") or "run"
+            state["last_rollout_count_at_cycle"] = rollout_count
+            state["cycles_run"] = int(state.get("cycles_run", 0)) + 1
+            state["last_engine"] = engine_used
+            _save_state(state)
+
+    def _run_engine_for_skill(
+        self, skill: str, use_official: bool, cfg: dict[str, Any],
+        custom_prompts: dict[str, str],
+    ) -> dict[str, Any]:
+        """Run the official engine for one skill, falling back to direct."""
+        if use_official:
+            try:
+                from usr.plugins.skillopt.helpers import official_adapter  # type: ignore
+                probe = official_adapter.probe_official()
+            except Exception as e:
+                self._log(f"official_adapter import/probe failed: {e}; using direct")
+                probe = {"available": False}
+            if probe.get("available"):
+                timeout = int(cfg.get("official_run_timeout_s", 600) or 600)
+                result = official_adapter.run_official_sleep_cycle(
+                    target=skill, custom_prompts=custom_prompts, cfg=cfg,
+                    timeout_s=timeout,
+                )
+                if result.get("ok"):
+                    return {**result, "engine": "official"}
+                # Fall through to direct on any failure.
+                self._log(
+                    f"auto-loop: official engine fallback for {skill!r}: "
+                    f"{result.get('reason')}"
+                )
+        # Direct optimizer (the existing working path, also the fallback).
+        from usr.plugins.skillopt.helpers import direct_optimizer  # type: ignore
+        cp = custom_prompts.get(skill)
+        res = direct_optimizer.optimize_skill(
+            skill, min_rollouts=int(cfg.get("auto_loop_min_rollouts", 3)),
+            custom_prompt=cp,
+        )
+        res["engine"] = "direct"
+        return res
+
+    def _candidate_skills(self, target: str | None) -> list[str]:
+        """Skills with rollouts. A configured target is the only candidate."""
+        if target:
+            return [target]
+        out: set[str] = set()
+        for rp in sleep_runner.rollouts_dir().glob("*.json"):
+            try:
+                r = json.loads(rp.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                continue
+            sk = (r.get("skill_used") or "").strip()
+            if sk:
+                out.add(sk)
+        return sorted(out)
+
+    def _skill_eligible_for_cycle(
+        self, skill: str, cfg: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Per-skill gate: governance + cadence + budget. Defensive.
+
+        On any helper failure we fall through to eligible (a helper bug
+        must never stall evolution), mirroring the fall-through in
+        _auto_adopt's governance check.
+        """
+        # Governance (opt-out / immutable / rate-limited / approval).
+        try:
+            from usr.plugins.skillopt.helpers import governance  # type: ignore  # noqa: F401
+        except Exception:
+            governance = None  # type: ignore[assignment]
+        if governance is not None:
+            try:
+                eligible, reason = governance.check_skill_eligible(skill)
+                try:
+                    governance.mark_decision(skill, eligible, reason)
+                except Exception:
+                    pass
+                if not eligible:
+                    return False, reason
+            except Exception as e:
+                self._log(f"governance check failed for {skill!r}: {e}; fall through")
+
+        # Cadence: is this skill due for a cycle yet?
+        if cadence is not None:
+            try:
+                st = cadence.load_per_skill_state(skill)
+                new_n = cadence.count_new_rollouts(skill, st.get("last_run_at", 0.0))
+                next_in_s = cadence.compute_next_run(new_n)
+                if (time.time() - st.get("last_run_at", 0.0)) < next_in_s:
+                    return False, f"cadence: not due for {next_in_s}s"
+            except Exception as e:
+                self._log(f"cadence check failed for {skill!r}: {e}; fall through")
+
+        # Budget: can we spend one more LLM call on this skill today?
+        if budget is not None:
+            try:
+                bt = budget.BudgetTracker(skill_name=skill)
+                cost = int(cfg.get("budget", {}).get("cost_per_call_cents", 1) or 1)
+                ok, reason = bt.can_spend(cost)
+                if not ok:
+                    return False, f"budget: {reason}"
+            except Exception as e:
+                self._log(f"budget check failed for {skill!r}: {e}; fall through")
+
+        return True, "eligible"
+
+    def _mark_skill_cycle(self, skill: str, cfg: dict[str, Any]) -> None:
+        """Update per-skill cadence + budget state after a cycle. Best-effort."""
+        if cadence is not None:
+            try:
+                st = cadence.load_per_skill_state(skill)
+                st["last_run_at"] = time.time()
+                st["total_cycles"] = int(st.get("total_cycles", 0)) + 1
+                cadence.save_per_skill_state(skill, st)
+            except Exception as e:
+                self._log(f"cadence state save failed for {skill!r}: {e}")
+        if budget is not None:
+            try:
+                bt = budget.BudgetTracker(skill_name=skill)
+                cost = int(cfg.get("budget", {}).get("cost_per_call_cents", 1) or 1)
+                bt.record_spend(cost)
+            except Exception as e:
+                self._log(f"budget record failed for {skill!r}: {e}")
 
     # ----------------------------------------------------------------- #
     # v1.3.0 (Day-4 item 4) - inner-loop integration
@@ -385,11 +566,14 @@ class AutoLoopThread(threading.Thread):
         last_log = _latest_sleep_log()
         held_out = sleep_runner.parse_held_out(last_log) if last_log else None
 
-        # Use the shared gate from sleep_runner. v1.2.0 (Task A.2):
-        # pass skill_name so the A/B harness stage runs against this
-        # skill's rollouts. The harness is opt-in; if ab_harness_enabled
-        # is False the new stage is a no-op.
-        ab_enabled = bool(cfg.get("ab_harness_enabled", True))
+        # v1.6.0 (Phase 2): if the staged proposal was produced by the
+        # official Sleep engine, that engine already ran its monotonic
+        # held-out gate before staging — so the local gate only needs the
+        # cheap structural pre-filter (official_gated=True skips the local
+        # held-out stage and the advisory A/B harness). The direct
+        # optimizer path keeps the full local gate.
+        official_gated = state.get("last_engine") == "official"
+        ab_enabled = bool(cfg.get("ab_harness_enabled", False)) and not official_gated
         ok, reason = sleep_runner.validate_proposal(
             proposed,
             current,
@@ -398,6 +582,7 @@ class AutoLoopThread(threading.Thread):
             max_shrink_ratio=float(cfg.get("gate_max_shrink_ratio", 0.5)),
             held_out=held_out,
             skill_name=skill_name if ab_enabled else None,
+            official_gated=official_gated,
         )
         entry = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),

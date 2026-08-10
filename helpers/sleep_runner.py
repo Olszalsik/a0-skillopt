@@ -276,6 +276,7 @@ def validate_proposal(
     *,
     skill_name: str | None = None,
     skill_path: str | os.PathLike | None = None,
+    official_gated: bool = False,
 ) -> tuple[bool, str]:
     """Shared validation gate used by auto-loop, adopt API, post-adopt hook, tool.
 
@@ -288,6 +289,8 @@ def validate_proposal(
        through to the structural stages below. The harness is never
        allowed to CRASH the gate; a bug in the harness returns
        can_run=False and the structural stages run unchanged.
+       v1.6.0: the harness is ADVISORY ONLY (ab_harness_enabled defaults
+       false) — the official engine's own gate is authoritative.
     0.5. v1.2.0 per-fragment gate (only when `skill_path` is passed).
        Decomposes the SKILL.md into named fragments via
        `fragment_store.read_fragments()`, and runs the structural
@@ -309,13 +312,19 @@ def validate_proposal(
        min_improvement_pp. If held_out is None we skip this check
        (the Sleep engine didn't surface one, e.g. for the direct
        optimizer path which has no numeric gate).
+       v1.6.0 (Phase 2): when `official_gated` is True, stage 8 is
+       SKIPPED entirely — the official Sleep engine already enforced
+       its strict monotonic held-out gate before staging the proposal,
+       so re-gating locally would double-count and could reject a
+       proposal the authoritative gate accepted. The structural stages
+       (1-7) still run as the cheap pre-filter; only the numeric
+       held-out stage is delegated upstream.
 
     Backwards compat: existing callers that don't pass `skill_name`
-    AND don't pass `skill_path` see the original v1.1.0 behaviour
-    exactly. The A/B stage and the per-fragment stage are both opt-in
-    and run before any expensive structural check. The A/B stage is
-    a fast-path reject; the per-fragment stage is a finer-grained
-    structural check that uses the v1.2.0 fragment store.
+    AND don't pass `skill_path` AND don't pass `official_gated` see the
+    original v1.1.0 behaviour exactly. The A/B stage and the per-fragment
+    stage are both opt-in and run before any expensive structural check.
+    `official_gated` only short-circuits the held-out stage.
     """
     # v1.2.0: stage 0 - A/B harness. Wrapped in try/except so a
     # harness bug can never crash the gate. The harness returns
@@ -438,7 +447,7 @@ def validate_proposal(
                     f"proposed skill shrank by more than "
                     f"{int(max_shrink_ratio*100)}% ({len(current)} -> {len(proposed)} chars)"
                 )
-        if min_improvement_pp > 0 and held_out is not None:
+        if not official_gated and min_improvement_pp > 0 and held_out is not None:
             delta = held_out.get("delta_pp")
             if delta is None or delta < min_improvement_pp:
                 return False, (

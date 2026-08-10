@@ -40,6 +40,18 @@ Pluggable judge:
   swaps in a real judge that POSTs to `SKILLOPT_JUDGE_ENDPOINT`. The
   smoke tests inject a deterministic judge so the harness is fully
   testable without an LLM.
+
+v1.6.0 — ADVISORY ONLY (Solution B):
+  The synthetic "replay" here feeds [task + response + skill_text] to
+  the (untrained) reward model; it is NOT a real counterfactual replay,
+  so it cannot be an authoritative gate. With use_official_engine on,
+  the official Sleep engine's own monotonic held-out gate is
+  authoritative before staging. Accordingly `ab_harness_enabled`
+  now defaults to FALSE (see default_config.yaml) and the auto-loop
+  only passes `skill_name` to validate_proposal when BOTH
+  ab_harness_enabled is true AND the proposal did NOT come from the
+  official engine (official_gated). Set ab_harness_enabled true only
+  if you want the harness as an extra advisory reject signal.
 """
 
 from __future__ import annotations
@@ -217,6 +229,12 @@ def _config() -> dict[str, Any]:
             out["n"] = int(os.environ["SKILLOPT_AB_HARNESS_N"])
         except ValueError:
             pass
+    # v1.6.0: explicit env override for the enabled flag. The default is
+    # now false (advisory-only); tests + power users opt in by setting
+    # SKILLOPT_AB_HARNESS_ENABLED=1.
+    env_en = os.environ.get("SKILLOPT_AB_HARNESS_ENABLED")
+    if env_en is not None:
+        out["enabled"] = env_en.strip().lower() in ("1", "true", "yes", "on")
     return out
 
 
