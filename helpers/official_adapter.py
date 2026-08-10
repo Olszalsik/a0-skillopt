@@ -41,14 +41,42 @@ DESIGN CONSTRAINTS
      falls back to direct_optimizer. Never crash, never stall
      evolution on an unverified integration.
 
-UNVERIFIED API NOTE
-  The `skillopt_sleep` CLI verb set (`run` / `cycle` / `harvest` /
-  `adopt` / `status`) and the `evaluate_gate` signature are taken from
-  the upstream README + paper and have NOT been verified against an
-  installed package here (the package is not installed in this env; the
-  live verification step in the plan covers this). The run verb is
-  configurable via `official_run_verb` so the user can match whatever the
-  installed version expects without a code change.
+VERIFIED API (v1.6.1, verified against microsoft/skillopt @ HEAD 2026-08-10)
+  The package is NOT installed in this dev env, so the live subprocess path is
+  still exercised only when the user installs it. But the CLI surface and gate
+  signature have been verified against the upstream source tree (clone of
+  microsoft/skillopt), so the arg mapping and staging discovery below match
+  the real package, not a guess:
+
+  CLI (entry point `skillopt-sleep = skillopt_sleep.__main:main`; invoked as
+  `python -m skillopt_sleep <subcommand>`). Subcommands: `run` (full cycle:
+  harvest->mine->replay->gate->stage), `dry-run`, `status`, `adopt`, `harvest`,
+  `schedule`, `unschedule`. `run` flags (from _add_common): `--project PATH`,
+  `--target-skill-path PATH` (a real SKILL.md path, NOT a skill name),
+  `--backend mock|claude|codex|copilot|cursor|pi|handoff|azure_openai`,
+  `--model NAME` (single model; there is no separate optimizer/target model),
+  `--lookback-hours N`, `--max-tasks N`, `--edit-budget N`, `--auto-adopt`,
+  `--preferences`, `--json`, `--progress`. The verb is configurable via
+  `official_run_verb` (default `run`).
+
+  Staging: `run` writes to `<project>/.skillopt-sleep/staging/<ts>/` containing
+  `proposed_SKILL.md`, `report.json`, `report.md`, `manifest.json`. The
+  authoritative gate verdict is in `report.json`:
+  `{accepted, gate_action, baseline_score, candidate_score, night, edits}`.
+  We read it via _read_gate_verdict() instead of scraping the log. We copy
+  `proposed_SKILL.md` into the plugin's `staging/<skill>.md` ONLY when the gate
+  accepted, so _auto_adopt only ever promotes gate-accepted proposals.
+
+  evaluate_gate signature (skillopt_sleep.gate AND skillopt.evaluation.gate,
+  behaviourally identical; the vendored copy is what the sleep engine uses):
+    evaluate_gate(candidate_skill, cand_hard, current_skill, current_score,
+                  best_skill, best_score, best_step, global_step, *,
+                  cand_soft=0.0, metric="hard", mixed_weight=0.5) -> GateResult
+  GateResult(action, current_skill, current_score, best_skill, best_score,
+  best_step); action in {"accept_new_best","accept","reject"}. We do NOT call
+  this authoritatively — the engine already ran it before staging and the
+  verdict is in report.json. _try_evaluate_gate() is corrected-to-spec for
+  future direct use + tests; degrades to None when the package is absent.
 """
 
 from __future__ import annotations
@@ -75,6 +103,38 @@ _probe_cache: dict[str, Any] = {"at": 0.0, "result": None}
 
 def _a0_python() -> str:
     return sleep_runner._a0_python()
+
+
+def _a0_root() -> Path:
+    """The A0 install root on this host.
+
+    `sleep_runner.plugin_root()` = `<a0>/usr/plugins/skillopt`, so
+    `.parent.parent` = `<a0>/usr` and `.parent.parent.parent` = `<a0>`.
+    The official engine's `--project` and the skills dir both resolve
+    from here. On the host this is E:\\...\\a0-inst-agent-zero-*; inside
+    the container the same paths are under /a0 — but the subprocess we
+    launch is the host .venv python, so host paths are correct.
+    """
+    return sleep_runner.plugin_root().parent.parent.parent
+
+
+def _resolve_skill_path(target: str | None) -> str | None:
+    """Resolve a skill name to its live SKILL.md path, or None.
+
+    A0 skills live at `<a0_root>/usr/skills/<name>/SKILL.md`. The official
+    `--target-skill-path` flag wants this real path (NOT a bare skill name).
+    Returns None when the skill dir doesn't exist so the caller can omit
+    the flag (the engine then evolves whatever skills it finds, or none).
+    """
+    if not target:
+        return None
+    p = _a0_root() / "usr" / "skills" / target / "SKILL.md"
+    return str(p) if p.is_file() else None
+
+
+def _official_staging_root() -> Path:
+    """Where the official `run` writes its staging dirs: `<a0>/.skillopt-sleep/staging/`."""
+    return _a0_root() / ".skillopt-sleep" / "staging"
 
 
 def probe_official(force: bool = False) -> dict[str, Any]:
@@ -132,29 +192,52 @@ def _str_cfg(cfg: dict[str, Any], key: str) -> str | None:
 
 
 def _build_run_args(cfg: dict[str, Any], target: str | None) -> list[str]:
-    """Map A0 config keys to `skillopt_sleep <verb>` CLI args.
+    """Map A0 config keys to the real `skillopt_sleep run` CLI args.
 
-    Conservative: only pass args we have values for. The verb itself is
-    `official_run_verb` (default "run"); the user can override it to
-    match the installed package's actual command (e.g. "cycle").
+    Verified against microsoft/skillopt @ HEAD (see module docstring):
+      --project PATH            (project to evolve; staging lands here)
+      --target-skill-path PATH  (a real SKILL.md path, NOT a skill name)
+      --backend mock|claude|codex|copilot|cursor|pi|handoff|azure_openai
+      --model NAME              (single model; no separate optimizer/target)
+      --lookback-hours N
+      --max-tasks N
+      --edit-budget N
+      --preferences TEXT
+      --json                    (machine-readable stdout in the log)
+
+    We do NOT pass --auto-adopt: our local _auto_adopt + validate_proposal
+    decide promotion so the safety wrapper stays in our control. The verb
+    itself is `official_run_verb` (default "run"); appended by
+    launch_sleep_subprocess as the subcommand.
     """
     args: list[str] = []
-    if target:
-        args += ["--skill", str(target)]
+
+    # --project: stage to <a0>/.skillopt-sleep/staging/<ts>/ for predictable
+    # discovery. Without it the engine uses cwd (the plugin's staging dir),
+    # burying the output where _find_staging_dir won't look.
+    args += ["--project", str(_a0_root())]
+
+    # --target-skill-path: real path to the live SKILL.md.
+    skill_path = _resolve_skill_path(target)
+    if skill_path:
+        args += ["--target-skill-path", skill_path]
+
     backend = _str_cfg(cfg, "official_backend")
     if backend:
-        args += ["--backend", backend]
-    opt_model = _str_cfg(cfg, "official_optimizer_model") or _str_cfg(cfg, "optimizer_model")
-    if opt_model:
-        args += ["--optimizer-model", opt_model]
-    tgt_model = _str_cfg(cfg, "official_target_model") or _str_cfg(cfg, "target_model")
-    if tgt_model:
-        args += ["--target-model", tgt_model]
-    # The official engine stages by default; we never pass --auto-adopt
-    # here — our local _auto_adopt + validate_proposal decide promotion
-    # so the safety wrapper stays in our control.
+        # The real CLI rejects unknown backends with argparse error; only
+        # pass values that look like a known choice.
+        known = {"mock", "claude", "codex", "copilot", "cursor", "pi",
+                 "handoff", "azure_openai"}
+        if backend in known:
+            args += ["--backend", backend]
+
+    # Single --model (no separate optimizer/target model in the real CLI).
+    model = _str_cfg(cfg, "official_optimizer_model") or _str_cfg(cfg, "optimizer_model")
+    if model:
+        args += ["--model", model]
+
     lookback = cfg.get("official_lookback_hours")
-    if lookback:
+    if lookback is not None:
         try:
             args += ["--lookback-hours", str(int(lookback))]
         except (TypeError, ValueError):
@@ -165,6 +248,18 @@ def _build_run_args(cfg: dict[str, Any], target: str | None) -> list[str]:
             args += ["--max-tasks", str(int(max_tasks))]
         except (TypeError, ValueError):
             pass
+    edit_budget = cfg.get("official_edit_budget")
+    if edit_budget:
+        try:
+            args += ["--edit-budget", str(int(edit_budget))]
+        except (TypeError, ValueError):
+            pass
+    prefs = _str_cfg(cfg, "official_preferences")
+    if prefs:
+        args += ["--preferences", prefs]
+
+    # Machine-readable stdout so the log carries the structured payload too.
+    args += ["--json"]
     return args
 
 
@@ -172,36 +267,53 @@ def _build_run_args(cfg: dict[str, Any], target: str | None) -> list[str]:
 # Staged-proposal discovery + rename
 # ----------------------------------------------------------------------- #
 
-def _find_staged(target: str | None) -> Path | None:
-    """Locate the proposal the official engine wrote to staging/.
+def _find_staging_dir() -> Path | None:
+    """Locate the official engine's most recent staging dir.
 
-    The engine's `consolidate` step writes `best_skill.md` (generic). The
-    auto-loop's _auto_adopt looks for `staging/<skill>.md`. When a target
-    skill is known we rename best_skill.md -> <skill>.md so the existing
-    adopt path finds it unchanged. When no target is set we leave
-    best_skill.md in place (the adopt path's find_staged_proposals() also
-    matches .md files).
+    The `run` command writes to `<project>/.skillopt-sleep/staging/<ts>/`
+    (one timestamped dir per night), each containing `proposed_SKILL.md`,
+    `report.json`, `report.md`, `manifest.json`. We pick the newest dir
+    that has a `manifest.json` (matches the upstream `latest_staging()`
+    heuristic). Returns None if no staging exists.
     """
-    sd = sleep_runner.staging_dir()
-    if target:
-        named = sd / f"{target}.md"
-        if named.is_file():
-            return named
-        best = sd / "best_skill.md"
-        if best.is_file():
-            try:
-                best.replace(named)
-                return named
-            except Exception:
-                return best
-    # No target: prefer best_skill.md, else first .md
-    best = sd / "best_skill.md"
-    if best.is_file():
-        return best
-    for child in sorted(sd.iterdir()):
-        if child.is_file() and child.suffix == ".md":
-            return child
-    return None
+    root = _official_staging_root()
+    if not root.is_dir():
+        return None
+    candidates: list[Path] = []
+    for child in root.iterdir():
+        if child.is_dir() and (child / "manifest.json").is_file():
+            candidates.append(child)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _read_gate_verdict(staging_dir: Path) -> dict[str, Any] | None:
+    """Read the authoritative gate verdict from `report.json`.
+
+    The official engine runs its monotonic `evaluate_gate` BEFORE staging
+    and writes the verdict to `report.json`. This is the authoritative
+    accept/reject decision — we do not re-run the gate. Returns None if
+    the report is missing or unreadable (caller treats as no proposal).
+    """
+    rj = staging_dir / "report.json"
+    if not rj.is_file():
+        return None
+    try:
+        rep = json.loads(rj.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return {
+        "accepted": bool(rep.get("accepted", False)),
+        "gate_action": rep.get("gate_action", ""),
+        "baseline_score": rep.get("baseline_score"),
+        "candidate_score": rep.get("candidate_score"),
+        "night": rep.get("night"),
+        "n_accepted_edits": rep.get("n_accepted_edits",
+                                   len(rep.get("edits", []) or [])),
+        "n_rejected_edits": rep.get("n_rejected_edits", 0),
+        "report": rep,
+    }
 
 
 # ----------------------------------------------------------------------- #
@@ -214,15 +326,23 @@ def run_official_sleep_cycle(
     cfg: dict[str, Any] | None = None,
     timeout_s: int = 600,
 ) -> dict[str, Any]:
-    """Run one official `skillopt_sleep` cycle for `target` (or all skills).
+    """Run one official `skillopt_sleep run` cycle for `target` (or all skills).
 
-    Returns:
-      {ok: True,  engine: "official", staged_path, held_out, log_path, pid}
-      {ok: False, fallback_to_direct: True, reason, ...}  on any failure
+    Returns one of:
+      {ok: True,  engine:"official", staged_path, official_staging_dir, gate,
+       held_out, log_path, pid, staged_size}
+          — engine ran, gate ACCEPTED, proposal copied to plugin staging/.
+      {ok: False, gate_rejected:True, engine:"official", reason, gate, ...}
+          — engine ran, gate REJECTED. Do NOT fall back to direct (the official
+          gate already considered the candidate). Record a reject cycle.
+      {ok: False, fallback_to_direct:True, engine:"official", reason, ...}
+          — infra failure (package absent, launch/timeout, no staging, copy
+          failed). The auto-loop retries with direct_optimizer.
 
     The auto-loop calls this when `use_official_engine` is true and
-    probe_official()["available"] is true; on a fallback result it
-    retries with direct_optimizer.run_direct_cycle().
+    probe_official()["available"] is true. The authoritative gate verdict
+    comes from the engine's own report.json (it ran evaluate_gate before
+    staging); we never re-run the gate here.
 
     `custom_prompts` is accepted for signature parity with the direct
     optimizer but is NOT forwarded to the official engine (it does not
@@ -290,27 +410,99 @@ def run_official_sleep_cycle(
             "log_path": log_path,
         }
 
-    held_out = sleep_runner.parse_held_out(log_path)
-    staged = _find_staged(target or None)
-    if not staged or not staged.is_file():
+    # Discover the official staging dir + the authoritative gate verdict
+    # from report.json (NOT log scraping). The engine ran evaluate_gate
+    # before staging, so report.json is the source of truth.
+    staging_dir = _find_staging_dir()
+    if not staging_dir:
         return {
             "ok": False,
             "fallback_to_direct": True,
             "engine": "official",
-            "reason": "official run produced no staged proposal",
+            "reason": "official run produced no staging dir",
             "pid": pid,
             "log_path": log_path,
-            "held_out": held_out,
+        }
+    verdict = _read_gate_verdict(staging_dir)
+    proposed = staging_dir / "proposed_SKILL.md"
+    if not proposed.is_file():
+        # A multi-skill night may stage per-skill rows instead of the
+        # single proposed_SKILL.md; without a single proposal we have
+        # nothing to feed the existing adopt path -> fall back this tick.
+        return {
+            "ok": False,
+            "fallback_to_direct": True,
+            "engine": "official",
+            "reason": "staging dir has no proposed_SKILL.md (multi-skill night?)",
+            "pid": pid,
+            "log_path": log_path,
+            "official_staging_dir": str(staging_dir),
+            "gate": verdict,
+        }
+
+    # If the official gate REJECTED the candidate, do NOT promote it and
+    # do NOT fall back to direct (direct has no held-out signal and would
+    # override the official gate's decision with an ungated edit). Return
+    # a gate_rejected result; the auto-loop records a reject cycle and
+    # moves on. The proposal is left in the official staging dir for
+    # inspection but is NOT copied into the plugin's staging/.
+    if verdict and not verdict.get("accepted"):
+        return {
+            "ok": False,
+            "gate_rejected": True,
+            "engine": "official",
+            "reason": (
+                f"official gate rejected (gate_action={verdict.get('gate_action')!r}, "
+                f"baseline={verdict.get('baseline_score')} -> "
+                f"candidate={verdict.get('candidate_score')})"
+            ),
+            "pid": pid,
+            "log_path": log_path,
+            "official_staging_dir": str(staging_dir),
+            "gate": verdict,
+        }
+
+    # Gate accepted: copy proposed_SKILL.md into the plugin's staging/
+    # <skill>.md so the existing _auto_adopt path finds it unchanged. We
+    # COPY (not move) so the official staging dir + report.md stay intact
+    # for `skillopt_sleep status`/`adopt`/human inspection.
+    import shutil
+    skill_name = target or "best_skill"
+    dest = sleep_runner.staging_dir() / f"{skill_name}.md"
+    try:
+        shutil.copy2(str(proposed), str(dest))
+    except Exception as e:  # noqa: BLE001
+        return {
+            "ok": False,
+            "fallback_to_direct": True,
+            "engine": "official",
+            "reason": f"copy staged proposal failed: {e}",
+            "pid": pid,
+            "log_path": log_path,
+            "official_staging_dir": str(staging_dir),
+            "gate": verdict,
         }
     try:
-        size = staged.stat().st_size
+        size = dest.stat().st_size
     except Exception:
         size = 0
     return {
         "ok": True,
         "engine": "official",
-        "staged_path": str(staged),
-        "held_out": held_out,
+        "staged_path": str(dest),
+        "official_staging_dir": str(staging_dir),
+        "gate": verdict,
+        "held_out": {
+            "before": verdict.get("baseline_score") if verdict else None,
+            "after": verdict.get("candidate_score") if verdict else None,
+            "delta_pp": (
+                (verdict.get("candidate_score") - verdict.get("baseline_score"))
+                if verdict and verdict.get("candidate_score") is not None
+                and verdict.get("baseline_score") is not None
+                else None
+            ),
+            "accepted": verdict.get("accepted") if verdict else None,
+        },
         "log_path": log_path,
         "pid": pid,
         "staged_size": size,
@@ -322,46 +514,53 @@ def run_official_sleep_cycle(
 # ----------------------------------------------------------------------- #
 
 def _try_evaluate_gate(
+    candidate_skill: str,
+    cand_hard: float,
+    current_skill: str,
     current_score: float,
-    candidate_score: float,
+    best_skill: str,
     best_score: float,
+    best_step: int,
+    global_step: int,
+    *,
+    cand_soft: float = 0.0,
     metric: str = "hard",
+    mixed_weight: float = 0.5,
 ) -> dict[str, Any] | None:
-    """Best-effort import + call of skillopt.evaluation.gate.evaluate_gate.
+    """Best-effort import + call of the official evaluate_gate.
 
-    Returns {accepted: bool, action: str, reason: str} if the official
-    gate was importable and callable with the args it accepts, or None if
-    it is unavailable or its signature could not be satisfied.
+    Verified signature (skillopt_sleep.gate AND skillopt.evaluation.gate,
+    behaviourally identical):
+      evaluate_gate(candidate_skill, cand_hard, current_skill, current_score,
+                    best_skill, best_score, best_step, global_step, *,
+                    cand_soft=0.0, metric="hard", mixed_weight=0.5) -> GateResult
+      GateResult(action, current_skill, current_score, best_skill, best_score,
+                 best_step); action in {"accept_new_best","accept","reject"}.
 
-    NOT wired as authoritative today: the official Sleep engine already
-    enforces the monotonic held-out gate before staging a proposal, so a
-    staged proposal has passed it by construction. This stub is kept so a
-    future refinement can make the Python gate authoritative without
-    touching the auto-loop — and so tests can assert it degrades to None
-    when the package is absent.
+    NOT wired as authoritative today: the official Sleep engine already runs
+    this gate before staging, and the verdict is in report.json (read via
+    _read_gate_verdict). This function is kept corrected-to-spec so a future
+    refinement can call the Python gate directly without touching the
+    auto-loop, and so tests can assert it degrades to None when the package
+    is absent. Returns {accepted, action, reason} or None on any failure.
     """
     try:  # pragma: no cover - exercised only when the package is installed
-        import inspect  # type: ignore
-        from skillopt.evaluation import gate as _gate  # type: ignore
+        # The vendored skillopt_sleep.gate is preferred (zero dependency on
+        # the research package); fall back to skillopt.evaluation.gate.
+        try:
+            from skillopt_sleep import gate as _gate  # type: ignore
+        except Exception:
+            from skillopt.evaluation import gate as _gate  # type: ignore
         fn = getattr(_gate, "evaluate_gate", None)
         if fn is None:
             return None
-        sig = inspect.signature(fn)
-        kwargs: dict[str, Any] = {}
-        params = set(sig.parameters)
-        if "current_score" in params:
-            kwargs["current_score"] = current_score
-        if "cand_score" in params or "candidate_score" in params:
-            key = "cand_score" if "cand_score" in params else "candidate_score"
-            kwargs[key] = candidate_score
-        if "best_score" in params:
-            kwargs["best_score"] = best_score
-        if "metric" in params:
-            kwargs["metric"] = metric
-        result = fn(**kwargs)
-        # GateResult is immutable; normalise the bits we care about.
-        accepted = bool(getattr(result, "accepted", getattr(result, "accept", None)))
+        result = fn(
+            candidate_skill, cand_hard, current_skill, current_score,
+            best_skill, best_score, best_step, global_step,
+            cand_soft=cand_soft, metric=metric, mixed_weight=mixed_weight,
+        )
         action = str(getattr(result, "action", ""))
+        accepted = action in ("accept", "accept_new_best")
         return {"accepted": accepted, "action": action, "reason": str(result)}
     except Exception:
         return None

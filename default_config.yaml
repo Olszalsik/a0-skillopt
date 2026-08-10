@@ -164,7 +164,7 @@ ab_harness_enabled: false
 judge_model: "minimax-m3"
 
 # =====================================================================
-# OFFICIAL ENGINE BRIDGE (v1.6.0 — Solution B)
+# OFFICIAL ENGINE BRIDGE (v1.6.0 — Solution B; v1.6.1 verified CLI mapping)
 # =====================================================================
 # Drive the upstream Microsoft `skillopt_sleep` engine for the optimizer
 # pass instead of the hand-rolled direct_optimizer. The official engine
@@ -176,17 +176,30 @@ judge_model: "minimax-m3"
 # (see the official_gated flag wired in sleep_runner.validate_proposal).
 #
 # When the official package is absent or a run fails, the auto-loop falls
-# back to direct_optimizer (the existing working path) automatically.
+# back to direct_optimizer (the existing working path) automatically. When
+# the official gate REJECTS a candidate, the loop does NOT fall back to
+# direct (the official verdict is authoritative) — it records a reject.
+#
+# v1.6.1: the arg mapping below was verified against microsoft/skillopt @
+# HEAD (2026-08-10). The real CLI is `python -m skillopt_sleep <verb>` with
+# subcommands run/dry-run/status/adopt/harvest/schedule/unschedule. `run`
+# takes --project, --target-skill-path (a PATH not a name), --backend, a
+# single --model, --lookback-hours, --max-tasks, --edit-budget,
+# --preferences, --json. There is NO separate optimizer/target model.
 #
 # use_official_engine      : prefer the official engine when available
-# official_run_verb        : CLI verb to invoke (default "run"). Override
-#                            to "cycle" or whatever the installed package
-#                            expects (the verb set was not verified here).
-# official_backend          : passed as --backend (empty = engine default)
-# official_optimizer_model  : optimizer model id (empty = fall back to optimizer_model)
-# official_target_model     : target model id (empty = fall back to target_model)
-# official_lookback_hours   : --lookback-hours (0 = omit)
+# official_run_verb        : CLI subcommand to invoke (default "run").
+# official_backend          : --backend (mock|claude|codex|copilot|cursor|pi|
+#                            handoff|azure_openai); empty = engine default (mock)
+# official_optimizer_model  : --model (single model; empty = fall back to optimizer_model)
+# official_target_model     : KEPT for compat but NOT mapped (the real CLI
+#                            has no separate target model; the "target" is
+#                            the skill being evolved via --target-skill-path)
+# official_lookback_hours   : --lookback-hours (0 = omit; null = full history)
 # official_max_tasks        : --max-tasks (0 = omit)
+# official_edit_budget      : --edit-budget (0 = omit) — the textual learning rate
+# official_preferences      : --preferences free-text house rules injected into
+#                            the optimizer's reflect step (empty = omit)
 # official_run_timeout_s    : poll timeout before falling back (detached
 #                            subprocess is left running on timeout)
 use_official_engine: true
@@ -196,6 +209,8 @@ official_optimizer_model: ""
 official_target_model: ""
 official_lookback_hours: 0
 official_max_tasks: 0
+official_edit_budget: 0
+official_preferences: ""
 official_run_timeout_s: 600
 
 # =====================================================================

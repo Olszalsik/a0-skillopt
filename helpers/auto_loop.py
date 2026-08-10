@@ -311,7 +311,19 @@ class AutoLoopThread(threading.Thread):
                 )
                 if result.get("ok"):
                     return {**result, "engine": "official"}
-                # Fall through to direct on any failure.
+                # v1.6.1: an official gate REJECT is authoritative — the
+                # engine already evaluated the candidate on the held-out
+                # set and found it no better. Do NOT fall back to direct
+                # (direct has no held-out signal and would override the
+                # official gate with an ungated edit). Return the reject
+                # so the tick records a no-op reject cycle and moves on.
+                if result.get("gate_rejected"):
+                    self._log(
+                        f"auto-loop: official gate REJECTED {skill!r}: "
+                        f"{result.get('reason')}"
+                    )
+                    return {**result, "engine": "official"}
+                # Fall through to direct on any infra failure.
                 self._log(
                     f"auto-loop: official engine fallback for {skill!r}: "
                     f"{result.get('reason')}"

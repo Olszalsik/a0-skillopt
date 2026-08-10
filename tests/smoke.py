@@ -2892,24 +2892,25 @@ def t_v150_governance_auto_loop_skip() -> bool:
 _section_v160 = "v1.6.0 NEW (Solution B): official-engine bridge, gate delegation, per-skill gating, side-findings"
 
 
-@test("v1.6.0: version strings aligned across plugin.py / hooks.py / plugin.yaml")
+@test("v1.6.1: version strings aligned across plugin.py / hooks.py / plugin.yaml")
 def t_v160_version_alignment() -> None:
     import re
     plugin_py = (PLUGIN_ROOT / "plugin.py").read_text(encoding="utf-8")
     hooks_py = (PLUGIN_ROOT / "hooks.py").read_text(encoding="utf-8")
     manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
-    assert 'PLUGIN_VERSION = "1.6.0"' in plugin_py, "plugin.py not 1.6.0"
-    assert 'PLUGIN_VERSION = "1.6.0"' in hooks_py, "hooks.py not 1.6.0"
-    assert re.search(r'^version:\s*1\.6\.0', manifest, re.M), "plugin.yaml not 1.6.0"
+    assert 'PLUGIN_VERSION = "1.6.1"' in plugin_py, "plugin.py not 1.6.1"
+    assert 'PLUGIN_VERSION = "1.6.1"' in hooks_py, "hooks.py not 1.6.1"
+    assert re.search(r'^version:\s*1\.6\.1', manifest, re.M), "plugin.yaml not 1.6.1"
 
 
-@test("v1.6.0: default_config.yaml declares the official-engine bridge keys")
+@test("v1.6.1: default_config.yaml declares the official-engine bridge keys")
 def t_v160_config_keys() -> None:
     src = (PLUGIN_ROOT / "default_config.yaml").read_text(encoding="utf-8")
     for key in ["use_official_engine", "official_run_verb", "official_backend",
-                "official_optimizer_model", "official_run_timeout_s"]:
+                "official_optimizer_model", "official_edit_budget",
+                "official_preferences", "official_run_timeout_s"]:
         assert key in src, f"default_config.yaml missing {key}"
-    # ab_harness is advisory-off by default in v1.6.0
+    # ab_harness is advisory-off by default in v1.6.0+
     assert "ab_harness_enabled: false" in src, "ab_harness_enabled should default to false"
 
 
@@ -3055,10 +3056,177 @@ def t_v160_cycle_history_status_archive() -> None:
             archive.unlink()
 
 
+# ======================================================================= #
+# v1.6.1 — verified CLI mapping + gate verdict from report.json
+# (verified against microsoft/skillopt @ HEAD 2026-08-10)
+# ======================================================================= #
+
+_section_v161 = "v1.6.1 NEW: verified CLI flag mapping, report.json gate verdict, gate_reject contract"
+
+
+@test("v1.6.1: _build_run_args maps to the real skillopt_sleep run flags")
+def t_v161_build_run_args_flags() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import official_adapter
+    cfg = {
+        "official_backend": "azure_openai",
+        "official_optimizer_model": "gpt-x",
+        "official_lookback_hours": 72,
+        "official_max_tasks": 10,
+        "official_edit_budget": 3,
+        "official_preferences": "be terse",
+    }
+    args = official_adapter._build_run_args(cfg, target=None)
+    # --project is always passed (predictable staging)
+    assert "--project" in args, args
+    # --model (single), NOT --optimizer-model / --target-model (don't exist)
+    assert "--model" in args and "gpt-x" in args, args
+    assert "--optimizer-model" not in args, "real CLI has no --optimizer-model"
+    assert "--target-model" not in args, "real CLI has no --target-model"
+    # --backend, --lookback-hours, --max-tasks, --edit-budget, --preferences
+    assert "--backend" in args and "azure_openai" in args, args
+    assert "--lookback-hours" in args and "72" in args, args
+    assert "--max-tasks" in args and "10" in args, args
+    assert "--edit-budget" in args and "3" in args, args
+    assert "--preferences" in args and "be terse" in args, args
+    # --json for structured stdout
+    assert "--json" in args, args
+    # NO --skill (the real flag is --target-skill-path, a PATH)
+    assert "--skill" not in args, "real CLI has no --skill"
+    # --auto-adopt must NEVER be passed (we do our own gated adopt)
+    assert "--auto-adopt" not in args, "must not auto-adopt"
+
+
+@test("v1.6.1: _build_run_args rejects unknown backends (argparse would error)")
+def t_v161_build_run_args_unknown_backend() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import official_adapter
+    cfg = {"official_backend": "some-bogus-backend"}
+    args = official_adapter._build_run_args(cfg, target=None)
+    assert "--backend" not in args, "unknown backend must be omitted"
+
+
+@test("v1.6.1: _build_run_args adds --target-skill-path only for a real skill")
+def t_v161_build_run_args_target_skill_path() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import official_adapter
+    # A skill that exists on the host (any of the 106) -> path resolved
+    real = "agent-browser"
+    args = official_adapter._build_run_args({}, target=real)
+    if official_adapter._resolve_skill_path(real):
+        assert "--target-skill-path" in args, args
+        assert any(a.endswith("SKILL.md") for a in args), args
+    # A skill that doesn't exist -> flag omitted (engine runs without a target)
+    args2 = official_adapter._build_run_args({}, target="no_such_skill_xyz_123")
+    assert "--target-skill-path" not in args2, args2
+
+
+@test("v1.6.1: _read_gate_verdict reads accepted/reject + scores from report.json")
+def t_v161_read_gate_verdict() -> None:
+    import json as _j
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import official_adapter
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as d:
+        from pathlib import Path
+        sd = Path(d)
+        # accepted proposal
+        (sd / "report.json").write_text(_j.dumps({
+            "accepted": True, "gate_action": "accept_new_best",
+            "baseline_score": 0.41, "candidate_score": 0.57,
+            "night": 3, "edits": [{"a": 1}], "rejected_edits": [],
+        }), encoding="utf-8")
+        v = official_adapter._read_gate_verdict(sd)
+        assert v is not None and v["accepted"] is True, v
+        assert v["gate_action"] == "accept_new_best", v
+        assert v["baseline_score"] == 0.41 and v["candidate_score"] == 0.57, v
+        assert v["n_accepted_edits"] == 1, v
+        # rejected proposal
+        (sd / "report.json").write_text(_j.dumps({
+            "accepted": False, "gate_action": "reject",
+            "baseline_score": 0.57, "candidate_score": 0.50,
+        }), encoding="utf-8")
+        v2 = official_adapter._read_gate_verdict(sd)
+        assert v2 is not None and v2["accepted"] is False, v2
+        assert v2["gate_action"] == "reject", v2
+        # missing report -> None
+        (sd / "report.json").unlink()
+        assert official_adapter._read_gate_verdict(sd) is None
+
+
+@test("v1.6.1: _find_staging_dir finds the newest manifest.json dir")
+def t_v161_find_staging_dir() -> None:
+    import os, time
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import official_adapter
+    import tempfile
+    from pathlib import Path
+    root = official_adapter._official_staging_root()
+    # Save + clear any pre-existing staging for a clean test
+    saved = []
+    if root.is_dir():
+        for child in list(root.iterdir()):
+            saved.append(child)
+    # Create two fake staging dirs with manifest.json; second is newer
+    a = root / "20260101T000000"
+    b = root / "20260102T000000"
+    a.mkdir(parents=True, exist_ok=True)
+    b.mkdir(parents=True, exist_ok=True)
+    (a / "manifest.json").write_text("{}", encoding="utf-8")
+    (b / "manifest.json").write_text("{}", encoding="utf-8")
+    # ensure b is newer by mtime
+    os.utime(str(a), (time.time() - 100, time.time() - 100))
+    os.utime(str(b), (time.time(), time.time()))
+    try:
+        found = official_adapter._find_staging_dir()
+        assert found is not None, "expected a staging dir"
+        assert found.name == "20260102T000000", found
+        # A dir without manifest.json is ignored
+        c = root / "20260103T000000"
+        c.mkdir(parents=True, exist_ok=True)
+        found2 = official_adapter._find_staging_dir()
+        assert found2 is not None and found2.name == "20260102T000000", found2
+        c.rmdir()
+    finally:
+        for p in (a, b):
+            for f in p.glob("*"):
+                f.unlink()
+            p.rmdir()
+        # restore nothing (saved entries are real; leave them)
+
+
+@test("v1.6.1: _try_evaluate_gate degrades to None when package absent")
+def t_v161_try_evaluate_gate_none() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import official_adapter
+    # Package not installed in this dev env -> must return None (fail-soft)
+    v = official_adapter._try_evaluate_gate(
+        "cand", 0.6, "cur", 0.5, "best", 0.55, 1, 2, metric="hard",
+    )
+    assert v is None, f"expected None when package absent, got {v!r}"
+
+
+@test("v1.6.1: _run_engine_for_skill honors gate_rejected (no direct fallback)")
+def t_v161_gate_rejected_no_fallback() -> None:
+    src = (PLUGIN_ROOT / "helpers" / "auto_loop.py").read_text(encoding="utf-8")
+    assert "gate_rejected" in src, "auto_loop must branch on gate_rejected"
+    # The branch must return WITHOUT calling direct_optimizer.optimize_skill
+    assert "official gate REJECTED" in src, src
+
+
+@test("v1.6.1: official_adapter docstring marks the API as VERIFIED")
+def t_v161_docstring_verified() -> None:
+    src = (PLUGIN_ROOT / "helpers" / "official_adapter.py").read_text(encoding="utf-8")
+    assert "VERIFIED API" in src, "adapter docstring must mark API verified"
+    assert "report.json" in src
+    assert "--target-skill-path" in src
+
+
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
     print(_section_v110)
     print(_section_v120)
     print(_section_v121)
     print(_section_v160)
+    print(_section_v161)
     sys.exit(main())

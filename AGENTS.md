@@ -2,7 +2,7 @@
 
 > Microsoft SkillOpt text-space skill optimizer, bridged as an Agent Zero self-evolution engine. Harvests the agent's own task rollouts, drives the official `skillopt_sleep` pipeline (or a fallback direct optimizer), gates proposals behind a monotonic validation gate, and stages gated skill edits for human-in-the-loop adoption.
 
-**Version:** 1.6.0 · **Plugin ID:** `skillopt`
+**Version:** 1.6.1 · **Plugin ID:** `skillopt`
 
 ## Purpose
 
@@ -16,10 +16,16 @@ official Microsoft `skillopt_sleep` pipeline instead of a hand-rolled optimizer,
 
 - **Two-loop:** outer `AutoLoopThread` (`helpers/auto_loop.py`, 600s) + inner `InnerLoopThread`
   (`helpers/inner_loop.py`, 60s suggestion miner).
-- **Official-engine bridge** (`helpers/official_adapter.py`, NEW v1.6.0): probes
+- **Official-engine bridge** (`helpers/official_adapter.py`, NEW v1.6.0, **v1.6.1 verified**): probes
   `import skillopt_sleep` in the A0 venv (cached 60s), then reuses `sleep_runner.launch_sleep_subprocess`
-  to run one official Sleep cycle (harvest→mine→replay→consolidate→gate→stage). Fail-soft: any error
-  returns `{ok: False, fallback_to_direct: True}` so the loop never stalls on an unverified integration.
+  to run one official Sleep cycle (harvest→mine→replay→consolidate→gate→stage). Fail-soft: any infra
+  error returns `{ok: False, fallback_to_direct: True}`; an official gate REJECT returns
+  `{ok: False, gate_rejected: True}` (the auto-loop does NOT fall back to direct on a reject — the
+  official verdict is authoritative). **v1.6.1**: the CLI flag mapping and staging discovery were
+  verified against `microsoft/skillopt` @ HEAD — `--project`, `--target-skill-path` (a real SKILL.md
+  path), single `--model`, `--backend`, `--lookback-hours`, `--max-tasks`, `--edit-budget`,
+  `--preferences`, `--json`; staging lands in `<a0>/.skillopt-sleep/staging/<ts>/` with the authoritative
+  gate verdict in `report.json` (read via `_read_gate_verdict`, not log scraping).
 - **Fallback optimizer** (`helpers/direct_optimizer.py`): the safety net; runs per-skill only when the
   official package is unavailable or an official run fails. Single full-rewrite LLM call + structural gate.
 - **Validation gate** (`helpers/sleep_runner.validate_proposal`): Stages 1–7 structural pre-filter
@@ -66,6 +72,12 @@ official Microsoft `skillopt_sleep` pipeline instead of a hand-rolled optimizer,
 - v1.6.0 (Solution B): official-engine bridge + gate delegation + per-skill tick gating +
   version alignment (plugin.py/hooks.py/plugin.yaml all 1.6.0) + cycle_history compaction +
   A/B harness advisory demotion. 92/92 smoke tests pass.
+- v1.6.1 (verified): CLI flag mapping + staging discovery + `evaluate_gate` signature verified
+  against `microsoft/skillopt` @ HEAD. Fixed the adapter: `--skill`→`--target-skill-path`,
+  dropped nonexistent `--optimizer-model`/`--target-model` (single `--model`), added
+  `--project`/`--edit-budget`/`--preferences`/`--json`, staging via `_find_staging_dir` +
+  `report.json` gate verdict, `gate_rejected` contract (no direct fallback on official reject).
+  100/100 smoke tests pass.
 
 ## Verification
 
@@ -78,13 +90,31 @@ official Microsoft `skillopt_sleep` pipeline instead of a hand-rolled optimizer,
   snapshot is written, and `post_adopt.log` records the safety-net re-validation. Roll back via the
   fragment store; confirm the live skill restores.
 
-## UNVERIFIED API NOTE
+## VERIFIED API NOTE (v1.6.1)
 
-The `skillopt_sleep` CLI verb set (`run`/`cycle`/`harvest`/`adopt`/`status`) and the
-`evaluate_gate` signature are taken from the upstream README + paper and have NOT been verified
-against an installed package in this environment. The run verb is configurable via
-`official_run_verb` (default `run`) so the user can match the installed version without a code
-change. Live verification on the user's installed `skillopt_sleep` is the remaining follow-up.
+The `skillopt_sleep` CLI surface and the `evaluate_gate` signature were verified against the
+upstream `microsoft/skillopt` source tree @ HEAD (2026-08-10) by shallow-clone + introspection.
+The package is NOT installed in this dev env, so the live subprocess path is exercised only when
+the user installs it — but the arg mapping, staging discovery, and gate-verdict reading in
+`helpers/official_adapter.py` match the real package (not a guess):
+
+- **CLI**: `python -m skillopt_sleep <subcommand>` — subcommands `run` / `dry-run` / `status` /
+  `adopt` / `harvest` / `schedule` / `unschedule`. `run` flags: `--project`, `--target-skill-path`
+  (a real SKILL.md path), `--backend mock|claude|codex|copilot|cursor|pi|handoff|azure_openai`,
+  single `--model`, `--lookback-hours`, `--max-tasks`, `--edit-budget`, `--preferences`, `--json`.
+- **Staging**: `<project>/.skillopt-sleep/staging/<ts>/` with `proposed_SKILL.md`, `report.json`,
+  `report.md`, `manifest.json`. The authoritative gate verdict is in `report.json`:
+  `{accepted, gate_action, baseline_score, candidate_score, night, edits}`.
+- **evaluate_gate**: `evaluate_gate(candidate_skill, cand_hard, current_skill, current_score,
+  best_skill, best_score, best_step, global_step, *, cand_soft=0.0, metric="hard",
+  mixed_weight=0.5) -> GateResult` — action in `{accept_new_best, accept, reject}`. Both
+  `skillopt_sleep.gate` (vendored) and `skillopt.evaluation.gate` (reference) are behaviourally
+  identical. We do NOT call it authoritatively — the engine already ran it before staging; the
+  verdict is read from `report.json`.
+
+Remaining live follow-up: install `skillopt`/`skillopt_sleep` into the A0 venv and run one real
+`run` end-to-end (with a configured backend) to confirm the bridge works against the installed
+version, not just the source tree.
 
 ## See also
 

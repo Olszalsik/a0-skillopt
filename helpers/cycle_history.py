@@ -135,7 +135,7 @@ def record_cycle_entry(cycle_entry: dict) -> dict:
     entry = dict(cycle_entry)
     entry.setdefault("cycle_id", _short_id())
     entry.setdefault("ts", _now_iso())
-    entry.setdefault("version", "1.6.0")
+    entry.setdefault("version", "1.6.1")
     entry.setdefault("skill", "")
     entry.setdefault("outcome", "unknown")
     entry.setdefault("outcome_detail", "")
