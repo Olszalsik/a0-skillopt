@@ -2,7 +2,7 @@
 
 > Microsoft SkillOpt text-space skill optimizer, bridged as an Agent Zero self-evolution engine. Harvests the agent's own task rollouts, drives the official `skillopt_sleep` pipeline (or a fallback direct optimizer), gates proposals behind a monotonic validation gate, and stages gated skill edits for human-in-the-loop adoption.
 
-**Version:** 1.7.0 · **Plugin ID:** `skillopt`
+**Version:** 1.8.0 · **Plugin ID:** `skillopt`
 
 ## Purpose
 
@@ -14,9 +14,14 @@ official Microsoft `skillopt_sleep` pipeline instead of a hand-rolled optimizer,
 fixes the silently-broken rollout harvester (it read a nonexistent `loop_data.messages`), adds a
 local counterfactual replay gate (deterministic mock executor + real-executor stub), a
 human-in-the-loop adopt UI (Approve/Reject/Rollback with whole-file snapshots), and auto-opt-in for
-new skills behind a human-approval guardrail.
+new skills behind a human-approval guardrail. **v1.8.0 implements the two pieces v1.7.0 deliberately
+stubbed — both opt-in and default-off** (v1.7.0 behavior is preserved byte-for-byte unless an operator
+flips the flags): a subprocess-isolated real A0-agent-loop replay executor, and DistilBERT
+reward-model training fed by an LLM-judge labelling pass, with a calibration step that picks the
+`prefer_model_above` threshold and wires the previously-dead `reward_model_path` /
+`reward_model_prefer_above` config keys.
 
-## Architecture (v1.7.0)
+## Architecture (v1.8.0)
 
 - **Two-loop:** outer `AutoLoopThread` (`helpers/auto_loop.py`, 600s) + inner `InnerLoopThread`
   (`helpers/inner_loop.py`, 60s suggestion miner).
@@ -39,9 +44,25 @@ new skills behind a human-approval guardrail.
   (C2)** adds **stage 0.7 — local counterfactual replay gate** (`helpers/replay_harness.py`): runs only
   when `skill_name AND not official_gated AND replay_local_gate_enabled`, scores the current vs proposed
   skill on the held-out rollouts with a deterministic mock executor (relevance heuristic, no LLM) and
-  accepts only on a strict-monotonic lift ≥ `gate_min_improvement_pp` over ≥ `replay_min_n` tasks. The
-  real A0-agent-loop executor is a guarded stub behind `replay_real_executor_enabled` (default false).
-  The local synthetic A/B "replay" harness is advisory-only and OFF by default.
+  accepts only on a strict-monotonic lift ≥ `gate_min_improvement_pp` over ≥ `replay_min_n` tasks. **v1.8.0:
+  the real A0-agent-loop executor is IMPLEMENTED** behind `replay_real_executor_enabled` (default false) —
+  `replay_harness._real_score` shells out to `scripts/replay_worker.py`, which runs each held-out task
+  through a real Agent Zero monologue under the given skill in a child process (temp cwd, own event loop,
+  `SKILLOPT_REPLAY_MODE=1`) and writes a `{score, outcome, ...}` JSON envelope. Cost is bounded by
+  `replay_real_max_tasks` (default 4 — 2×N full monologues per gate call) and `replay_real_per_task_timeout_s`
+  (default 180). Any worker failure raises → `real_executor_unavailable:...` (loud-not-crash, falls through
+  to the structural gate). The local synthetic A/B "replay" harness is advisory-only and OFF by default.
+- **LLM-judge labelling + reward training (v1.8.0, P4–P6):** `helpers/llm_judge.py` classifies a rollout's
+  turn outcome into success/partial/failure (aligned with `score_rollout`'s 3-class space) via
+  `direct_optimizer._call_llm` with a judge-specific system prompt (never raises). `scripts/label_rollouts.py`
+  is the idempotent CLI pass that augments each rollout JSON in place with `judge_label`/`judge_confidence`/
+  `judge_reason`/`judge_model`/`judge_at` (atomic `os.replace`). `scripts/train_reward_model.py --mode train`
+  loads the labelled rollouts, featurizes them with `reward_model._rollout_to_text` (the SAME featurizer
+  inference uses), splits train/val deterministically, runs an AdamW epochs loop, persists the model, writes
+  a `1.3.0-train-*` version stamp, and runs a calibration pass. `reward_model._calibrate` sweeps T in
+  [0.3, 0.9] under the gated decision rule, writes `calibration.json`, and `score_rollout(prefer_model_above=None)`
+  resolves `calibration.json` > `reward_model_prefer_above` config > 0.6 via `_config_prefer_above()`.
+  `model_path()` now reads the `reward_model_path` config key (env still wins).
 - **Per-skill governance** (`helpers/governance.py`): `opt_out`/`opt_in`/`immutable`/`rate_limited`,
   per-skill `policy.json`, `.skillopt.optout`/`.skillopt.optin` markers. The tick now calls
   `check_skill_eligible()` + `cadence.compute_next_run()` + `budget.can_skill_spend()` before each
@@ -75,11 +96,15 @@ new skills behind a human-approval guardrail.
 - `extensions/` — monologue-end harvester, monologue-start warning, post-adopt safety net, banner
 - `helpers/` — auto_loop, inner_loop, official_adapter, direct_optimizer, sleep_runner, bridge,
   ab_harness, governance, cadence, budget, fragment_store, failure_memory, reward_model, cycle_history,
-  audit_log, config_loader, replay_harness (v1.7.0)
+  audit_log, config_loader, replay_harness (v1.7.0), llm_judge (v1.8.0)
+- `scripts/` — train_reward_model (v1.8.0 `--mode train`), calibrate_judge, replay_worker (v1.8.0),
+  label_rollouts (v1.8.0)
 - `api/` — adopt, status, config, fragments (+rollback), cycles (+cycle), audit_log, loop, sleep,
   staged, reject, rollback, governance_approve, governance_status (last 5 NEW v1.7.0)
 - `webui/` — dashboard + config UI (Staged-proposals + Governance sections v1.7.0)
-- `tests/smoke.py` — 122 deterministic tests (no LLM/network)
+- `tests/smoke.py` — 133 deterministic tests (no LLM/network); 11 `t_v18_*` + the renamed
+  `t_c2_real_executor_disabled_returns_not_enabled` cover the v1.8.0 opt-in paths with mocked
+  subprocess / LLM / asyncio (no real spawn).
 
 ## Local Contracts
 
@@ -96,9 +121,14 @@ new skills behind a human-approval guardrail.
 - **v1.7.0 (C4) guardrail:** `governance.default_policy.require_human_approval: true` is the safe
   default — adoption is one-click, never silent. New skills are auto-opted-in but stay
   `require_human_approval_pending` until a human approves via `/governance_approve`.
-- **Recursion guard:** `SKILLOPT_REPLAY_MODE` (env) is checked in the harvester, the auto-loop
-  watchdog, and set/unset around the (stubbed) real replay executor, so a replay agent's own turns
-  never pollute the training set or spawn a nested optimizer loop.
+- **Recursion guard:** `SKILLOPT_REPLAY_MODE` (env, process-global, inherited by subprocesses) is
+  checked in the harvester, the auto-loop watchdog, and set/unset around the real replay executor
+  (parent + child both set it before creating the replay `AgentContext`), so a replay agent's own
+  turns never pollute the training set or spawn a nested optimizer loop.
+- **v1.8.0 opt-in guardrail:** the real replay executor and the trained reward model are BOTH
+  default-off. `replay_real_executor_enabled: false` → the gate uses the mock executor (byte-identical
+  to v1.7.0). No trained model on disk → `score_rollout` uses the heuristic fallback (byte-identical to
+  v1.7.0). An operator must explicitly flip the flag / run the training script to activate them.
 
 ## v2.5 Status
 
@@ -119,10 +149,20 @@ new skills behind a human-approval guardrail.
   adopt UI (`/staged` + `/adopt` by id + `/reject` + `/rollback` with whole-file snapshots); C4
   added auto-opt-in for new skills behind a human-approval gate (`/governance_approve` +
   `/governance_status`). 122/122 smoke tests pass.
+- v1.8.0 (the two offline pieces, integrated): P1 `scripts/replay_worker.py` (subprocess-isolated
+  A0-agent-loop replay); P2 `replay_harness._real_score` shells out to it (blocking `subprocess.run`,
+  `build_subprocess_env` factored out of `launch_sleep_subprocess`, `replay_real_max_tasks` cost cap);
+  P3 `sleep_runner` stage-0.7 call-site passes `executor="real"` when the flag is on; P4
+  `helpers/llm_judge.py` + `scripts/label_rollouts.py` (LLM-judge outcome labelling pass, idempotent +
+  atomic); P5 `scripts/train_reward_model.py --mode train` (real DistilBERT training loop + dataset
+  loader reusing `reward_model._rollout_to_text`); P6 `reward_model._calibrate` + `model_path` /
+  `score_rollout` config wiring (`_config_prefer_above` reads `calibration.json` > config > 0.6). Both
+  opt-in, default-off. 133/133 smoke tests pass. Live checks (L1–L4) pending the A0 venv + LLM creds.
 
 ## Verification
 
-- `python tests/smoke.py` — 122 deterministic tests (no LLM/network).
+- `python tests/smoke.py` — 133 deterministic tests (no LLM/network); the 11 `t_v18_*` cases mock
+  subprocess / LLM / asyncio so no real spawn or network happens in the suite.
 - `python -c "import skillopt_sleep"` in the A0 venv confirms the official package (else fallback).
 - Dry-run against the 5 synthetic rollouts with `use_official_engine: true`, `auto_adopt: false` → a
   proposal lands in `staging/` with a gate reason recorded in `cycle_history.jsonl`.
@@ -137,6 +177,15 @@ new skills behind a human-approval guardrail.
   `/rollback` restores the pre-adopt bytes; (C4) a brand-new skill gets `.skillopt.optin` +
   `.policy.json` (`require_human_approval: true`) automatically and is `require_human_approval_pending`
   until `/governance_approve` is called, then `eligible`.
+- **v1.8.0 live checks (L1–L4, require A0 venv + running A0 server + LLM creds — NOT run in dev):**
+  (L1) with `replay_real_executor_enabled: true` + ≥3 held-out rollouts, `validate_proposal` on a
+  staged proposal launches the worker, runs the monologue, writes a score JSON, and `_real_score`
+  returns a float; (L2) `python scripts/label_rollouts.py --limit 5` writes `judge_label` on 5
+  rollouts, a second run skips all 5 (idempotent); (L3) with ≥50 labelled rollouts,
+  `python scripts/train_reward_model.py --mode train --epochs 1` writes `models/reward_model/` +
+  `skillopt_reward_version.json` (`1.3.0-train-*`) + `calibration.json`, and `get_model_status()`
+  shows `model_loaded: true`; (L4) after training, a direct-optimizer cycle uses the real executor +
+  the trained reward model, with the verdict in `cycle_history.jsonl`.
 
 ## VERIFIED API NOTE (v1.6.1)
 
@@ -190,3 +239,14 @@ version, not just the source tree.
   whole-file snapshots); C4 auto-opt-in for new skills behind a human-approval gate
   (`/governance_approve` `/governance_status`). 122/122 smoke tests. Out-of-scope stubs (documented
   follow-ups): real A0-agent-loop replay executor + DistilBERT reward-model training.
+- 1.8.0 — the two v1.7.0 stubs, integrated (both opt-in, default-off): P1 `scripts/replay_worker.py`
+  (subprocess-isolated A0-agent-loop replay, temp cwd + own event loop + `SKILLOPT_REPLAY_MODE`);
+  P2 `replay_harness._real_score` shells out to it (blocking `subprocess.run`, `build_subprocess_env`,
+  `replay_real_max_tasks` cost cap); P3 stage-0.7 call-site passes `executor="real"` when enabled;
+  P4 `helpers/llm_judge.py` + `scripts/label_rollouts.py` (LLM-judge outcome labelling, idempotent +
+  atomic, advisory judge-vs-heuristic agreement %); P5 `scripts/train_reward_model.py --mode train`
+  (real DistilBERT training loop, dataset loader reusing `reward_model._rollout_to_text`, deterministic
+  stratified split, AdamW, `1.3.0-train-*` stamp); P6 `reward_model._calibrate` + `model_path` /
+  `score_rollout` config wiring (`_config_prefer_above`: `calibration.json` > `reward_model_prefer_above`
+  > 0.6; `reward_model_path` config now read, env wins). `direct_optimizer._call_llm` gained an optional
+  `system` param so the judge reuses it. 133/133 smoke tests. Live checks L1–L4 pending A0 venv + LLM.

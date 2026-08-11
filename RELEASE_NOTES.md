@@ -2,6 +2,59 @@
 
 ---
 
+## v1.8.0 — the two offline pieces, integrated (real replay + reward training)
+
+> v1.7.0 stubbed the two expensive/offline pieces of the self-evolution loop and
+> documented them as follow-ups. **v1.8.0 implements both**, default-off so
+> v1.7.0 behavior is preserved byte-for-byte unless you opt in. 122/122
+> deterministic smoke tests pass (11 new `t_v18_*`); no LLM/network in tests.
+
+### TL;DR
+
+- **Real replay executor (P1–P3):** flip `replay_real_executor_enabled: true`
+  and the local counterfactual replay gate runs each held-out task through a
+  **real Agent Zero monologue** under the current vs proposed skill — in a child
+  process (temp cwd, own event loop, recursion-guarded) — instead of the mock
+  relevance heuristic. Cost bounded by `replay_real_max_tasks` (default 4) and
+  `replay_real_per_task_timeout_s` (default 180). Worker failure is
+  loud-not-crash (falls through to the structural gate).
+- **LLM-judge labelling (P4):** `python scripts/label_rollouts.py` writes an
+  LLM-judged `judge_label` (success/partial/failure) into each rollout JSON,
+  atomically + idempotently. These labels are the reward model's training data.
+- **Real DistilBERT training (P5):** `python scripts/train_reward_model.py
+  --mode train` trains a 3-class classifier on the labelled rollouts, persists
+  it, writes a `1.3.0-train-*` version stamp. `--mode smoke` (default) is the
+  v1.2.0 demo step, unchanged.
+- **Calibration + config wiring (P6):** the dead `reward_model_path` /
+  `reward_model_prefer_above` config keys are now wired. A post-train
+  calibration pass picks `prefer_model_above` on the val set and writes
+  `calibration.json`; `score_rollout` reads it automatically.
+
+### What's new for users
+
+- **The replay gate can now produce *trustworthy* counterfactual evidence** on
+  the direct-optimizer path. The mock executor (default) is a cheap keyword
+  relevance heuristic; the real executor actually re-runs the agent under each
+  skill and measures the difference. Opt in with `replay_real_executor_enabled:
+  true` — it runs full monologues, so it costs more (bounded by
+  `replay_real_max_tasks`).
+- **The reward model can now actually be trained** on your own rollouts. Label
+  them with the LLM judge, then run the training script. A trained + calibrated
+  model replaces the keyword heuristic in `score_rollout`, sharpening both the
+  replay gate and the A/B harness.
+- **Everything is opt-in.** With the flags off (the default), v1.8.0 is
+  byte-identical to v1.7.0 at runtime. No new dependencies, no breaking
+  changes, the validation gate is preserved.
+
+### Live verification still pending
+
+The four live checks (L1 worker spawn, L2 judge labelling, L3 training, L4
+end-to-end gate) need the A0 venv + a running A0 server + LLM credentials.
+They are flagged in the integration plan, not run in dev. The smoke suite
+covers all logic testable without them.
+
+---
+
 ## v1.7.0 — Solution C (the self-evolution engine now actually evolves)
 
 > **The headline fix:** the rollout harvester had been writing **zero rollouts**

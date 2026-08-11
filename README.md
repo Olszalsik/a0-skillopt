@@ -1,6 +1,6 @@
 # SkillOpt Self-Evolution Engine
 
-[![Version](https://img.shields.io/badge/version-1.7.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-1.8.0-blue)](#)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![SkillOpt](https://img.shields.io/badge/powered%20by-microsoft%2Fskillopt-blueviolet)](https://github.com/microsoft/SkillOpt)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB)](#)
@@ -9,7 +9,13 @@
 
 **SkillOpt** turns the agent's own task trajectories into better skill documents — automatically, with a held-out validation gate, and without ever silently overwriting your work. It's the missing closed loop between execution and skill learning.
 
-**v1.7.0 (Solution C)** closes the loop for real: the rollout harvester now actually records every chat (it had been silently writing nothing since v1.1.0), a local counterfactual replay gate scores proposed skills on held-out tasks, a human-in-the-loop adopt UI lets you Approve/Reject/Rollback each staged proposal, and new skills auto-opt-in behind a human-approval gate. The auto-loop drives the official Microsoft `skillopt_sleep` pipeline (Solution B, v1.6.0) and falls back to a local optimizer when the package is absent.
+**v1.7.0 (Solution C)** closed the loop for real: the rollout harvester now actually records every chat (it had been silently writing nothing since v1.1.0), a local counterfactual replay gate scores proposed skills on held-out tasks, a human-in-the-loop adopt UI lets you Approve/Reject/Rollback each staged proposal, and new skills auto-opt-in behind a human-approval gate. The auto-loop drives the official Microsoft `skillopt_sleep` pipeline (Solution B, v1.6.0) and falls back to a local optimizer when the package is absent.
+
+**v1.8.0** implements the two pieces Solution C deliberately stubbed — both **opt-in and default-off**, so v1.7.0 behavior is preserved byte-for-byte unless you flip the flags:
+- **Real A0-agent-loop replay executor** (`replay_real_executor_enabled: true`): the local replay gate re-runs each held-out task through a real Agent Zero monologue under the current vs proposed skill (subprocess-isolated: temp cwd, own event loop, recursion-guarded) instead of the mock keyword heuristic. Cost is bounded by `replay_real_max_tasks` (default 4) and `replay_real_per_task_timeout_s` (default 180).
+- **DistilBERT reward-model training**: an LLM-judge labelling pass (`scripts/label_rollouts.py`) writes outcome labels into your rollouts, then `scripts/train_reward_model.py --mode train` trains a 3-class classifier on them, a calibration pass picks the `prefer_model_above` threshold, and `score_rollout` uses the trained + calibrated model instead of the heuristic. The previously-dead `reward_model_path` / `reward_model_prefer_above` config keys are now wired.
+
+Live verification of the opt-in paths (real A0 runtime + LLM credentials) is still pending; the 122/122 deterministic smoke suite covers all logic testable without them.
 
 ---
 

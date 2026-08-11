@@ -2895,17 +2895,17 @@ def t_v150_governance_auto_loop_skip() -> bool:
 _section_v160 = "v1.6.0 NEW (Solution B): official-engine bridge, gate delegation, per-skill gating, side-findings"
 
 
-@test("v1.7.0: version strings aligned across plugin.py / hooks.py / plugin.yaml")
+@test("v1.8.0: version strings aligned across plugin.py / hooks.py / plugin.yaml")
 def t_v170_version_alignment() -> None:
     import re
     plugin_py = (PLUGIN_ROOT / "plugin.py").read_text(encoding="utf-8")
     hooks_py = (PLUGIN_ROOT / "hooks.py").read_text(encoding="utf-8")
     manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
     execute_py = (PLUGIN_ROOT / "execute.py").read_text(encoding="utf-8")
-    assert 'PLUGIN_VERSION = "1.7.0"' in plugin_py, "plugin.py not 1.7.0"
-    assert 'PLUGIN_VERSION = "1.7.0"' in hooks_py, "hooks.py not 1.7.0"
-    assert re.search(r'^version:\s*1\.7\.0', manifest, re.M), "plugin.yaml not 1.7.0"
-    assert 'EXPECTED_VERSION = "1.7.0"' in execute_py, "execute.py not 1.7.0"
+    assert 'PLUGIN_VERSION = "1.8.0"' in plugin_py, "plugin.py not 1.8.0"
+    assert 'PLUGIN_VERSION = "1.8.0"' in hooks_py, "hooks.py not 1.8.0"
+    assert re.search(r'^version:\s*1\.8\.0', manifest, re.M), "plugin.yaml not 1.8.0"
+    assert 'EXPECTED_VERSION = "1.8.0"' in execute_py, "execute.py not 1.8.0"
 
 
 @test("v1.6.1: default_config.yaml declares the official-engine bridge keys")
@@ -3543,8 +3543,8 @@ def t_c2_gate_insufficient_n() -> None:
     assert "hard_current" in r2 and "hard_proposed" in r2 and "lift_pp" in r2, r2
 
 
-@test("v1.7.0 C2: real executor is a guarded stub (not enabled -> ok=False)")
-def t_c2_real_executor_stub_disabled() -> None:
+@test("v1.7.0 C2 / v1.8.0: real executor disabled -> not_enabled; flag-on worker failure -> unavailable")
+def t_c2_real_executor_disabled_returns_not_enabled() -> None:
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers import replay_harness
     tasks = [{"task": "t", "outcome": "success"}] * 3
@@ -4137,6 +4137,401 @@ def t_c4_check_eligible_after_auto_optin_and_approval() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ======================================================================= #
+# v1.8.0 — real replay executor + LLM-judge reward training + wiring
+# ======================================================================= #
+
+_section_v180 = "v1.8.0 NEW: subprocess replay worker, LLM judge, training loop, calibration, config wiring (11 cases)"
+
+
+@test("v1.8.0 P2: _real_score builds the worker argv and parses the score envelope (no spawn)")
+def t_v18_real_score_builds_worker_command() -> None:
+    """Mock subprocess.run so no real subprocess spawns. The fake writes a
+    {score, outcome} JSON to the --out path (as the worker would) and we
+    assert _real_score returns 0.75 AND that the argv it built points at
+    replay_worker.py with the four required flags."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import replay_harness, sleep_runner
+    import subprocess as _subp
+
+    captured = {}
+
+    class _FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd, **kw):
+        captured["cmd"] = list(cmd)
+        # find --out and write the score envelope there (what the worker does)
+        out_idx = cmd.index("--out")
+        out_path = cmd[out_idx + 1]
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump({"score": 0.75, "outcome": "success", "source": "heuristic"}, fh)
+        return _FakeProc()
+
+    _orig = _subp.run
+    _subp.run = _fake_run
+    try:
+        sc = replay_harness._real_score(
+            {"task": "do X", "outcome": "success"}, "# Skill\n**kw**\n",
+            {"replay_real_per_task_timeout_s": 5}, "replay",
+        )
+    finally:
+        _subp.run = _orig
+    assert sc == 0.75, sc
+    cmd = captured["cmd"]
+    assert any(p.endswith("replay_worker.py") for p in cmd), cmd
+    assert "--skill-name" in cmd and "replay" in cmd, cmd
+    assert "--skill-md" in cmd and "--task" in cmd and "--out" in cmd, cmd
+    # the python entry is the A0 venv python
+    assert sleep_runner._a0_python() in cmd or cmd[0] == sleep_runner._a0_python(), cmd
+
+
+@test("v1.8.0 P2: a worker error envelope -> _real_score raises -> real_executor_unavailable")
+def t_v18_real_score_worker_error_envelope() -> None:
+    """When the worker writes {score: null, error: ...} (it ran but failed),
+    _real_score raises RuntimeError and run_counterfactual turns that into
+    real_executor_unavailable:RuntimeError:... (loud-not-crash)."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import replay_harness
+    import subprocess as _subp
+
+    class _FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd, **kw):
+        out_path = cmd[cmd.index("--out") + 1]
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump({"score": None, "error": "boom"}, fh)
+        return _FakeProc()
+
+    _orig = _subp.run
+    _subp.run = _fake_run
+    try:
+        r = replay_harness.run_counterfactual(
+            "s", "cur", "prop", [{"task": "t", "outcome": "success"}] * 3,
+            executor="real",
+            config={"replay_min_n": 3, "replay_real_executor_enabled": True,
+                    "replay_real_per_task_timeout_s": 5},
+        )
+    finally:
+        _subp.run = _orig
+    assert r["ok"] is False, r
+    assert r["reason"].startswith("real_executor_unavailable:RuntimeError"), r
+
+
+@test("v1.8.0 P1: replay_worker.main parses args + writes the score JSON (A0 imports lazy)")
+def t_v18_replay_worker_arg_parsing() -> None:
+    """Import scripts/replay_worker.py via importlib (its A0 imports are
+    lazy, so it imports without A0 core). Patch asyncio.run so no real
+    event loop / monologue runs; main() must still write a {score, outcome}
+    JSON to --out and return 0."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "replay_worker_v18", PLUGIN_ROOT / "scripts" / "replay_worker.py")
+    rw = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rw)
+
+    from types import SimpleNamespace
+    rw.asyncio = SimpleNamespace(run=lambda coro: {"response": "Done. Tests pass.", "task": "demo"})
+
+    import tempfile as _tf
+    skill_md = "# Skill\n**do thing**\n"
+    task = json.dumps({"task": "do the thing"})
+    sf = _tf.mkstemp(suffix=".md")[1]; open(sf, "w", encoding="utf-8").write(skill_md)
+    tf = _tf.mkstemp(suffix=".json")[1]; open(tf, "w", encoding="utf-8").write(task)
+    of = _tf.mkstemp(suffix=".json")[1]
+    import os as _o
+    try:
+        rc = rw.main(["--skill-name", "s", "--skill-md", sf, "--task", tf, "--out", of])
+        assert rc == 0, rc
+        out = json.loads(open(of, encoding="utf-8").read())
+        assert "score" in out and "outcome" in out, out
+        assert isinstance(out["score"], float), out
+    finally:
+        for p in (sf, tf, of):
+            try: _o.unlink(p)
+            except OSError: pass
+
+
+@test("v1.8.0 P4: judge_outcome builds a TASK/RESPONSE/TRAJECTORY prompt + validates the label")
+def t_v18_llm_judge_prompt_builder() -> None:
+    """Stub direct_optimizer._call_llm to capture the prompt + system and
+    return a canned judge JSON. Assert the prompt has TASK/RESPONSE/
+    TRAJECTORY sections, the system prompt is the judge one, the label is
+    validated, and a bad label comes back as {label: None}."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import direct_optimizer, llm_judge
+
+    captured = {}
+
+    def _fake_call(prompt, model, max_tokens=2000, system=None):
+        captured["prompt"] = prompt
+        captured["system"] = system
+        captured["model"] = model
+        return '{"label": "success", "confidence": 0.9, "reason": "task done"}'
+
+    _orig = direct_optimizer._call_llm
+    direct_optimizer._call_llm = _fake_call
+    try:
+        r = llm_judge.judge_outcome({
+            "task": "Refactor the parser.",
+            "last_response": "Done. Parser handles nesting.",
+            "trajectory": [{"role": "assistant", "content": "edited parser.py"}],
+        })
+    finally:
+        direct_optimizer._call_llm = _orig
+    assert r["label"] == "success", r
+    assert r["confidence"] == 0.9 and "reason" in r and "model" in r, r
+    p = captured["prompt"]
+    assert "TASK:" in p and "RESPONSE:" in p and "TRAJECTORY:" in p, p
+    assert captured["system"] == llm_judge.JUDGE_SYSTEM, "judge must use its own system prompt"
+
+    # bad label -> {label: None, error}
+    def _bad_call(prompt, model, max_tokens=2000, system=None):
+        return '{"label": "win"}'
+    direct_optimizer._call_llm = _bad_call
+    try:
+        r2 = llm_judge.judge_outcome({"task": "x", "last_response": "y"})
+    finally:
+        direct_optimizer._call_llm = _orig
+    assert r2.get("label") is None and "error" in r2, r2
+
+
+@test("v1.8.0 P4: label_rollout_file is idempotent (skip when judge_label present) + force re-labels")
+def t_v18_label_rollout_idempotent() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import direct_optimizer, llm_judge
+    import tempfile as _tf, os as _o
+    import shutil
+    tmp = _tf.mkdtemp()
+    try:
+        p = Path(tmp) / "rollout_1.json"
+        rec = {"task": "x", "last_response": "done", "outcome": "success", "judge_label": "success"}
+        p.write_text(json.dumps(rec), encoding="utf-8")
+        before = p.read_text(encoding="utf-8")
+        # idempotent skip
+        r = llm_judge.label_rollout_file(p)
+        assert r["labelled"] is False and r["skipped"] is True, r
+        assert p.read_text(encoding="utf-8") == before, "file must be unchanged on skip"
+        # force re-label -> partial
+        _orig = direct_optimizer._call_llm
+        direct_optimizer._call_llm = lambda prompt, model, max_tokens=2000, system=None: \
+            '{"label": "partial", "confidence": 0.5, "reason": "mid"}'
+        try:
+            r2 = llm_judge.label_rollout_file(p, force=True)
+        finally:
+            direct_optimizer._call_llm = _orig
+        assert r2["labelled"] is True and r2["label"] == "partial", r2
+        after = json.loads(p.read_text(encoding="utf-8"))
+        assert after["judge_label"] == "partial" and "judge_at" in after, after
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test("v1.8.0 P5: _load_labelled_rollouts keeps labelled rollouts, skips unlabelled (success=0/failure=2)")
+def t_v18_train_dataset_loader() -> None:
+    import importlib.util, tempfile as _tf, shutil
+    spec = importlib.util.spec_from_file_location(
+        "trm_v18", PLUGIN_ROOT / "scripts" / "train_reward_model.py")
+    trm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(trm)
+    tmp = _tf.mkdtemp()
+    try:
+        d = Path(tmp)
+        (d / "a.json").write_text(json.dumps({"task": "t1", "last_response": "ok", "judge_label": "success"}), encoding="utf-8")
+        (d / "b.json").write_text(json.dumps({"task": "t2", "last_response": "err", "judge_label": "failure"}), encoding="utf-8")
+        (d / "c.json").write_text(json.dumps({"task": "t3", "last_response": "no label here"}), encoding="utf-8")
+        samples = trm._load_labelled_rollouts(d)
+        assert len(samples) == 2, samples
+        idxs = sorted(idx for _, idx in samples)
+        assert idxs == [0, 2], idxs  # success=0, failure=2
+        assert all(isinstance(t, str) and t.strip() for t, _ in samples), samples
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test("v1.8.0 P5: _train_val_split is deterministic + stratified + always leaves a val set")
+def t_v18_train_val_split_deterministic() -> None:
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "trm_v18b", PLUGIN_ROOT / "scripts" / "train_reward_model.py")
+    trm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(trm)
+    # 10 per class x 3 classes = 30 samples
+    samples = [(f"t{i}", c) for c in (0, 1, 2) for i in range(10)]
+    tr1, val1 = trm._train_val_split(samples, val_frac=0.2)
+    tr2, val2 = trm._train_val_split(samples, val_frac=0.2)
+    assert (tr1, val1) == (tr2, val2), "split must be deterministic"
+    assert len(tr1) + len(val1) == 30
+    assert 0 < len(val1) < 30, (len(tr1), len(val1))
+    # val_mod=5 -> every 5th per class (c%5==0 and c>0) -> c=5 only for 10
+    # samples/class -> 1 per class x 3 = 3. Approaches val_frac for larger n.
+    assert len(val1) == 3, len(val1)
+    # stratified: each val class also appears in train (no class lost entirely)
+    val_classes = {idx for _, idx in val1}
+    train_classes = {idx for _, idx in tr1}
+    assert val_classes.issubset(train_classes), (val_classes, train_classes)
+    # tiny data: 2 samples -> still get a val set
+    tr3, val3 = trm._train_val_split([("a", 0), ("b", 1)], val_frac=0.2)
+    assert len(val3) == 1 and len(tr3) == 1, (tr3, val3)
+
+
+@test("v1.8.0 P6: _calibrate picks the T maximizing val agreement (highest T wins ties)")
+def t_v18_calibration_threshold() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import reward_model
+    import tempfile as _tf, shutil
+    tmp = _tf.mkdtemp()
+    try:
+        # Sample 1 (true success): P(success)=0.8 -> agrees for T<=0.8.
+        # Sample 2 (true partial): P(success)=0.2 -> below all T in [0.3,0.9],
+        #   so argmax{partial,failure}=partial -> always agrees.
+        # Sample 3 (true failure): P(success)=0.1 -> argmax=failure -> always agrees.
+        # So agreement=1.0 for T in [0.3..0.8], 2/3 for T in {0.85,0.9}.
+        # Highest T with agreement 1.0 -> 0.8.
+        val = [("s1", 0), ("s2", 1), ("s3", 2)]
+        probs = {"s1": [0.8, 0.1, 0.1], "s2": [0.2, 0.7, 0.1], "s3": [0.1, 0.1, 0.8]}
+
+        def _probs_fn(text):
+            return probs.get(text, [0.33, 0.33, 0.34])
+
+        res = reward_model._calibrate(None, None, val, probs_fn=_probs_fn, out_dir=tmp)
+        assert 0.3 <= res["prefer_model_above"] <= 0.9, res
+        assert res["prefer_model_above"] == 0.8, res
+        assert res["val_agreement"] == 1.0 and res["n_val"] == 3, res
+        cal = json.loads((Path(tmp) / "calibration.json").read_text(encoding="utf-8"))
+        assert cal["prefer_model_above"] == 0.8, cal
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test("v1.8.0 P6: model_path reads reward_model_path config; env SKILLOPT_REWARD_MODEL_DIR wins")
+def t_v18_reward_model_path_reads_config() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import sleep_runner, reward_model
+    import tempfile as _tf
+    # make sure no env override leaks from another test
+    old_env = os.environ.pop("SKILLOPT_REWARD_MODEL_DIR", None)
+    orig_mc = sleep_runner.merged_config
+    sleep_runner.merged_config = lambda: {"reward_model_path": "models/custom"}
+    try:
+        p = reward_model.model_path()
+        assert p == (PLUGIN_ROOT / "models" / "custom"), p
+    finally:
+        sleep_runner.merged_config = orig_mc
+    # env wins over config
+    tmp = _tf.mkdtemp()
+    os.environ["SKILLOPT_REWARD_MODEL_DIR"] = tmp
+    try:
+        sleep_runner.merged_config = lambda: {"reward_model_path": "models/custom"}
+        try:
+            assert reward_model.model_path() == Path(tmp), reward_model.model_path()
+        finally:
+            sleep_runner.merged_config = orig_mc
+    finally:
+        os.environ.pop("SKILLOPT_REWARD_MODEL_DIR", None)
+        if old_env is not None:
+            os.environ["SKILLOPT_REWARD_MODEL_DIR"] = old_env
+        import shutil; shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test("v1.8.0 P6: score_rollout prefer_model_above reads config then calibration.json (calibration wins)")
+def t_v18_score_rollout_default_reads_config() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import sleep_runner, reward_model
+    import tempfile as _tf, shutil
+    reward_model.reset_for_tests()
+    tmp = _tf.mkdtemp()
+    os.environ["SKILLOPT_REWARD_MODEL_DIR"] = tmp  # model_path() -> tmp (no model -> heuristic fallback)
+    orig_mc = sleep_runner.merged_config
+    sleep_runner.merged_config = lambda: {"reward_model_prefer_above": 0.7}
+    try:
+        r = reward_model.score_rollout({"task": "x", "last_response": "done"})
+        assert r["prefer_model_above"] == 0.7, r
+        # calibration.json next to the model wins over config
+        (Path(tmp) / "calibration.json").write_text(
+            json.dumps({"prefer_model_above": 0.9}), encoding="utf-8")
+        reward_model.reset_for_tests()  # _config_prefer_above reads disk fresh anyway
+        r2 = reward_model.score_rollout({"task": "x", "last_response": "done"})
+        assert r2["prefer_model_above"] == 0.9, r2
+    finally:
+        sleep_runner.merged_config = orig_mc
+        os.environ.pop("SKILLOPT_REWARD_MODEL_DIR", None)
+        reward_model.reset_for_tests()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test("v1.8.0 P3: validate_proposal passes executor=real when enabled, mock when not")
+def t_v18_call_site_real_when_enabled() -> None:
+    """Mock replay_harness.run_counterfactual to capture the executor kwarg.
+    With replay_real_executor_enabled:true -> executor='real'; false -> 'mock'.
+    A/B harness env is disabled so stage 0 falls through and the replay stage
+    0.7 is what we capture."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import ab_harness, replay_harness
+    from helpers.sleep_runner import validate_proposal
+    ab_harness.reset_for_tests()
+    old_ab = os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
+    skill = "v18_callsite_skill"
+    rollouts = _write_fake_rollouts(skill, n=3)
+    current = "# Refactor Module\n**nested groups**\n\n```example\nrefactor module\n```\n" + ("x" * 180)
+    proposed = "# Refactor Module v2\n**nested groups deeper**\n\n```example\nrefactor module\n```\n" + ("y" * 180)
+
+    captured = {}
+
+    def _fake_rcf(**kw):
+        captured["executor"] = kw.get("executor")
+        # return ok=False so validate_proposal falls through to structural
+        return {"ok": False, "reason": "captured", "executor": kw.get("executor"), "n": 3}
+
+    _orig_rcf = replay_harness.run_counterfactual
+    replay_harness.run_counterfactual = _fake_rcf
+    try:
+        from helpers import sleep_runner as _sr
+        _orig_mc = _sr.merged_config
+
+        def _overlay(real_fn, *, replay_real):
+            def _fn():
+                base = dict(real_fn())  # preserve all real defaults
+                base["replay_local_gate_enabled"] = True
+                base["replay_real_executor_enabled"] = replay_real
+                base["ab_harness_enabled"] = False  # disable A/B so stage 0 falls through
+                base["fragment_per_fragment_gate"] = False
+                return base
+            return _fn
+
+        # flag ON -> executor='real'
+        _sr.merged_config = _overlay(_orig_mc, replay_real=True)
+        try:
+            validate_proposal(proposed, current, min_chars=200, min_improvement_pp=5.0,
+                              max_shrink_ratio=0.5, held_out=None, skill_name=skill)
+        finally:
+            _sr.merged_config = _orig_mc
+        assert captured.get("executor") == "real", captured
+
+        # flag OFF -> executor='mock'
+        _sr.merged_config = _overlay(_orig_mc, replay_real=False)
+        try:
+            validate_proposal(proposed, current, min_chars=200, min_improvement_pp=5.0,
+                              max_shrink_ratio=0.5, held_out=None, skill_name=skill)
+        finally:
+            _sr.merged_config = _orig_mc
+        assert captured.get("executor") == "mock", captured
+    finally:
+        replay_harness.run_counterfactual = _orig_rcf
+        _cleanup_rollouts(rollouts)
+        if old_ab is None:
+            os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
+        else:
+            os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = old_ab
+        # restore the suite-wide default the harness header sets
+        os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = "1"
+
+
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
     print(_section_v110)
@@ -4148,4 +4543,5 @@ if __name__ == "__main__":
     print(_section_v170_c2)
     print(_section_v170_c3)
     print(_section_v170_c4)
+    print(_section_v180)
     sys.exit(main())

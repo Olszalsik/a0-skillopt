@@ -88,7 +88,7 @@ layers on top.
   deterministic mock executor (relevance heuristic, no LLM) scores current vs
   proposed on held-out rollouts; strict-monotonic lift ≥ `gate_min_improvement_pp`
   over ≥ `replay_min_n`. Wired as **stage 0.7** (skipped when `official_gated`).
-  Real executor is a guarded stub.
+  Real executor implemented in v1.8.0 (subprocess-isolated A0 loop); mock stays default.
 - **C3 — human-in-the-loop adopt UI.** `/staged` + `/adopt` (by id, with
   whole-file snapshot) + `/reject` + `/rollback`. `fragment_store` whole-file
   snapshot/restore keyed on skill-name string. WebUI Staged-proposals section.
@@ -99,37 +99,61 @@ layers on top.
 
 ---
 
-## Next: the two offline pieces (stubbed in v1.7.0)
+## v1.8.0 — DONE (2026-08-11): the two offline pieces, integrated
 
 Solution C deliberately stubbed the two expensive/offline pieces and documented
-them as follow-ups. They are the next roadmap items:
+them as follow-ups. **v1.8.0 implements both**, default-off so v1.7.0 behavior
+is preserved byte-for-byte unless an operator opts in. 122/122 deterministic
+smoke tests still pass (11 new `t_v18_*` cases + the updated `t_c2_*`); live
+verification (real A0 runtime + LLM) is flagged below.
 
-### 10. Real A0-agent-loop replay executor — STUBBED in v1.7.0 (C2)
+### 10. Real A0-agent-loop replay executor — DONE (v1.8.0, P1–P3)
 
-The C2 local replay gate currently scores proposals with a deterministic **mock
-executor** (relevance heuristic, no LLM). The real executor runs each held-out
-task through an actual A0 agent loop with the proposed skill loaded, captures the
-outcome, and scores it — a genuine counterfactual. The stub (`replay_harness.
-_real_score`) is already wired: it raises `NotImplementedError` unless
-`replay_real_executor_enabled` is true, and it already sets/unsets
-`SKILLOPT_REPLAY_MODE` around the replay agent so the replay's own turns don't
-pollute the training set or spawn a nested optimizer loop. The work is to fill
-in the `AgentContext` + `Agent` + `skills.add_loaded_skill_name` +
-`hist_add_tool_result(skill_instructions)` + `context.communicate(UserMessage)`
-flow and score the captured `last_response` via `reward_model.score_rollout`.
+The C2 local replay gate now has a real executor behind
+`replay_real_executor_enabled`. `helpers/replay_harness.py:_real_score` shells
+out to the new `scripts/replay_worker.py`, which runs each held-out task through
+a real Agent Zero monologue (all tools) under the current vs proposed skill in a
+**child process** — temp working directory, own event loop,
+`SKILLOPT_REPLAY_MODE=1` — and writes a `{score, outcome, ...}` JSON envelope.
+The subprocess design gives side-effect containment (temp cwd), a clean async
+boundary (no "event loop already running" when called from the auto-loop thread
+or an async WebUI handler), and recursion isolation. Skill injection uses the
+corrected recipe: `hist_add_tool_result` takes `skill_instructions` as a
+**top-level kwarg**, not nested under `additional`. Cost is bounded by
+`replay_real_max_tasks` (default 4 — the real executor runs 2×N full monologues
+per gate call) and `replay_real_per_task_timeout_s` (default 180). The
+`sleep_runner.py` call-site (stage 0.7) now passes `executor="real"` when the
+flag is on; off = byte-identical to v1.7.0. On any worker failure the gate
+returns `real_executor_unavailable:...` and falls through to the structural
+gate (loud-not-crash, unchanged).
 
-### 11. DistilBERT reward-model training — SKELETON (v1.2.0 `scripts/train_reward_model.py`)
+### 11. DistilBERT reward-model training + LLM judge — DONE (v1.8.0, P4–P6)
 
-The reward model (`helpers/reward_model.py`) currently falls back to a heuristic
-scorer because `models/reward_model/` is untrained. The training script exists as
-a 215-LoC skeleton. The work is to label rollouts (outcome → reward), train a
-DistilBERT regression head on the rollout text, and persist it so
-`score_rollout` uses the trained model instead of the heuristic. The C2 mock
-executor reuses `score_rollout`, so a trained reward model sharpens both the
-replay gate and the A/B harness.
+- **P4 — LLM-judge labelling pass.** NEW `helpers/llm_judge.py`:
+  `judge_outcome(rollout)` classifies an agent turn into success/partial/failure
+  (aligned with `score_rollout`'s 3-class space) via `direct_optimizer._call_llm`
+  with a judge-specific system prompt; never raises. NEW
+  `scripts/label_rollouts.py` is the CLI pass (idempotent, atomic in-place
+  augmentation, `--limit/--force/--model/--dry-run`, advisory judge-vs-heuristic
+  agreement %).
+- **P5 — real training loop.** `scripts/train_reward_model.py --mode train`
+  loads judge-labelled rollouts, featurizes them with
+  `reward_model._rollout_to_text` (the SAME featurizer inference uses), splits
+  train/val deterministically (stratified per-class), runs an AdamW epochs loop
+  with per-epoch val accuracy+loss, persists the model, writes a `1.3.0-train-*`
+  version stamp. `--mode smoke` (default) is the v1.2.0 demo step, unchanged.
+- **P6 — calibration + dead-config wiring.** `reward_model.model_path()` now
+  reads the `reward_model_path` config key (env still wins);
+  `score_rollout(prefer_model_above=None)` resolves `calibration.json` >
+  `reward_model_prefer_above` config > 0.6 via `_config_prefer_above()`. The
+  `_calibrate()` pass (called from `cmd_train`) sweeps T in [0.3, 0.9] under the
+  gated decision rule and writes `calibration.json` next to the model; `T*` is
+  surfaced in the version stamp.
 
-See the integration plan (added separately) for the design, scope options, and
-verification approach for both.
+**Remaining live follow-up:** the four live checks (L1 worker spawn, L2 judge
+labelling, L3 training, L4 end-to-end gate) need the A0 venv + a running A0
+server + LLM credentials — they are flagged in the plan, not run in dev. The
+smoke suite covers all logic testable without them.
 
 ---
 

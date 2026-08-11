@@ -63,19 +63,32 @@ gate_min_improvement_pp: 5.0
 # and we must not double-count).
 #
 # The mock executor is deterministic (no LLM) — a relevance heuristic,
-# not a real agent replay. The real A0-agent-loop executor is a STUB
-# behind replay_real_executor_enabled (default false); it is the live
-# follow-up. See helpers/replay_harness.py.
+# not a real agent replay. The real A0-agent-loop executor (v1.8.0) is
+# IMPLEMENTED behind replay_real_executor_enabled (default false): it
+# shells out to scripts/replay_worker.py, which runs each held-out task
+# through a real Agent Zero monologue under the current vs proposed skill
+# in a child process (temp working dir, own event loop). See
+# helpers/replay_harness.py + scripts/replay_worker.py.
 #
 # replay_local_gate_enabled   : master kill switch (default ON)
 # replay_min_n                : below this many held-out rollouts the gate
 #                               returns ok=False and the structural gate runs
 # replay_held_out_n           : how many recent rollouts to re-score (per skill)
-# replay_real_executor_enabled: opt into the real (stub) executor. OFF by default.
+# replay_real_executor_enabled: opt into the real A0-agent-loop executor. OFF
+#                               by default (mock is byte-identical to v1.7.0).
+# replay_real_per_task_timeout_s: per-task subprocess timeout (real executor).
+#                               The worker runs a FULL A0 monologue per task,
+#                               so give it room. Default 180s.
+# replay_real_max_tasks       : cap on held-out tasks the real executor scores
+#                               (it runs 2xN full monologues — current + proposed
+#                               x N — per gate call, so N must stay small).
+#                               Default 4. 0 = no cap (not recommended).
 replay_local_gate_enabled: true
 replay_min_n: 3
 replay_held_out_n: 8
 replay_real_executor_enabled: false
+replay_real_per_task_timeout_s: 180
+replay_real_max_tasks: 4
 
 # =====================================================================
 # STORAGE
@@ -153,8 +166,11 @@ failure_memory_max_per_skill: 100
 # Override the on-disk model location with SKILLOPT_REWARD_MODEL_DIR.
 #
 # Confidence threshold above which the harvester prefers the model
-# output over the v1.1.0 heuristic. 0.6 is the v1.2.0 default and
-# will be re-calibrated once 5K labelled rollouts exist.
+# output over the v1.1.0 heuristic. v1.8.0: this is now WIRED —
+# score_rollout reads calibration.json (written by the training script's
+# calibration pass) when present, else this config key, else 0.6. The
+# training labels come from the LLM judge (helpers/llm_judge.py, P4) and
+# the real training loop is scripts/train_reward_model.py --mode train (P5).
 reward_model_path: "models/reward_model"
 reward_model_prefer_above: 0.6
 

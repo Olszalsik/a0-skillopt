@@ -6,10 +6,82 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
-The next planned work is the two offline pieces stubbed in v1.7.0: the real
-A0-agent-loop replay executor (currently a guarded stub behind
-`replay_real_executor_enabled`) and DistilBERT reward-model training (the
-`scripts/train_reward_model.py` skeleton). See ROADMAP.md.
+Nothing staged yet. The two v1.7.0 follow-ups (real replay executor + reward
+training) landed in v1.8.0 — see below. Live verification of the v1.8.0 opt-in
+paths (L1–L4 in the plan) is the remaining work.
+
+---
+
+## [1.8.0] — 2026-08-11
+
+**The two offline pieces stubbed in v1.7.0 are now implemented, default-off.**
+Six phases, each its own commit to the nested `Olszalsik/a0-skillopt` repo.
+122/122 deterministic smoke tests pass (11 new `t_v18_*` + the updated
+`t_c2_real_executor_disabled_returns_not_enabled`); no LLM/network. v1.7.0
+behavior is preserved byte-for-byte unless an operator opts in.
+
+### Added
+
+- **P1 — subprocess-isolated replay worker** (`scripts/replay_worker.py`, NEW).
+  Runs one held-out task through a real Agent Zero monologue under a given skill
+  in a child process (temp working dir, own event loop, `SKILLOPT_REPLAY_MODE=1`)
+  and writes a `{score, outcome, ...}` JSON envelope. A0 imports are lazy so the
+  module is importable in smoke tests without A0 core. Skill injection uses the
+  corrected recipe: `hist_add_tool_result` takes `skill_instructions` as a
+  **top-level kwarg**, not nested under `additional`.
+- **P2 — real `_real_score`** (`helpers/replay_harness.py`). Shells out to the
+  worker via blocking `subprocess.run` (not detached), parses the score JSON,
+  returns a float. `sleep_runner.build_subprocess_env()` factored out of
+  `launch_sleep_subprocess` so the worker inherits the `.skillopt-env` overlay.
+  Cost bounded by `replay_real_max_tasks` (default 4 — 2×N full monologues per
+  gate call). Any worker failure raises → `run_counterfactual` returns
+  `real_executor_unavailable:...` (loud-not-crash, falls through to the
+  structural gate — unchanged).
+- **P4 — LLM-judge outcome labelling** (`helpers/llm_judge.py` + `scripts/label_rollouts.py`, NEW).
+  `judge_outcome(rollout)` classifies a turn into success/partial/failure
+  (aligned with `score_rollout`'s 3-class space) via `direct_optimizer._call_llm`
+  with a judge-specific system prompt; never raises. `label_rollout_file`
+  augments a rollout JSON in place, atomically, and is idempotent. The CLI pass
+  (`--limit/--force/--model/--dry-run`) reports an advisory judge-vs-heuristic
+  agreement %. `direct_optimizer._call_llm` gained an optional `system` param
+  (back-compat default) so judge + optimizer share one call function.
+- **P5 — real DistilBERT training loop** (`scripts/train_reward_model.py`).
+  `--mode train` (default `smoke` — backwards compatible) loads judge-labelled
+  rollouts, featurizes them with `reward_model._rollout_to_text` (the SAME
+  featurizer inference uses), splits train/val deterministically (stratified
+  per-class), runs an AdamW epochs loop with per-epoch val accuracy+loss,
+  persists the model, writes a `1.3.0-train-*` version stamp. `--min-samples`
+  (50) guards against tiny datasets.
+- **P6 — calibration + dead-config wiring** (`helpers/reward_model.py`).
+  `model_path()` now reads the `reward_model_path` config key (env still wins).
+  `score_rollout(prefer_model_above=None)` resolves `calibration.json` >
+  `reward_model_prefer_above` config > 0.6 via `_config_prefer_above()`. The
+  `_calibrate()` pass sweeps T in [0.3, 0.9] under the gated decision rule,
+  writes `calibration.json` next to the model, and surfaces `T*` in the version
+  stamp. `probs_fn` is injectable so the smoke test calibrates without torch.
+
+### Changed
+
+- **P3 — replay gate call-site** (`helpers/sleep_runner.py` stage 0.7). Now
+  passes `executor="real"` when `replay_real_executor_enabled` is true (was
+  hardcoded `mock`). Off by default = byte-identical to v1.7.0.
+- **Config** — new keys in `default_config.yaml` + `config.json`:
+  `replay_real_per_task_timeout_s: 180`, `replay_real_max_tasks: 4`. The
+  `replay_real_executor_enabled` comment now says IMPLEMENTED (was "stub"). The
+  `reward_model_prefer_above` comment now says WIRED (was "will be
+  re-calibrated once 5K labelled rollouts exist"). `config.json` is gitignored
+  and is not committed.
+- **Version bump** 1.7.0 → 1.8.0 (`plugin.yaml`, `plugin.py`, `hooks.py`,
+  `execute.py`, `README.md` badge).
+
+### Tests
+
+- 11 new `t_v18_*` smoke cases + the renamed
+  `t_c2_real_executor_disabled_returns_not_enabled` (flag-on no longer asserts
+  `NotImplementedError`; it now mocks `subprocess.run` with a failing
+  `_FakeProc` so no real subprocess spawns, and the
+  `real_executor_unavailable` assertion holds via `RuntimeError`). All
+  deterministic, NO LLM, NO subprocess spawn.
 
 ---
 
