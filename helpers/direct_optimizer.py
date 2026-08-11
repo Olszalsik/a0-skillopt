@@ -104,8 +104,21 @@ def _default_model() -> str:
     return cfg.get("optimizer_model") or "minimax-m3"
 
 
-def _call_llm(prompt: str, model: str, max_tokens: int = 2000) -> str:
-    """Call the ollama_cloud LLM via the openai package (OpenAI-compatible)."""
+_OPTIMIZER_SYSTEM = (
+    "You are an expert at improving Agent Zero skill documents. You receive "
+    "the current skill, a list of successful uses, and a list of failed uses. "
+    "You output ONLY the improved skill document - no preamble, no explanation, "
+    "no markdown fences."
+)
+
+
+def _call_llm(prompt: str, model: str, max_tokens: int = 2000, system: str | None = None) -> str:
+    """Call the OpenAI-compatible LLM via the openai package.
+
+    ``system`` overrides the default optimizer system prompt - the LLM judge
+    (helpers/llm_judge.py) passes its own classification instruction. Defaults
+    to the skill-improvement prompt for backwards compatibility.
+    """
     env = _read_env_file()
     base_url = env.get("AZURE_OPENAI_ENDPOINT", "https://ollama.com/v1")
     api_key = env.get("AZURE_OPENAI_API_KEY", "")
@@ -121,7 +134,7 @@ def _call_llm(prompt: str, model: str, max_tokens: int = 2000) -> str:
     resp = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": "You are an expert at improving Agent Zero skill documents. You receive the current skill, a list of successful uses, and a list of failed uses. You output ONLY the improved skill document - no preamble, no explanation, no markdown fences."},
+            {"role": "system", "content": system or _OPTIMIZER_SYSTEM},
             {"role": "user", "content": prompt},
         ],
         max_tokens=max_tokens,
