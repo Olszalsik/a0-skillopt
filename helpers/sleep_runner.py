@@ -390,11 +390,13 @@ def validate_proposal(
     # NOT already gate this proposal (official_gated=False — the upstream
     # gate is authoritative and we must not double-count), and the local
     # replay gate is enabled (replay_local_gate_enabled, default true).
-    # Uses a deterministic mock executor (no LLM); a real A0-agent-loop
-    # executor is stubbed behind replay_real_executor_enabled. As with
-    # stage 0, a harness bug can never crash the gate — on ok=False
-    # (insufficient rollouts / executor unavailable) we fall through to
-    # the structural stages; on ok=True + accepted=False we REJECT.
+    # v1.8.0: the executor is the deterministic mock (no LLM) by default,
+    # OR the real A0-agent-loop subprocess executor when
+    # replay_real_executor_enabled is true (see helpers/replay_harness.py
+    # + scripts/replay_worker.py). As with stage 0, a harness bug can
+    # never crash the gate — on ok=False (insufficient rollouts / executor
+    # unavailable) we fall through to the structural stages; on ok=True +
+    # accepted=False we REJECT.
     if skill_name and not official_gated:
         try:
             _cfg = merged_config()
@@ -406,7 +408,7 @@ def validate_proposal(
                     current_skill_md=current or "",
                     proposed_skill_md=proposed or "",
                     held_out_tasks=_held,
-                    executor="mock",
+                    executor=("real" if bool(_cfg.get("replay_real_executor_enabled", False)) else "mock"),
                     config=_cfg,
                 )
                 if _replay.get("ok"):
@@ -569,6 +571,44 @@ def _per_fragment_structural_check(
     return None
 
 
+def build_subprocess_env(env_file: Path | None = None) -> dict[str, str]:
+    """Build the env dict for a skillopt subprocess.
+
+    Starts from ``os.environ.copy()`` and overlays any ``export FOO=bar``
+    lines from ``logs/runs/.skillopt-env`` (with ``$VAR``/``${VAR}``
+    references expanded against the env being built). Done in-Python rather
+    than via ``source ... && python ...`` so the call works on any shell,
+    including the minimal one inside the A0 container.
+
+    Shared by the detached Sleep cycle launcher
+    (:func:`launch_sleep_subprocess`) and the blocking replay-worker spawn
+    (``helpers/replay_harness._real_score``). Best-effort: on any parse
+    error the parent env is returned unchanged.
+    """
+    sub_env = os.environ.copy()
+    env_file = env_file or (runs_dir() / ".skillopt-env")
+    if not env_file.is_file():
+        return sub_env
+    try:
+        for raw in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                val = _expand_env(val, sub_env)
+                sub_env[key] = val
+    except Exception:
+        # Best-effort: continue with the parent env
+        pass
+    return sub_env
+
+
 def launch_sleep_subprocess(
     verb: str,
     extra_args: list[str] | None = None,
@@ -609,35 +649,11 @@ def launch_sleep_subprocess(
     except Exception as _bridge_err:
         bridge_result = {"rollouts_written": 0, "error": str(_bridge_err)}
 
-    # Build the subprocess env: start from the parent's env, then
-    # overlay any `export FOO=bar` lines from .skillopt-env. We
-    # do this in-Python (not via `source ... && python ...`) so the
-    # call works on any shell, including the minimal one inside the
-    # A0 container.
-    sub_env = os.environ.copy()
+    # Build the subprocess env: start from the parent's env, then overlay any
+    # `export FOO=bar` lines from .skillopt-env. Shared with the replay-worker
+    # spawn via build_subprocess_env() so both paths apply the same credentials.
     env_file = runs_dir() / ".skillopt-env"
-    if env_file.is_file():
-        try:
-            for raw in env_file.read_text(encoding="utf-8").splitlines():
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("export "):
-                    line = line[len("export "):].strip()
-                    if "=" not in line:
-                        continue
-                    key, _, val = line.partition("=")
-                    key = key.strip()
-                    val = val.strip().strip('"').strip("'")
-                    # Expand $OTHER_VARS or ${OTHER_VARS} from the current sub_env
-                    val = _expand_env(val, sub_env)
-                    sub_env[key] = val
-        except Exception as e:
-            # Best-effort: log and continue with the parent env
-            try:
-                (runs_dir() / "auto_loop.log").parent.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
+    sub_env = build_subprocess_env(env_file)
 
     ts = time.strftime("%Y%m%dT%H%M%S")
     log_name = log_name or f"sleep-{verb}-{ts}.log"

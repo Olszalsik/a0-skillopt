@@ -3554,11 +3554,30 @@ def t_c2_real_executor_stub_disabled() -> None:
     )
     assert r["ok"] is False, r
     assert r["reason"] == "real_executor_not_enabled", r
-    # flag on -> stub raises -> real_executor_unavailable (never a fake score)
-    r2 = replay_harness.run_counterfactual(
-        "s", "cur", "prop", tasks, executor="real",
-        config={"replay_min_n": 3, "replay_real_executor_enabled": True},
-    )
+    # flag on -> _real_score shells out to the worker. Mock subprocess.run so
+    # no real spawn happens in the smoke suite; a worker exit-1 becomes
+    # real_executor_unavailable (never a fake score). The argv shape + the
+    # success envelope are covered by t_v18_real_score_builds_worker_command.
+    import subprocess as _subp
+    _orig_run = _subp.run
+
+    class _FakeProc:
+        returncode = 1
+        stdout = ""
+        stderr = "boom"
+
+    def _fake_run(cmd, **kw):
+        return _FakeProc()
+
+    _subp.run = _fake_run
+    try:
+        r2 = replay_harness.run_counterfactual(
+            "s", "cur", "prop", tasks, executor="real",
+            config={"replay_min_n": 3, "replay_real_executor_enabled": True,
+                    "replay_real_per_task_timeout_s": 5},
+        )
+    finally:
+        _subp.run = _orig_run
     assert r2["ok"] is False, r2
     assert r2["reason"].startswith("real_executor_unavailable"), r2
     # unknown executor -> ok=False

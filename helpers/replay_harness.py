@@ -28,22 +28,35 @@ Two executors:
    the gate non-trivial and deterministic for tests; the real executor
    below is the live follow-up.
 
-2. **real** (STUB, guarded behind `replay_real_executor_enabled`,
-   default false): `_real_score(task, skill_md)` would build an Agent Zero
-   `AgentContext` + `Agent`, inject the skill, run `context.communicate()`,
-   and score `agent.loop_data.last_response` via `reward_model.score_rollout`.
-   That is the real counterfactual. It is NOT implemented here — the
-   deliverable for C2 is the structure + guard wiring + recursion guard,
-   not live verification. When enabled but unimplemented it raises, and
-   `run_counterfactual` returns `real_executor_unavailable`.
+2. **real** (v1.8.0, guarded behind `replay_real_executor_enabled`,
+   default false): `_real_score(task, skill_md, config, skill_name)` shells
+   out to `scripts/replay_worker.py`, which runs ONE held-out task through a
+   real Agent Zero monologue under the given skill in a CHILD PROCESS (temp
+   working directory, own event loop, `SKILLOPT_REPLAY_MODE=1`) and writes a
+   `{score, outcome, ...}` JSON envelope. The parent blocks on the
+   subprocess, parses the envelope, and returns the float score. The worker
+   injects the skill via `skills.add_loaded_skill_name(agent, name)` +
+   `agent.hist_add_tool_result("skills_tool", skill_md,
+   skill_instructions={...})` — note `skill_instructions` is a TOP-LEVEL
+   kwarg of `hist_add_tool_result`, NOT nested under `additional` (that
+   unwrap happens inside `Tool.after_execution`, which the worker bypasses).
+   The subprocess design gives side-effect containment (temp cwd), a clean
+   async boundary (no "event loop already running" when called from the
+   auto-loop thread or an async WebUI handler), and recursion isolation.
+   Cost is bounded by `replay_real_max_tasks` (default 4) since the real
+   executor runs 2xN full monologues per gate call. When the worker fails or
+   times out, `_real_score` raises and `run_counterfactual` returns
+   `real_executor_unavailable:...` (loud-not-crash, falls through to the
+   structural gate).
 
-Recursion guard: the real executor sets `SKILLOPT_REPLAY_MODE=1` BEFORE
-creating the replay agent and unsets it in `finally`. The harvester
-(C1) and the agent_init auto-loop starter (C2) both check this env var
-and short-circuit, so the replay agent's own `monologue_end` /
-`agent_init` do not pollute the training set with synthetic rollouts or
-spawn a nested optimizer loop. The mock executor never touches a real
-agent, so it does not need the guard.
+Recursion guard: the parent (`_real_score`) sets `SKILLOPT_REPLAY_MODE=1`
+before spawning the worker and unsets it in `finally`; the worker also sets
+it before creating the replay `AgentContext` (agent_init fires synchronously
+inside `Agent.__init__`). The harvester (C1) and the agent_init auto-loop
+starter (C2) both check this env var and short-circuit, so the replay
+agent's own `monologue_end` / `agent_init` do not pollute the training set
+with synthetic rollouts or spawn a nested optimizer loop. The mock executor
+never touches a real agent, so it does not need the guard.
 
 Public surface:
 - run_counterfactual(skill_name, current_skill_md, proposed_skill_md,
@@ -152,39 +165,96 @@ def _mock_score(task: dict[str, Any], skill_md: str) -> float:
     return base * (0.5 + 0.5 * overlap)
 
 
-def _real_score(task: dict[str, Any], skill_md: str, config: dict[str, Any]) -> float:
-    """STUB: real A0-agent-loop counterfactual replay executor.
+def _real_score(
+    task: dict[str, Any],
+    skill_md: str,
+    config: dict[str, Any],
+    skill_name: str = "replay",
+) -> float:
+    """Real A0-agent-loop counterfactual replay executor (v1.8.0).
 
-    The real counterfactual: build an Agent Zero `AgentContext` + `Agent`,
-    inject this skill so `skill_instruction_name` matches (via
-    `skills.add_loaded_skill_name` + `agent.hist_add_tool_result(...,
-    additional={"skill_instructions": {"name": ..., "content_included":
-    True, ...}})`), run `context.communicate(UserMessage(message=task[
-    "task"]))`, then score `agent.loop_data.last_response` through
-    `reward_model.score_rollout`. The score is `1.0` for a success
-    outcome, `0.5` partial, `0.0` failure.
+    Shells out to ``scripts/replay_worker.py``, which runs ONE held-out task
+    through a real Agent Zero monologue under ``skill_md`` in a child process
+    (temp working dir, own event loop, ``SKILLOPT_REPLAY_MODE=1``) and writes
+    a ``{score, outcome, ...}`` JSON envelope. We block on the subprocess,
+    parse the envelope, and return the float score (success=1.0 / partial=
+    0.5 / failure=0.0).
 
-    DELIVERABLE for C2 = the structure + guard wiring + recursion guard,
-    NOT live verification. This raises `NotImplementedError` so that
-    `run_counterfactual` (which wraps the real path in try/except) returns
-    `real_executor_unavailable` instead of silently faking a score. When
-    the live follow-up lands, replace the body below.
+    See the module docstring + ``scripts/replay_worker.py`` for the
+    skill-injection recipe (note: ``hist_add_tool_result`` takes
+    ``skill_instructions`` as a TOP-LEVEL kwarg, not under ``additional``).
 
-    Recursion guard: `SKILLOPT_REPLAY_MODE` is set BEFORE the replay agent
-    could be created and unset in `finally`, so the replay agent's own
-    `monologue_end` (harvester) and `agent_init` (auto-loop starter) both
-    short-circuit. The mock executor never creates a real agent, so it
-    does not need this guard.
+    Never returns a fake score on failure: any error (timeout, missing
+    envelope, worker error) raises, and ``run_counterfactual``'s try/except
+    turns it into ``real_executor_unavailable:<ExcType>:<msg>`` so the gate
+    falls through to the structural stages (loud-not-crash).
+
+    ``skill_name`` is used only for the skill-instructions metadata so
+    ``skill_instruction_name`` matches in the replay agent's history; it
+    defaults to ``"replay"`` and is threaded from ``run_counterfactual``.
     """
+    import json as _json
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    cfg = config or {}
     was = os.environ.get("SKILLOPT_REPLAY_MODE")
     os.environ["SKILLOPT_REPLAY_MODE"] = "1"
+    sf = tf = of = None
     try:
-        # Live follow-up: implement the real A0-agent-loop replay here.
-        # Until then, raising keeps the gate honest (no fake scores).
-        raise NotImplementedError(
-            "real replay executor is a stub (Solution C live follow-up)"
-        )
+        from helpers import sleep_runner  # type: ignore  # noqa: E402
+
+        py = sleep_runner._a0_python()
+        worker = sleep_runner.plugin_root() / "scripts" / "replay_worker.py"
+        if not worker.is_file():
+            raise RuntimeError(f"replay worker not found: {worker}")
+        timeout = float(cfg.get("replay_real_per_task_timeout_s", 180) or 180)
+
+        fd, sf = tempfile.mkstemp(suffix=".md", prefix="skillopt_replay_skill_")
+        os.write(fd, (skill_md or "").encode("utf-8"))
+        os.close(fd)
+        fd, tf = tempfile.mkstemp(suffix=".json", prefix="skillopt_replay_task_")
+        os.write(fd, _json.dumps(task, ensure_ascii=False).encode("utf-8"))
+        os.close(fd)
+        fd, of = tempfile.mkstemp(suffix=".json", prefix="skillopt_replay_out_")
+        os.close(fd)
+
+        env = sleep_runner.build_subprocess_env()
+        env["SKILLOPT_REPLAY_MODE"] = "1"
+        cmd = [
+            py, str(worker),
+            "--skill-name", str(skill_name),
+            "--skill-md", sf,
+            "--task", tf,
+            "--out", of,
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout, env=env,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"replay worker timed out after {timeout}s") from e
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "").strip()[:500]
+            raise RuntimeError(f"replay worker exit {proc.returncode}: {tail}")
+        try:
+            result = _json.loads(Path(of).read_text(encoding="utf-8"))
+        except Exception as e:
+            raise RuntimeError(f"replay worker wrote no parseable output: {e}") from e
+        if result.get("score") is None:
+            raise RuntimeError(
+                f"replay worker error: {result.get('error', 'unknown')}"
+            )
+        return float(result["score"])
     finally:
+        for p in (sf, tf, of):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
         if was is None:
             os.environ.pop("SKILLOPT_REPLAY_MODE", None)
         else:
@@ -291,9 +361,18 @@ def run_counterfactual(
                     "executor": "real",
                     "n": n,
                 }
+            # Cost bound: the real executor spawns 2xN full A0 monologues
+            # (current + proposed x N), so cap N at replay_real_max_tasks
+            # (default 4). The min_n check above already passed against the
+            # original n; we recompute n to the capped count so the means
+            # and _decide below use the actual scored count.
+            max_tasks = int(cfg.get("replay_real_max_tasks", 4) or 0)
+            if max_tasks and len(held_out_tasks) > max_tasks:
+                held_out_tasks = held_out_tasks[:max_tasks]
+                n = len(held_out_tasks)
             for t in held_out_tasks:
-                sc = _real_score(t, current_skill_md, cfg)
-                sp = _real_score(t, proposed_skill_md, cfg)
+                sc = _real_score(t, current_skill_md, cfg, skill_name)
+                sp = _real_score(t, proposed_skill_md, cfg, skill_name)
                 per_task.append({
                     "id": (t.get("id") if isinstance(t, dict) else None),
                     "current": round(sc, 4),
