@@ -22,7 +22,7 @@ import sys
 
 
 PLUGIN_NAME = "skillopt"
-EXPECTED_VERSION = "1.6.1"
+EXPECTED_VERSION = "1.7.0"
 
 
 def main() -> int:
