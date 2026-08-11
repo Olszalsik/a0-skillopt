@@ -254,6 +254,11 @@ class AutoLoopThread(threading.Thread):
 
         eligible: list[str] = []
         for skill in candidates:
+            # v1.7.0 (Phase C4): auto-opt-in a brand-new skill behind the
+            # human-approval guardrail BEFORE the eligibility check, so the
+            # first cycle that sees it can proceed (still gated on human
+            # approval). Defensive: never stalls the tick.
+            self._maybe_auto_optin(skill, cfg)
             ok, reason = self._skill_eligible_for_cycle(skill, cfg)
             if ok:
                 eligible.append(skill)
@@ -352,6 +357,35 @@ class AutoLoopThread(threading.Thread):
             if sk:
                 out.add(sk)
         return sorted(out)
+
+    def _maybe_auto_optin(self, skill: str, cfg: dict[str, Any]) -> None:
+        """v1.7.0 (Phase C4): auto-opt-in a NEW skill behind the
+        human-approval guardrail. `auto_optin_new_skill` is idempotent and
+        self-guarding (skips optout/immutable/already-opted-in), so this is
+        safe to call on every candidate every tick. Only logs on the
+        `created` transition. Defensive: never stalls the tick."""
+        try:
+            gov_cfg = (cfg.get("governance") or {}).get("default_policy") or {}
+            if not bool(gov_cfg.get("auto_optin_new_skills", True)):
+                return
+        except Exception:
+            return
+        try:
+            from usr.plugins.skillopt.helpers import governance  # type: ignore
+        except Exception:
+            try:
+                from helpers import governance  # type: ignore
+            except Exception:
+                return
+        try:
+            res = governance.auto_optin_new_skill(skill, source="auto_loop")
+            if res.get("ok") and res.get("reason") == "created":
+                self._log(
+                    f"auto-loop: auto-opted-in new skill {skill!r} "
+                    f"(pending human approval via /governance_approve)"
+                )
+        except Exception as e:
+            self._log(f"auto-loop: auto_optin failed for {skill!r}: {e}")
 
     def _skill_eligible_for_cycle(
         self, skill: str, cfg: dict[str, Any],

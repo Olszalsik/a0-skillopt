@@ -3895,6 +3895,227 @@ def t_c3_adopt_without_id_falls_back_to_latest() -> None:
             os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = old_ab
 
 
+# ======================================================================= #
+# v1.7.0 — Solution C, Phase C4: auto opt-in with guardrails
+# (new skills auto-opted-in behind a human-approval gate)
+# ======================================================================= #
+
+_section_v170_c4 = "v1.7.0 NEW (C4): auto opt-in with guardrails"
+
+
+def _c4_mirror_governance(tmp_skills):
+    """Mirror governance under usr.plugins.skillopt.helpers + point it at
+    a tmp skills dir. Does NOT wipe state (call _c4_fresh for that)."""
+    _c3_mirror_helpers()
+    from helpers import governance  # type: ignore
+    pkg = sys.modules["usr.plugins.skillopt.helpers"]
+    pkg.governance = governance
+    sys.modules["usr.plugins.skillopt.helpers.governance"] = governance
+    governance.set_skills_dir_for_tests(tmp_skills)
+    return governance
+
+
+def _c4_fresh(tmp_skills):
+    """Full C4 test setup: mirror governance, wipe prior state, point at
+    tmp. Returns the governance module (mirrored + test-dir-set)."""
+    gov = _c4_mirror_governance(tmp_skills)
+    gov.reset_for_tests()                       # wipe governance.log + clear _TEST_SKILLS_DIR
+    gov.set_skills_dir_for_tests(tmp_skills)    # re-point at tmp
+    return gov
+
+
+def _c4_import_api_class(module_name, class_name):
+    """Import an api class. Caller must have already mirrored governance
+    via _c4_fresh/_c4_mirror_governance so the api module's
+    `from usr.plugins.skillopt.helpers import governance` resolves. Does
+    NOT reset state."""
+    _c3_mirror_helpers()  # idempotent; ensures helpers + api importable
+    try:
+        mod = __import__("usr.plugins.skillopt.api." + module_name,
+                         fromlist=[class_name])
+    except Exception:
+        mod = __import__("api." + module_name, fromlist=[class_name])
+    return getattr(mod, class_name)
+
+
+@test("v1.7.0 C4: auto_optin_new_skill creates optin + policy markers")
+def t_c4_auto_optin_creates_markers() -> None:
+    import json
+    import tempfile, shutil
+    from pathlib import Path
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_c4_cre_"))
+    gov = _c4_fresh(tmp)
+    skill = "c4_new_skill"
+    try:
+        res = gov.auto_optin_new_skill(skill, source="auto_loop")
+        assert res["ok"], res
+        assert res["reason"] == "created", res
+        sd = tmp / skill
+        assert (sd / ".skillopt.optin").is_file(), "optin marker not created"
+        pol = json.loads((sd / ".skillopt.policy.json").read_text(encoding="utf-8"))
+        assert pol["mode"] == "opt_in", pol
+        assert pol["require_human_approval"] is True, pol
+        assert pol["auto_optin_source"] == "auto_loop", pol
+        assert "auto_optin_at" in pol, pol
+        # governance.log got an auto_optin row
+        log = gov._runs_dir() / "governance.log"
+        assert log.is_file(), "governance.log not written"
+        rows = [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        assert any(r.get("event") == "auto_optin" and r.get("skill") == skill for r in rows), rows
+    finally:
+        gov.reset_for_tests()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test("v1.7.0 C4: auto_optin skips an immutable skill (never touched)")
+def t_c4_auto_optin_skips_immutable() -> None:
+    import json
+    import tempfile, shutil
+    from pathlib import Path
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_c4_imm_"))
+    gov = _c4_fresh(tmp)
+    skill = "c4_locked"
+    sd = tmp / skill
+    sd.mkdir(parents=True, exist_ok=True)
+    (sd / ".skillopt.policy.json").write_text(json.dumps({"mode": "immutable"}), encoding="utf-8")
+    try:
+        res = gov.auto_optin_new_skill(skill)
+        assert res["ok"], res
+        assert res["reason"] == "immutable", res
+        assert not (sd / ".skillopt.optin").is_file(), "immutable skill was touched"
+    finally:
+        gov.reset_for_tests()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test("v1.7.0 C4: auto_optin skips an opted-out skill (never touched)")
+def t_c4_auto_optin_skips_optout() -> None:
+    import tempfile, shutil
+    from pathlib import Path
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_c4_out_"))
+    gov = _c4_fresh(tmp)
+    skill = "c4_out"
+    sd = tmp / skill
+    sd.mkdir(parents=True, exist_ok=True)
+    (sd / ".skillopt.optout").write_text("", encoding="utf-8")
+    try:
+        res = gov.auto_optin_new_skill(skill)
+        assert res["ok"], res
+        assert res["reason"] == "opted_out", res
+        assert not (sd / ".skillopt.optin").is_file(), "opted-out skill was touched"
+    finally:
+        gov.reset_for_tests()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test("v1.7.0 C4: auto_optin is idempotent (second run returns reason=exists)")
+def t_c4_auto_optin_idempotent() -> None:
+    import json
+    import tempfile, shutil
+    from pathlib import Path
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_c4_idem_"))
+    gov = _c4_fresh(tmp)
+    skill = "c4_idem"
+    try:
+        r1 = gov.auto_optin_new_skill(skill)
+        assert r1["ok"] and r1["reason"] == "created", r1
+        pol_path = tmp / skill / ".skillopt.policy.json"
+        first_at = json.loads(pol_path.read_text(encoding="utf-8"))["auto_optin_at"]
+        r2 = gov.auto_optin_new_skill(skill)
+        assert r2["ok"] and r2["reason"] == "exists", r2
+        # policy.json not rewritten — auto_optin_at unchanged
+        second_at = json.loads(pol_path.read_text(encoding="utf-8"))["auto_optin_at"]
+        assert second_at == first_at, "idempotent run rewrote policy.json"
+    finally:
+        gov.reset_for_tests()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test("v1.7.0 C4: /governance_approve records a decision and unblocks eligibility")
+def t_c4_governance_approve_endpoint() -> None:
+    import asyncio, json
+    import tempfile, shutil
+    from pathlib import Path
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_c4_app_"))
+    gov = _c4_fresh(tmp)
+    skill = "c4_approve_skill"
+    gov.auto_optin_new_skill(skill)  # markers + require_human_approval=true
+    # Before approval: pending.
+    elig, reason = gov.check_skill_eligible(skill)
+    assert not elig and reason == "require_human_approval_pending", (elig, reason)
+    try:
+        GovernanceApprove = _c4_import_api_class("governance_approve", "GovernanceApprove")
+        resp = asyncio.run(GovernanceApprove().process({"skill": skill, "approved": True}, None))
+        assert resp["ok"], resp
+        assert resp["approved"] is True, resp
+        # After approval: eligible.
+        elig2, reason2 = gov.check_skill_eligible(skill)
+        assert elig2, f"expected eligible after approve, got {reason2!r}"
+        # human_decision row recorded.
+        log = gov._runs_dir() / "governance.log"
+        rows = [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+        hd = [r for r in rows if r.get("event") == "human_decision" and r.get("skill") == skill]
+        assert hd and hd[-1]["approved"] is True, rows
+    finally:
+        gov.reset_for_tests()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test("v1.7.0 C4: /governance_status returns full block + per-skill policy")
+def t_c4_governance_status_endpoint() -> None:
+    import asyncio
+    import tempfile, shutil
+    from pathlib import Path
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_c4_st_"))
+    gov = _c4_fresh(tmp)
+    skill = "c4_status_skill"
+    gov.auto_optin_new_skill(skill)
+    try:
+        GovernanceStatus = _c4_import_api_class("governance_status", "GovernanceStatus")
+        # Full block (no skill).
+        resp_all = asyncio.run(GovernanceStatus().process({}, None))
+        assert resp_all["ok"], resp_all
+        assert skill in (resp_all.get("opted_in") or []), resp_all
+        assert "default_policy" in resp_all, resp_all
+        # Per-skill.
+        resp_one = asyncio.run(GovernanceStatus().process({"skill": skill}, None))
+        assert resp_one["ok"], resp_one
+        assert resp_one["markers"]["optin"] is True, resp_one
+        assert resp_one["policy"]["mode"] == "opt_in", resp_one
+        assert resp_one["eligible"] is False, resp_one      # still pending approval
+        assert resp_one["reason"] == "require_human_approval_pending", resp_one
+    finally:
+        gov.reset_for_tests()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test("v1.7.0 C4: full flow — auto_optin (pending) -> approve -> eligible")
+def t_c4_check_eligible_after_auto_optin_and_approval() -> None:
+    import asyncio
+    import tempfile, shutil
+    from pathlib import Path
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_c4_flow_"))
+    gov = _c4_fresh(tmp)
+    skill = "c4_flow_skill"
+    try:
+        # Brand-new skill: no marker, default mode=opt_out -> not eligible.
+        e0, r0 = gov.check_skill_eligible(skill)
+        assert not e0 and r0 == "mode_opt_in_no_marker", (e0, r0)
+        # Auto-optin: markers created, but pending human approval.
+        res = gov.auto_optin_new_skill(skill)
+        assert res["ok"] and res["reason"] == "created", res
+        e1, r1 = gov.check_skill_eligible(skill)
+        assert not e1 and r1 == "require_human_approval_pending", (e1, r1)
+        # Approve via the endpoint -> eligible.
+        GovernanceApprove = _c4_import_api_class("governance_approve", "GovernanceApprove")
+        asyncio.run(GovernanceApprove().process({"skill": skill, "approved": True}, None))
+        e2, r2 = gov.check_skill_eligible(skill)
+        assert e2 and r2 == "eligible", (e2, r2)
+    finally:
+        gov.reset_for_tests()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
     print(_section_v110)
@@ -3905,4 +4126,5 @@ if __name__ == "__main__":
     print(_section_v170_c1)
     print(_section_v170_c2)
     print(_section_v170_c3)
+    print(_section_v170_c4)
     sys.exit(main())

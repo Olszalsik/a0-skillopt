@@ -276,6 +276,68 @@ def mark_human_decision(skill_name: str, approved: bool, decided_by: str = "user
     }
 
 
+def auto_optin_new_skill(skill_name: str, *, source: str = "auto_loop") -> dict[str, Any]:
+    """Auto-opt a NEW skill into the auto-loop, behind the human-approval
+    guardrail. Creates `.skillopt.optin` (empty) + `.skillopt.policy.json`
+    (`mode=opt_in`, `require_human_approval=True`) under the skill dir.
+
+    NEVER touches:
+      - skills with a `.skillopt.optout` marker (user explicitly opted out)
+      - skills whose effective policy `mode == "immutable"` (compliance/legal)
+
+    Idempotent: if `.skillopt.optin` already exists, returns
+    `{ok:True, reason:"exists"}` without rewriting policy.json. Returns
+    `{ok, reason, skill, markers}` on success, `{ok:False, error}` on
+    failure. The `require_human_approval:true` guardrail means an
+    auto-opted-in skill is NOT silently adoptable — `check_skill_eligible`
+    still returns `require_human_approval_pending` until a human approves
+    it via `mark_human_decision` (the /governance_approve endpoint).
+    """
+    if not skill_name:
+        return {"ok": False, "error": "missing skill_name"}
+    sd = _skill_dir(skill_name)
+    # Guardrail 1: explicit opt-out — never touch.
+    if (sd / ".skillopt.optout").is_file():
+        return {"ok": True, "reason": "opted_out", "skill": skill_name,
+                "markers": {"optout": True}}
+    # Guardrail 2: immutable — never touch.
+    try:
+        policy = load_skill_policy(skill_name)
+    except Exception:
+        policy = {}
+    if str(policy.get("mode", "opt_out")) == "immutable":
+        return {"ok": True, "reason": "immutable", "skill": skill_name,
+                "markers": {"immutable": True}}
+    # Idempotent: already opted in.
+    if (sd / ".skillopt.optin").is_file():
+        return {"ok": True, "reason": "exists", "skill": skill_name,
+                "markers": {"optin": True}}
+    try:
+        if _TEST_SKILLS_DIR is None:
+            sd.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).isoformat()
+        (sd / ".skillopt.optin").write_text("", encoding="utf-8")
+        policy_doc = {
+            "mode": "opt_in",
+            "require_human_approval": True,
+            "auto_optin_source": str(source or "auto_loop"),
+            "auto_optin_at": ts,
+        }
+        (sd / ".skillopt.policy.json").write_text(
+            json.dumps(policy_doc, ensure_ascii=False, indent=2),
+            encoding="utf-8")
+        _append_log({
+            "ts_iso": ts,
+            "skill": skill_name,
+            "event": "auto_optin",
+            "source": policy_doc["auto_optin_source"],
+        })
+        return {"ok": True, "reason": "created", "skill": skill_name,
+                "markers": {"optin": True, "policy": True}}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "skill": skill_name}
+
+
 def list_governed_skills() -> list[str]:
     """All skills in the user's skills dir that have an optout marker
     or a per-skill policy.json. Sorted alphabetically."""
@@ -469,6 +531,7 @@ def _human_approved(skill_name: str) -> bool:
 
 __all__ = [
     "DEFAULT_POLICY",
+    "auto_optin_new_skill",
     "check_skill_eligible",
     "get_governance_status",
     "list_governed_skills",

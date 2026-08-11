@@ -83,6 +83,30 @@
     },
 
     /**
+     * v1.7.0 (Phase C4): governance — auto opt-in with guardrails.
+     *   - governanceStatus(skill?)   -> POST /governance_status : full
+     *     block (no skill) or per-skill policy + markers + eligibility +
+     *     last human decision (with skill).
+     *   - governanceApprove(skill, approved, decidedBy?) -> POST
+     *     /governance_approve : record a human decision (the row
+     *     check_skill_eligible step 7 reads); approved=true also touches
+     *     the .skillopt.optin marker so the ledger and marker agree.
+     */
+    governanceStatus(skill) {
+      const body = skill ? { skill: String(skill || '') } : {};
+      return call('/governance_status', { body });
+    },
+    governanceApprove(skill, approved, decidedBy) {
+      return call('/governance_approve', {
+        body: {
+          skill: String(skill || ''),
+          approved: !!approved,
+          decided_by: String(decidedBy || 'user'),
+        },
+      });
+    },
+
+    /**
      * Per-cycle dashboard — Day-5 item 7.
      * Reads the most recent N cycle_history.jsonl entries (newest-first)
      * from /api/plugins/skillopt/cycles. Filters: skill name, ISO since

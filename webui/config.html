@@ -119,6 +119,33 @@
     </template>
   </div>
 
+  <!-- GOVERNANCE (v1.7.0, Solution C Phase C4: auto opt-in with guardrails) -->
+  <div class="so-card">
+    <h4>Governance <small style="opacity: 0.6; font-weight: normal;">— auto opt-in behind a human-approval gate</small></h4>
+    <small style="opacity: 0.7;">New skills seen in rollouts are auto-opted-in with <code>require_human_approval: true</code> — they stay <em>pending</em> until you Approve them here. Immutable or opted-out skills are never touched.</small>
+    <div class="so-stat" style="margin-top: 8px;">
+      <div>Default mode: <strong x-text="(govState.default_policy && govState.default_policy.mode) || '—'"></strong></div>
+      <div>Require approval: <strong x-text="(govState.default_policy && govState.default_policy.require_human_approval) ? 'yes' : 'no'"></strong></div>
+      <div>Opted-in: <strong x-text="(govState.opted_in && govState.opted_in.length) || 0"></strong></div>
+      <div>Opted-out: <strong x-text="(govState.opted_out && govState.opted_out.length) || 0"></strong></div>
+    </div>
+    <template x-if="!govState.opted_in || govState.opted_in.length === 0">
+      <small style="opacity: 0.6; display: block; margin-top: 8px;">No opted-in skills yet.</small>
+    </template>
+    <template x-for="s in govState.opted_in || []" :key="s">
+      <div class="so-card" style="margin-top: 8px; background: rgba(0,0,0,0.15);">
+        <div class="so-stat">
+          <div><strong x-text="s"></strong></div>
+          <div>Last decision: <span x-text="(govState.last_decisions && govState.last_decisions[s] && govState.last_decisions[s].reason) || '—'"></span></div>
+        </div>
+        <div class="so-row">
+          <button type="button" class="so-btn so-btn-primary" :disabled="busy" @click="governanceApprove(s, true)">Approve</button>
+          <button type="button" class="so-btn" :disabled="busy" @click="governanceApprove(s, false)">Deny</button>
+        </div>
+      </div>
+    </template>
+  </div>
+
   <!-- BACKEND -->
   <div class="so-card">
     <h4>Backend</h4>
@@ -167,6 +194,7 @@ function skilloptSettings() {
     rollouts: 0,
     staged: 0,
     stagedProposals: [],
+    govState: {},
     loopState: {},
 
     async init() {
@@ -212,6 +240,7 @@ function skilloptSettings() {
         if (l && l.loop) this.loopState = l.loop || {};
       } catch (e) { /* loop endpoint may not be wired */ }
       await this.refreshStaged();
+      await this.refreshGovernance();
       this.busy = false;
     },
 
@@ -257,6 +286,25 @@ function skilloptSettings() {
         if (r && r.ok) { this.setMsg('rolled back: ' + skill + ' (' + (r.bytes || 0) + ' bytes)', true); }
         else { this.setMsg('rollback: ' + ((r && r.error) || 'no snapshot'), false); }
       } catch (e) { this.setMsg('rollback: ' + e, false); }
+      this.busy = false;
+      await this.refresh();
+    },
+
+    async refreshGovernance() {
+      try {
+        const g = await this.api('/governance_status');
+        this.govState = (g && g.ok) ? g : {};
+      } catch (e) { this.govState = {}; }
+    },
+
+    async governanceApprove(skill, approved) {
+      this.busy = true;
+      this.setMsg((approved ? 'approving ' : 'denying ') + skill + '...', true);
+      try {
+        const r = await this.api('/governance_approve', { body: { skill, approved, decided_by: 'user' } });
+        if (r && r.ok) { this.setMsg((approved ? 'approved: ' : 'denied: ') + skill, true); }
+        else { this.setMsg('governance: ' + ((r && r.error) || 'unknown'), false); }
+      } catch (e) { this.setMsg('governance: ' + e, false); }
       this.busy = false;
       await this.refresh();
     },
