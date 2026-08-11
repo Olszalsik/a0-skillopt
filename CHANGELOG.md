@@ -6,6 +6,154 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
+The next planned work is the two offline pieces stubbed in v1.7.0: the real
+A0-agent-loop replay executor (currently a guarded stub behind
+`replay_real_executor_enabled`) and DistilBERT reward-model training (the
+`scripts/train_reward_model.py` skeleton). See ROADMAP.md.
+
+---
+
+## [1.7.0] — 2026-08-11
+
+**Solution C (Core) — the self-evolution engine now actually evolves.** Four
+phases, each its own commit to the nested `Olszalsik/a0-skillopt` repo. 122/122
+deterministic smoke tests pass (no LLM/network).
+
+### Fixed
+
+- **C1 — the harvester wrote zero rollouts.** The v1.1.0 harvester read
+  `loop_data.messages`, which does not exist on `LoopData` (the real attributes
+  are `history_output`, `user_message`, `last_response`), so it early-returned
+  on every chat turn. The engine had been running blind since v1.1.0 —
+  `cycles_run` was non-zero but no rollout ever fed the gate. The harvester now
+  reads `history_output` and attributes the active skill **authoritatively** via
+  `skills.skill_instruction_name` (a per-turn walk of the output history, last
+  match wins) with `get_loaded_skill_names` as the session-ledger fallback. A
+  `SKILLOPT_REPLAY_MODE` env recursion guard keeps a replay agent's own turns out
+  of the training set.
+
+### Added
+
+- **C2 — local counterfactual replay gate** (`helpers/replay_harness.py`, NEW).
+  A deterministic mock executor scores the current vs proposed skill on the
+  held-out rollouts (relevance heuristic: base outcome × keyword-overlap, no
+  LLM) and accepts only on a strict-monotonic lift ≥ `gate_min_improvement_pp`
+  over ≥ `replay_min_n` tasks. Wired as **stage 0.7** in `validate_proposal`
+  (runs only when `skill_name AND not official_gated AND
+  replay_local_gate_enabled`). The real A0-agent-loop executor is a guarded
+  stub behind `replay_real_executor_enabled` (default false) — documented
+  follow-up. New config keys (in both `default_config.yaml` and `config.json`):
+  `replay_local_gate_enabled: true`, `replay_min_n: 3`, `replay_held_out_n: 8`,
+  `replay_real_executor_enabled: false`.
+- **C3 — human-in-the-loop adopt UI.** Three new API endpoints: `/staged` lists
+  proposals with gate evidence (lift_pp, n_held_out, gate_reason, diff_summary);
+  `/reject` records a no (audit-only, does not delete the staged file);
+  `/rollback` restores the most recent whole-file `_default` snapshot.
+  `api/adopt.py` rewritten to take an optional `proposal_id` (stem match, latest
+  fallback) and snapshot the pre-adopt `SKILL.md` before overwriting.
+  `helpers/fragment_store.py` gains `snapshot_default`/`restore_default_snapshot`
+  keyed on the skill-name string (avoids the `Path.stem`="SKILL" collision that
+  the old `_snapshots_dir_for_skill` hit). WebUI `config.html` gets a "Staged
+  proposals" section with Approve/Reject/Rollback buttons; `skillopt-dashboard.js`
+  gets `staged()`/`adoptProposal`/`reject`/`rollback`/`renderStagedProposals`.
+- **C4 — auto opt-in with guardrails.** `helpers/governance.py` gains
+  `auto_optin_new_skill(skill, *, source)`: a brand-new skill seen in rollouts is
+  auto-opted-in (`.skillopt.optin` + `.skillopt.policy.json` with
+  `require_human_approval: true`) but stays `require_human_approval_pending` until
+  a human approves it. NEVER touches opted-out or immutable skills. Idempotent.
+  `helpers/auto_loop.py` runs `_maybe_auto_optin` before the eligibility check
+  (gated on `governance.default_policy.auto_optin_new_skills`). Two new API
+  endpoints: `/governance_approve` (records a human decision + touches the optin
+  marker) and `/governance_status` (full block or per-skill policy + markers +
+  eligibility). WebUI gets a "Governance" section with Approve/Deny per skill.
+  Config (both files): `require_human_approval: true`, `auto_optin_new_skills: true`.
+- **12 new smoke tests** (110 → 122): 4 C1, 6 C2, 5 C3, 7 C4.
+
+### Changed
+
+- Version strings aligned at 1.7.0 across `plugin.yaml`/`plugin.py`/`hooks.py`/
+  `execute.py`; the version-alignment smoke test now checks all four files.
+- `governance.default_policy.require_human_approval` default flipped to `true`
+  (safe default — adoption is one-click, never silent).
+
+---
+
+## [1.6.1] — 2026-08-10
+
+**Verified the official-engine bridge against the upstream source.** The v1.6.0
+adapter had wrong assumptions about the `skillopt_sleep` CLI and the
+`evaluate_gate` signature; all verified against `microsoft/skillopt` @ HEAD by
+shallow-clone introspection (the package is not installed in this dev env).
+
+### Fixed
+
+- CLI is `python -m skillopt_sleep <subcommand>` (run/dry-run/status/adopt/
+  harvest/schedule/unschedule). `run` flags: `--project PATH`,
+  `--target-skill-path PATH` (a real SKILL.md path, NOT a name — v1.6.0 wrongly
+  passed `--skill`), single `--model` (v1.6.0 wrongly passed `--optimizer-model`/
+  `--target-model` which don't exist), `--backend mock|claude|codex|copilot|
+  cursor|pi|handoff|azure_openai`, `--lookback-hours`, `--max-tasks`,
+  `--edit-budget`, `--preferences`, `--json`.
+- Staging: the real engine writes `<project>/.skillopt-sleep/staging/<ts>/` with
+  `proposed_SKILL.md` + `report.json` + `manifest.json` (v1.6.0 wrongly looked
+  for `staging/<skill>.md`/`best_skill.md`).
+- Gate verdict: read from `report.json` `{accepted, gate_action,
+  baseline_score, candidate_score}` via `_read_gate_verdict` (NOT log scraping).
+  `proposed_SKILL.md` is copied to plugin `staging/` ONLY when the gate accepts.
+  A gate reject → `{ok:False, gate_rejected:True}` with NO direct fallback (the
+  official verdict is authoritative).
+- `evaluate_gate(candidate_skill, cand_hard, current_skill, current_score,
+  best_skill, best_score, best_step, global_step, *, cand_soft=0.0,
+  metric="hard", mixed_weight=0.5) -> GateResult`; action in
+  `{accept_new_best, accept, reject}`. Not called authoritatively (`report.json`
+  is).
+
+### Added
+
+- New config keys: `official_edit_budget`, `official_preferences`.
+- 8 new smoke tests (92 → 100) covering the verified CLI flag mapping, staging
+  discovery, `report.json` gate verdict, and the `gate_rejected` no-fallback
+  contract.
+
+---
+
+## [1.6.0] — 2026-08-10
+
+**Solution B — the auto-loop now drives the official Microsoft `skillopt_sleep`
+pipeline** instead of a hand-rolled optimizer. The local `direct_optimizer` is
+demoted to a fallback used only when the official package is absent.
+
+### Added
+
+- **`helpers/official_adapter.py`** (NEW): cached subprocess probe of
+  `import skillopt_sleep` in the A0 venv (60s TTL), reuses
+  `sleep_runner.launch_sleep_subprocess` to run one official Sleep cycle
+  (harvest→mine→replay→consolidate→gate→stage), discovers/renames the staged
+  proposal. Fail-soft: any infra error → `{ok:False, fallback_to_direct:True}`;
+  an official gate reject → `{ok:False, gate_rejected:True}` (no direct fallback).
+- **`helpers/sleep_runner.py`**: `validate_proposal` gains `official_gated: bool`;
+  Stage 8 held-out is SKIPPED when `official_gated` (the official engine runs its
+  own monotonic held-out gate before staging).
+- **`helpers/auto_loop.py`**: `_tick` now calls
+  `_run_engine_for_eligible_skills` per skill with
+  `governance.check_skill_eligible` + `cadence.compute_next_run` +
+  `budget.can_skill_spend` gating (previously computed-but-unused), tries
+  official_adapter first, falls back to direct_optimizer. Records `last_engine`;
+  `_auto_adopt` passes `official_gated` to the gate.
+- **`helpers/ab_harness.py`**: synthetic A/B replay demoted to ADVISORY ONLY
+  (default off, `SKILLOPT_AB_HARNESS_ENABLED` env override).
+- **`helpers/cycle_history.py`**: compaction rotates overflow beyond
+  `cycle_history_max_entries` (default 500) to `cycle_history.archive.jsonl`.
+- Config (both files): `use_official_engine: true`, `ab_harness_enabled: false`,
+  OFFICIAL ENGINE BRIDGE keys (`official_run_verb="run"`, `official_backend`,
+  models, lookback, max_tasks, `official_run_timeout_s=600`).
+- 10 new smoke tests (82 → 92).
+
+### Changed
+
+- Version strings aligned at 1.6.0 across `plugin.yaml`/`plugin.py`/`hooks.py`/
+  `execute.py`.
+
 ---
 
 ## [1.5.0] — 2026-07-29

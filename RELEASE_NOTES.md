@@ -1,4 +1,73 @@
-# SkillOpt Plugin — v1.5.0 (Day-5 final) Release Notes
+# SkillOpt Plugin — Release Notes
+
+---
+
+## v1.7.0 — Solution C (the self-evolution engine now actually evolves)
+
+> **The headline fix:** the rollout harvester had been writing **zero rollouts**
+> since v1.1.0 — it read a nonexistent `loop_data.messages` and early-returned on
+> every chat turn. The engine was running blind. v1.7.0 fixes the attribution,
+> adds a local counterfactual replay gate, a human-in-the-loop adopt UI, and
+> auto-opt-in for new skills behind a human-approval gate. 122/122 deterministic
+> smoke tests pass.
+
+### TL;DR
+
+- **C1 (Fixed):** harvester reads `history_output` + attributes the active skill
+  authoritatively via `skills.skill_instruction_name`. Rollouts now actually flow.
+- **C2 (Added):** `helpers/replay_harness.py` — local counterfactual replay gate
+  (deterministic mock executor, no LLM) wired as stage 0.7 in `validate_proposal`.
+  Real executor stubbed behind `replay_real_executor_enabled`.
+- **C3 (Added):** human-in-the-loop adopt UI — `/staged`, `/adopt` (by id, with
+  whole-file snapshot), `/reject`, `/rollback`. WebUI Staged-proposals section.
+- **C4 (Added):** auto-opt-in for new skills behind a human-approval gate —
+  `/governance_approve`, `/governance_status`. WebUI Governance section.
+- **+12 smoke tests** (110 → 122). No new runtime dependencies. No breaking
+  changes. The validation gate is preserved (stage 0.7 is strictly additive and
+  skipped when `official_gated`).
+
+### What's new for users
+
+- **Your skills now actually learn from chats.** Before v1.7.0 the harvester was
+  silently broken, so no rollout ever fed the gate. After v1.7.0 every chat turn
+  you run writes a rollout with the skill that was active, attributed from the
+  authoritative loaded-skills ledger (not a regex on your prompt).
+- **Staged proposals are reviewable.** The WebUI now shows each gated proposal
+  with its lift, held-out n, and gate reason. Approve promotes it (with a
+  reversible snapshot); Reject records a no; Roll back restores the prior
+  `SKILL.md`. Nothing is auto-adopted unless you turn on `auto_adopt`.
+- **New skills are safe by default.** A skill the loop sees for the first time
+  is auto-opted-in but stays **pending human approval** — you Approve it once in
+  the Governance section and it's eligible. Immutable or opted-out skills are
+  never touched.
+
+### What's new for developers
+
+- The replay gate is a deterministic **mock** executor by design (no LLM, no
+  network) so it's safe to run in CI. The real A0-agent-loop executor is a
+  guarded stub — flip `replay_real_executor_enabled: true` and fill in
+  `replay_harness._real_score` to use it (documented follow-up; see ROADMAP.md
+  item 10).
+- `SKILLOPT_REPLAY_MODE` is the cross-cutting recursion guard: checked in the
+  harvester, the auto-loop watchdog, and set/unset around the real replay
+  executor, so a replay agent's own turns never pollute the training set or
+  spawn a nested optimizer loop.
+- Two stubbed follow-ups are the next roadmap items (ROADMAP.md): the real replay
+  executor (item 10) and DistilBERT reward-model training (item 11).
+
+---
+
+## v1.6.0 / v1.6.1 — Solution B (bridge to official `skillopt_sleep`)
+
+> The auto-loop now drives the official Microsoft `skillopt_sleep` pipeline; the
+> local `direct_optimizer` is demoted to a fallback. v1.6.1 verified the CLI and
+> `evaluate_gate` signature against `microsoft/skillopt` @ HEAD. 100/100 tests.
+
+See CHANGELOG.md for the full v1.6.0 / v1.6.1 entries.
+
+---
+
+## v1.5.0 (Day-5 final)
 
 > **First public release candidate.** v1.5.0 closes Day-5 of the roll-out:
 > the governance layer is in place (per-skill opt-out / rate-limit /
@@ -9,7 +78,7 @@
 
 ---
 
-## TL;DR
+## TL;DR (v1.5.0)
 
 - **+1 helper:** `helpers/governance.py` (per-skill policies + opt-out marker)
 - **+9 smoke tests** (82 total, all green on Python 3.10 - 3.13)

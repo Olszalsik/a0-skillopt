@@ -1,6 +1,6 @@
 # SkillOpt Self-Evolution Engine
 
-[![Version](https://img.shields.io/badge/version-1.4.0-blue)](#)
+[![Version](https://img.shields.io/badge/version-1.7.0-blue)](#)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![SkillOpt](https://img.shields.io/badge/powered%20by-microsoft%2Fskillopt-blueviolet)](https://github.com/microsoft/SkillOpt)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB)](#)
@@ -8,6 +8,8 @@
 > Your Agent Zero skills train themselves. Every chat teaches them.
 
 **SkillOpt** turns the agent's own task trajectories into better skill documents — automatically, with a held-out validation gate, and without ever silently overwriting your work. It's the missing closed loop between execution and skill learning.
+
+**v1.7.0 (Solution C)** closes the loop for real: the rollout harvester now actually records every chat (it had been silently writing nothing since v1.1.0), a local counterfactual replay gate scores proposed skills on held-out tasks, a human-in-the-loop adopt UI lets you Approve/Reject/Rollback each staged proposal, and new skills auto-opt-in behind a human-approval gate. The auto-loop drives the official Microsoft `skillopt_sleep` pipeline (Solution B, v1.6.0) and falls back to a local optimizer when the package is absent.
 
 ---
 
@@ -17,8 +19,8 @@ Read this before you install — it should take 30 seconds and save you an after
 
 ✅ **Install SkillOpt if:**
 - You have an Agent Zero agent with **5+ skills in active use** and you want them to improve over time without you hand-editing every `SKILL.md`.
-- You're OK with **per-skill opt-in governance** (default is opt-out for safety). SkillOpt never edits a skill you haven't explicitly enabled.
-- You want a **closed loop between agent execution and skill learning** with a **strict held-out validation gate** so a regression never lands silently.
+- You're OK with **per-skill governance** (global default is opt-out for safety). New skills seen in rollouts are auto-opted-in but stay **pending human approval** — nothing is ever adopted silently. You can also mark any skill `immutable` or `.skillopt.optout` and the loop will never touch it.
+- You want a **closed loop between agent execution and skill learning** with a **strict held-out validation gate** (official engine gate + a local counterfactual replay gate) so a regression never lands silently.
 - You're happy to ship a **local-first** self-evolution engine — all training is on-device on the agent's own trajectories; no data leaves the host.
 
 🚫 **Don't install SkillOpt if:**

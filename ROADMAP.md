@@ -47,6 +47,92 @@ The closed loop is now fully observable. Every Sleep cycle — whether adopted o
 
 ---
 
+## Solution B — DONE (v1.6.0 / v1.6.1, 2026-08-10)
+
+**Bridge to the official Microsoft `skillopt_sleep` pipeline.** The auto-loop now
+drives the official research-grade engine instead of the hand-rolled
+`direct_optimizer`, which is demoted to a fallback used only when the official
+package is absent. v1.6.1 verified the CLI flag mapping and `evaluate_gate`
+signature against `microsoft/skillopt` @ HEAD (shallow-clone introspection; the
+package is not installed in this dev env). 100/100 smoke tests.
+
+- NEW `helpers/official_adapter.py` — cached `import skillopt_sleep` probe (60s
+  TTL) + one official Sleep cycle per skill; fail-soft to direct on infra error;
+  authoritative gate-reject (no direct fallback). Gate verdict read from
+  `report.json`, not log scraping.
+- `validate_proposal` gains `official_gated`; Stage 8 held-out is skipped when
+  the official engine already ran its own monotonic held-out gate pre-staging.
+- Per-skill `governance` + `cadence` + `budget` gating wired into the tick
+  (previously computed-but-unused). `cycle_history` compaction. A/B harness
+  demoted to advisory-only.
+
+**Remaining live follow-up:** install `skillopt_sleep` into the A0 venv and run
+one real `run` end-to-end with a configured backend to confirm the bridge
+against the installed package, not just the source tree.
+
+---
+
+## Solution C (Core) — DONE (v1.7.0, 2026-08-11)
+
+**The self-evolution engine now actually evolves.** Four phases. 122/122 smoke
+tests. The headline fix: the v1.1.0 rollout harvester read a nonexistent
+`loop_data.messages` and had been writing **zero rollouts** the entire time —
+the engine was running blind. Solution C fixes that and adds the trust + control
+layers on top.
+
+- **C1 — ground-truth attribution.** Harvester reads `history_output` and
+  attributes the active skill via `skills.skill_instruction_name` (per-turn walk,
+  last match wins) + `get_loaded_skill_names` fallback. `SKILLOPT_REPLAY_MODE`
+  recursion guard.
+- **C2 — local counterfactual replay gate.** NEW `helpers/replay_harness.py`:
+  deterministic mock executor (relevance heuristic, no LLM) scores current vs
+  proposed on held-out rollouts; strict-monotonic lift ≥ `gate_min_improvement_pp`
+  over ≥ `replay_min_n`. Wired as **stage 0.7** (skipped when `official_gated`).
+  Real executor is a guarded stub.
+- **C3 — human-in-the-loop adopt UI.** `/staged` + `/adopt` (by id, with
+  whole-file snapshot) + `/reject` + `/rollback`. `fragment_store` whole-file
+  snapshot/restore keyed on skill-name string. WebUI Staged-proposals section.
+- **C4 — auto opt-in with guardrails.** `governance.auto_optin_new_skill` creates
+  `.skillopt.optin` + `policy.json` (`require_human_approval: true`) for new
+  skills; `/governance_approve` + `/governance_status` endpoints; WebUI Governance
+  section. Immutable/opted-out skills never touched.
+
+---
+
+## Next: the two offline pieces (stubbed in v1.7.0)
+
+Solution C deliberately stubbed the two expensive/offline pieces and documented
+them as follow-ups. They are the next roadmap items:
+
+### 10. Real A0-agent-loop replay executor — STUBBED in v1.7.0 (C2)
+
+The C2 local replay gate currently scores proposals with a deterministic **mock
+executor** (relevance heuristic, no LLM). The real executor runs each held-out
+task through an actual A0 agent loop with the proposed skill loaded, captures the
+outcome, and scores it — a genuine counterfactual. The stub (`replay_harness.
+_real_score`) is already wired: it raises `NotImplementedError` unless
+`replay_real_executor_enabled` is true, and it already sets/unsets
+`SKILLOPT_REPLAY_MODE` around the replay agent so the replay's own turns don't
+pollute the training set or spawn a nested optimizer loop. The work is to fill
+in the `AgentContext` + `Agent` + `skills.add_loaded_skill_name` +
+`hist_add_tool_result(skill_instructions)` + `context.communicate(UserMessage)`
+flow and score the captured `last_response` via `reward_model.score_rollout`.
+
+### 11. DistilBERT reward-model training — SKELETON (v1.2.0 `scripts/train_reward_model.py`)
+
+The reward model (`helpers/reward_model.py`) currently falls back to a heuristic
+scorer because `models/reward_model/` is untrained. The training script exists as
+a 215-LoC skeleton. The work is to label rollouts (outcome → reward), train a
+DistilBERT regression head on the rollout text, and persist it so
+`score_rollout` uses the trained model instead of the heuristic. The C2 mock
+executor reuses `score_rollout`, so a trained reward model sharpens both the
+replay gate and the A/B harness.
+
+See the integration plan (added separately) for the design, scope options, and
+verification approach for both.
+
+---
+
 ## Where we are (v1.1.0)
 
 **The closed loop runs end-to-end.** A0 chats → rollouts → background loop → Sleep engine (or direct LLM) → staged proposal → strict validation gate → adoption or rejection with a one-line reason.
