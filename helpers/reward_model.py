@@ -83,13 +83,28 @@ def _plugin_root() -> Path:
 def model_path() -> Path:
     """Where we look for the trained model on disk.
 
-    Override via SKILLOPT_REWARD_MODEL_DIR env var. Default is
-    <plugin>/models/reward_model/ - the directory the training
-    script writes to.
+    Resolution order (first wins):
+      1. ``SKILLOPT_REWARD_MODEL_DIR`` env var (absolute or relative to cwd).
+      2. ``reward_model_path`` config key (relative paths resolve against the
+         plugin root) — read via ``sleep_runner.merged_config``. This wires
+         the previously-dead config key declared in default_config.yaml.
+      3. ``<plugin>/models/reward_model/`` (the directory the training
+         script writes to).
+
+    The env override still wins, so tests / operators can point at a
+    throwaway model without editing config.
     """
     override = os.environ.get("SKILLOPT_REWARD_MODEL_DIR")
     if override:
         return Path(override)
+    try:
+        from helpers.sleep_runner import merged_config  # type: ignore
+        cp = merged_config().get("reward_model_path")
+    except Exception:
+        cp = None
+    if cp:
+        p = Path(cp)
+        return p if p.is_absolute() else _plugin_root() / p
     return _plugin_root() / _DEFAULT_MODEL_DIRNAME / _DEFAULT_MODEL_NAME
 
 
@@ -244,7 +259,105 @@ def _infer(text: str) -> tuple[str, float, list[float]] | None:
         return None
 
 
-def score_rollout(rollout: dict, *, prefer_model_above: float = 0.6) -> dict:
+def _config_prefer_above() -> float:
+    """Resolve the default ``prefer_model_above`` threshold (v1.8.0, P6).
+
+    Resolution order (first wins):
+      1. ``calibration.json`` next to the trained model (written by
+         ``_calibrate`` / the training script) — the calibrated threshold.
+      2. ``reward_model_prefer_above`` config key (wires the previously-dead
+         config key; default 0.6).
+      3. 0.6 (the v1.2.0 hardcoded default).
+
+    Clamped to [0, 1]. Never raises — a missing config / unreadable
+    calibration file falls through to the next source.
+    """
+    # 1. calibration.json next to the model
+    try:
+        cal = model_path() / "calibration.json"
+        if cal.is_file():
+            v = json.loads(cal.read_text(encoding="utf-8")).get("prefer_model_above")
+            if v is not None:
+                return max(0.0, min(1.0, float(v)))
+    except Exception:
+        pass
+    # 2. config key
+    try:
+        from helpers.sleep_runner import merged_config  # type: ignore
+        v = merged_config().get("reward_model_prefer_above")
+        if v is not None:
+            return max(0.0, min(1.0, float(v)))
+    except Exception:
+        pass
+    # 3. hardcoded default
+    return 0.6
+
+
+def _calibrate(model, tokenizer, val_samples, *, probs_fn=None, out_dir=None) -> dict:
+    """Pick the ``prefer_model_above`` threshold on a validation set (P6).
+
+    For each val ``(text, true_idx)`` we get the model's class probabilities
+    (via ``probs_fn(text) -> [p_success, p_partial, p_failure]`` when given,
+    else a real torch forward over ``model`` / ``tokenizer``). We then sweep
+    ``T`` in [0.3, 0.9] step 0.05 and, under the gated decision rule
+    "success if P(success) >= T, else argmax over {partial, failure}", count
+    how many predictions agree with the true label. ``T*`` is the value that
+    maximizes agreement; on ties the HIGHEST T wins (strictest success gate
+    — safest for a reward model). Writes ``calibration.json`` to ``out_dir``
+    (or ``model_path()`` when ``out_dir`` is None) and returns
+    ``{"prefer_model_above": T*, "val_agreement": float, "n_val": int}``.
+
+    ``probs_fn`` is injectable so the smoke test can calibrate on a fake
+    probability surface without torch installed. When ``probs_fn`` is None
+    (the real training run), ``model`` and ``tokenizer`` must be loaded.
+    """
+    if not val_samples:
+        return {"prefer_model_above": _config_prefer_above(), "val_agreement": 0.0, "n_val": 0}
+
+    def _default_probs(text: str) -> list[float]:
+        import torch  # type: ignore
+        enc = tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding=False)
+        with torch.no_grad():
+            logits = model(**enc).logits
+        probs = torch.softmax(logits, dim=-1)[0].tolist()
+        return [float(p) for p in probs]
+
+    fn = probs_fn or _default_probs
+
+    ts = [round(0.3 + 0.05 * k, 2) for k in range(int((0.9 - 0.3) / 0.05) + 1)]
+    best_t = 0.6
+    best_agree = -1.0
+    for T in ts:
+        agree = 0
+        for text, true_idx in val_samples:
+            probs = fn(text)
+            if len(probs) < 3:
+                pred = max(range(len(probs)), key=lambda i: probs[i])
+            elif probs[0] >= T:
+                pred = 0  # success
+            else:
+                pred = 1 if probs[1] >= probs[2] else 2
+            if pred == true_idx:
+                agree += 1
+        frac = agree / len(val_samples)
+        # strict >= so the HIGHEST T wins ties (strictest success gate)
+        if frac >= best_agree:
+            best_agree = frac
+            best_t = T
+
+    result = {"prefer_model_above": best_t, "val_agreement": round(best_agree, 4), "n_val": len(val_samples)}
+    try:
+        target = Path(out_dir) if out_dir else model_path()
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "calibration.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+    except Exception as e:
+        log.warning("[skillopt] calibration.json write failed: %s", e)
+    return result
+
+
+def score_rollout(rollout: dict, *, prefer_model_above: float | None = None) -> dict:
     """Classify a rollout's outcome.
 
     Returns a dict with these keys (always present):
@@ -269,6 +382,12 @@ def score_rollout(rollout: dict, *, prefer_model_above: float = 0.6) -> dict:
     """
     global _fallback_count, _model_call_count, _last_call_at
     _last_call_at = time.time()
+
+    # v1.8.0 (P6): when the caller omits the threshold, resolve it from
+    # calibration.json / config (wires the dead reward_model_prefer_above
+    # key). Callers that pass an explicit value (tests) keep overriding.
+    if prefer_model_above is None:
+        prefer_model_above = _config_prefer_above()
 
     # v1.2.0: defensive type guard. The harvester can produce a `None`
     # or non-dict record if upstream is buggy; a corrupted record must
