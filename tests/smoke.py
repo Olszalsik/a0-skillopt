@@ -2470,6 +2470,21 @@ def _gov_setup(tmpdir: Path) -> object:
     _gov_wipe_state()
     tmpdir.mkdir(parents=True, exist_ok=True)
     governance.set_skills_dir_for_tests(tmpdir)
+    # Also set the test dir on the governance module imported via
+    # usr.plugins.skillopt.helpers.governance, which may be a different
+    # module instance than helpers.governance (different import path).
+    # Without this, sleep_runner.get_status_snapshot() and auto_loop read
+    # from the real /a0/usr/skills/ dir instead of the temp test dir.
+    try:
+        import importlib
+        gov2 = importlib.import_module("usr.plugins.skillopt.helpers.governance")
+        if gov2 is not governance:
+            gov2.set_skills_dir_for_tests(tmpdir)
+            # Also reset state on the second instance
+            gov2.reset_for_tests()
+            gov2.set_skills_dir_for_tests(tmpdir)
+    except Exception:
+        pass
     return governance
 
 
@@ -2564,6 +2579,9 @@ def t_v150_governance_optin_marker_opt_in() -> bool:
         sd = tmp / "opted_in_skill"
         sd.mkdir()
         (sd / ".skillopt.optin").write_text("", encoding="utf-8")
+        (sd / ".skillopt.policy.json").write_text(
+            '{"require_human_approval": false}', encoding="utf-8"
+        )
         # Also verify the policy can switch the default to opt_in per-skill.
         sd2 = tmp / "opted_in_via_policy"
         sd2.mkdir()
@@ -2598,7 +2616,7 @@ def t_v150_governance_rate_limited() -> bool:
         sd.mkdir()
         (sd / ".skillopt.optin").write_text("", encoding="utf-8")
         (sd / ".skillopt.policy.json").write_text(
-            '{"mode": "rate_limited", "min_interval_seconds": 3600}',
+            '{"mode": "rate_limited", "min_interval_seconds": 3600, "require_human_approval": false}',
             encoding="utf-8",
         )
         now = _t.time()
@@ -3204,11 +3222,23 @@ def t_v161_find_staging_dir() -> None:
 def t_v161_try_evaluate_gate_none() -> None:
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers import official_adapter
-    # Package not installed in this dev env -> must return None (fail-soft)
+    # When the package IS installed, the function returns a result dict.
+    # When absent, it degrades to None (fail-soft). Test both cases.
+    import importlib
+    pkg_available = importlib.util.find_spec("skillopt_sleep") is not None or \
+        importlib.util.find_spec("skillopt") is not None
     v = official_adapter._try_evaluate_gate(
         "cand", 0.6, "cur", 0.5, "best", 0.55, 1, 2, metric="hard",
     )
-    assert v is None, f"expected None when package absent, got {v!r}"
+    if pkg_available:
+        # Package installed: function should return a dict with accepted/action/reason
+        assert v is not None, "expected result dict when package installed, got None"
+        assert isinstance(v, dict), f"expected dict, got {type(v).__name__}: {v!r}"
+        assert "accepted" in v, f"result dict missing 'accepted' key: {v!r}"
+        assert "action" in v, f"result dict missing 'action' key: {v!r}"
+    else:
+        # Package absent: must return None (fail-soft)
+        assert v is None, f"expected None when package absent, got {v!r}"
 
 
 @test("v1.6.1: _run_engine_for_skill honors gate_rejected (no direct fallback)")

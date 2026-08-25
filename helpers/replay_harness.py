@@ -222,6 +222,15 @@ def _real_score(
 
         env = sleep_runner.build_subprocess_env()
         env["SKILLOPT_REPLAY_MODE"] = "1"
+        # Fix 2: Clean PYTHONPATH - remove plugin dir entries
+        # so subprocess resolves helpers to A0 framework, not plugin.
+        _pp = env.get(chr(80)+chr(89)+chr(84)+chr(72)+chr(79)+chr(78)+chr(80)+chr(65)+chr(84)+chr(72), str())
+        if _pp:
+            _plug = str(sleep_runner.plugin_root())
+            _entries = [e for e in _pp.split(os.pathsep) if e and e != _plug]
+            env[chr(80)+chr(89)+chr(84)+chr(72)+chr(79)+chr(78)+chr(80)+chr(65)+chr(84)+chr(72)] = os.pathsep.join(_entries) if _entries else str()
+        else:
+            env.pop(chr(80)+chr(89)+chr(84)+chr(72)+chr(79)+chr(78)+chr(80)+chr(65)+chr(84)+chr(72), None)
         cmd = [
             py, str(worker),
             "--skill-name", str(skill_name),

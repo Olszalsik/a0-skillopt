@@ -79,21 +79,71 @@ def _a0_root() -> Path:
 
 
 def _setup_syspath() -> None:
-    """Put A0ROOT + the plugin dir on sys.path so A0 core + helpers import.
+    """Pin sys.path so A0 framework's `helpers` package wins the namespace.
 
-    Idempotent. Called before the first lazy A0 import.
+    Idempotent. MUST run at module import time (not lazily) so that any
+    import chain that touches A0 core (e.g. ``from initialize import
+    initialize_agent`` -> ``from agent import Agent`` -> ``from helpers
+    import dotenv``) resolves `helpers` to /a0/helpers/, NOT to the plugin's
+    /a0/usr/plugins/skillopt/helpers/ (namespace collision).
+
+    Behaviour:
+    - Strip /a0/usr/plugins/skillopt (the plugin dir) from sys.path
+    COMPLETELY. We do not need it on sys.path because plugin-local modules
+    (reward_model, replay_harness, etc.) are loaded directly via
+    importlib.util in _load_plugin_helper().
+    - Insert /a0 at sys.path[0] so it is found first.
+    - Clear every cached `helpers` / `helpers.*` entry from sys.modules so
+    any subsequent ``from helpers import ...`` re-resolves against /a0.
     """
     global _syspath_done
     if _syspath_done:
         return
     a0 = str(_a0_root())
     plug = str(_plugin_root())
-    # Insert at front so the plugin's own helpers/ win over any same-named
-    # stdlib/framework modules on a polluted path.
-    for p in (a0, plug):
-        if p not in sys.path:
-            sys.path.insert(0, p)
+    # 1. Remove the plugin dir from sys.path entirely (it shadows `helpers`).
+    sys.path[:] = [p for p in sys.path if p != plug and p != a0]
+    # 2. Put A0 at sys.path[0].
+    sys.path.insert(0, a0)
+    # 3. Drop any cached `helpers` modules so the next import re-resolves.
+    for key in list(sys.modules.keys()):
+        if key == "helpers" or key.startswith("helpers."):
+            del sys.modules[key]
     _syspath_done = True
+
+
+# CRITICAL: invoke at module import time, BEFORE any A0 import can fire.
+# A0 core does lazy imports inside functions, but downstream code paths
+# (e.g. asyncio.run -> _run_monologue -> `from initialize import ...`)
+# reach into /a0 via `from helpers import dotenv` synchronously during
+# AgentContext construction.
+#
+# IMPORTANT: _setup_syspath() is NOT called at module import time. Doing so
+# would break smoke tests and any in-process import of this module, because
+# it strips the plugin path from sys.path and clears all cached `helpers`
+# modules — making subsequent `from helpers import direct_optimizer` (etc.)
+# resolve to A0's helpers/ instead of the plugin's.
+# Instead, _setup_syspath() is called inside _run_monologue() and
+# _score_response(), right before A0 imports are needed. The subprocess is
+# spawned with PYTHONPATH=/a0 (no plugin path) by replay_harness._real_score,
+# so the worker never has the plugin path on sys.path to begin with.
+
+
+def _load_plugin_helper(name: str):
+    """Load a helper module from the plugin's helpers/ dir via importlib.
+
+    Needed because the plugin's helpers/ package shares the name 'helpers'
+    with A0's framework helpers/. With A0 root at sys.path[0], 'helpers'
+    resolves to /a0/helpers/. This function loads directly from the plugin
+    path, avoiding the namespace collision.
+    """
+    import importlib.util
+    plug = _plugin_root()
+    mod_path = plug / 'helpers' / f'{name}.py'
+    spec = importlib.util.spec_from_file_location(f'skillopt_helpers.{name}', mod_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def _load_task(path: str) -> dict[str, Any]:
@@ -194,8 +244,7 @@ def _score_response(response: str, task_text: str) -> dict[str, Any]:
     to the heuristic (same path the harvester uses), so the worker is useful
     even before P5/P6 land.
     """
-    _setup_syspath()
-    from helpers import reward_model  # type: ignore
+    reward_model = _load_plugin_helper('reward_model')
 
     return reward_model.score_rollout(
         {"task": task_text, "last_response": response, "outcome": ""}

@@ -32,9 +32,9 @@ cr/ccr.db
 staging/
 fragments/skillopt_prop_*/
 fragments/STAGING/
-models/reward_model/*.bin
-models/reward_model/*.safetensors
-models/reward_model/*.pt
+# Trained reward-model artifacts (267 MB model.safetensors + tokenizer).
+# Whole dir is generated output; keep it out of git. See AGENTS.md v1.8.0.
+models/
 
 # --- Python ---
 __pycache__/
