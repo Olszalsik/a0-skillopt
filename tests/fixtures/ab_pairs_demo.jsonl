@@ -1,0 +1,10 @@
+{"task": "Refactor the parser to handle nested groups.", "response_a": "Try to handle groups, but the regex doesn't work for nesting.", "response_b": "Refactored to a recursive descent parser. Nested groups now work. Tests added.", "human_label": "win"}
+{"task": "Find the bug in the validation gate.", "response_a": "Looks fine to me, not sure what's wrong.", "response_b": "Found the bug: byte-identical but whitespace-normalised check was missing. Patched.", "human_label": "win"}
+{"task": "Add error handling to the loader.", "response_a": "Wrapped the loader in a try/except. Tested.", "response_b": "Added typed exception classes and structured logging to the loader. Tested end-to-end.", "human_label": "win"}
+{"task": "Diagnose the slow import.", "response_a": "Used cProfile, found the slow function, replaced it with a C extension. 50x faster.", "response_b": "Maybe try to import less stuff?", "human_label": "lose"}
+{"task": "Add a /health endpoint.", "response_a": "Returns 200 with uptime + version. Mounted at /health. Auth-bypassed.", "response_b": "I forgot how routes work in this framework.", "human_label": "lose"}
+{"task": "Test the new validator.", "response_a": "Wrote 12 unit tests, all pass. Coverage 95%.", "response_b": "Skipped tests, looks fine.", "human_label": "lose"}
+{"task": "Refactor the helper.", "response_a": "Renamed variables for clarity.", "response_b": "Renamed variables for clarity.", "human_label": "tie"}
+{"task": "Document the API.", "response_a": "Wrote docstrings for all public functions.", "response_b": "Wrote docstrings for all public functions.", "human_label": "tie"}
+{"task": "Reformat the file.", "response_a": "Ran black on the file.", "response_b": "Ran black on the file.", "human_label": "tie"}
+{"task": "Tighten the SQL query.", "response_a": "Added an index. Query went from 2s to 5ms.", "response_b": "Added an index. Query went from 2s to 5ms.", "human_label": "tie"}

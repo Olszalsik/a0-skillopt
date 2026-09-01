@@ -417,4 +417,12 @@ These need answers before items 4-6 can land:
 
 This roadmap lives at the plugin root. The CHANGELOG.md tracks what has actually shipped. The smoke test in `usr/workdir/skillopt-plugin/` is the live signal that the loop still works.
 
-Last updated: 2026-07-26. Next review: when Day-5 (item 7, per-cycle dashboard) lands.
+Last updated: 2026-08-31 (post v1.8.0 live verification).
+
+### Status addendum (2026-08-31, post v1.8.0 live verification)
+
+- **L1–L4 live checks: DONE** — L1 worker spawn, L2 judge labelling (65 rollouts, idempotent+atomic), L3 DistilBERT training (val_acc=0.364, 1 epoch, calibrated via calibration.json, model at models/reward_model/), L4 mock gate all PASS on the live A0 runtime with Ollama Cloud endpoint. L4-real monologue requires a reachable A0 server LLM endpoint; harness fails loud (`real_executor_unavailable`), not a code bug.
+- **Security audit (item 9, step 1): DONE** — static scan across helpers/, scripts/, api/, tools/, extensions/: no `eval()`/`exec()`, no `pickle`, no `os.system`. PyTorch `.eval()` hits are inference mode; subprocess usage is controlled (Sleep engine launch, cwd=staging, arg-list form); `__import__` uses are limited to `os.getpid()` and test-only module loading.
+- **Solution B live follow-up: DONE** — `skillopt_sleep` 0.2.0 confirmed installed in the A0 venv; `probe_official(force=True)` returns `available=true, error=null`. The adapter bridge now runs against the installed package, not just the source tree.
+- **Smoke suite**: 133/133 green (all pre-existing v1.2.0/v1.5.0 isolation failures + the v1.6.1 package-presence assumption fixed; replay namespace fix committed as `91e8999`).
+- **Still open**: item 8 formal completion (per-skill policy scopes), item 9 public release (steps 2–5: plugin review, hub PR, release tag, hub listing), open questions 2/3/5 (failure-memory backup, budget cap tuning, stuck-skill indicator).
