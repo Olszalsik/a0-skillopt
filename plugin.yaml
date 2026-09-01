@@ -4,7 +4,7 @@ description: Integrates Microsoft's SkillOpt text-space optimizer as a self-evol
 version: 1.8.0
 author: Olszalsik (integrates Microsoft's SkillOpt)
 license: MIT
-homepage: https://github.com/microsoft/SkillOpt
+homepage: https://github.com/Olszalsik/a0-skillopt
 settings_sections: [developer]
 per_project_config: false
 per_agent_config: false
