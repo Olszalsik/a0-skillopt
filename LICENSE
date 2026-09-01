@@ -1,7 +1,10 @@
 MIT License
 
+Copyright (c) 2026 Olszalsik (SkillOpt Self-Evolution Engine for Agent Zero)
 Copyright (c) 2026 Microsoft Research (SkillOpt)
-Copyright (c) 2026 Agent Zero Plugin authors
+
+This plugin integrates Microsoft's SkillOpt (https://github.com/microsoft/SkillOpt),
+which is MIT licensed. The plugin code itself is an original work.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

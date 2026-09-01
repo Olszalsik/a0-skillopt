@@ -2,7 +2,7 @@ name: skillopt
 title: SkillOpt Self-Evolution Engine
 description: Integrates Microsoft's SkillOpt text-space optimizer as a self-evolution engine for Agent Zero. Trains and refines natural-language skill documents (`best_skill.md`) against the agent's own trajectories, then promotes validated improvements into `usr/skills/` — closing the loop between execution and skill learning without touching model weights.
 version: 1.8.0
-author: Agent Zero Plugin (SkillOpt by Microsoft Research)
+author: Olszalsik (integrates Microsoft's SkillOpt)
 license: MIT
 homepage: https://github.com/microsoft/SkillOpt
 settings_sections: [developer]

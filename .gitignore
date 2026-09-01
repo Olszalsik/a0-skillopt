@@ -49,3 +49,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 *.swp
+
+# --- Internal dev analysis (not useful publicly, kept local only) ---
+ANALYSIS_*.md
