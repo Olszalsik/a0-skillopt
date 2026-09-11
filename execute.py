@@ -22,7 +22,7 @@ import sys
 
 
 PLUGIN_NAME = "skillopt"
-EXPECTED_VERSION = "1.8.0"
+EXPECTED_VERSION = "1.8.1"
 
 
 def main() -> int:
@@ -181,6 +181,10 @@ def main() -> int:
     # v1.1.0: honest health check. v1.0 always said PASSED. Now we fail
     # if the loop was supposed to have run but didn't (rollouts >=
     # threshold, no cycles, auto_loop is enabled).
+    # v1.8.1: don't fail while the loop thread has STARTED but hasn't
+    # completed its first tick yet (running=true, cycles_run=0) — that is
+    # the normal window right after a restart, and it used to produce a
+    # false "HEALTH CHECK FAILED".
     last_err_path = os.path.join(here, "logs", "runs", ".auto_loop_last_error.json")
     if os.path.isfile(last_err_path):
         try:
@@ -202,12 +206,22 @@ def main() -> int:
     threshold = int(cfg.get("auto_loop_min_rollouts", 10)) if cfg else 10
     auto_enabled = (cfg.get("auto_loop_enabled", True) if cfg else True)
     # If the auto-loop is enabled and we have enough rollouts to have
-    # fired at least one cycle, but we haven't, that's a bug.
+    # fired at least one cycle, but we haven't, that's a bug — UNLESS the
+    # loop thread is alive and simply hasn't ticked yet (v1.8.1).
+    loop_started_not_ticked = (
+        auto_state.get("running") is True and cycles == 0
+    )
     loop_stalled = (
         auto_enabled
         and rollout_count >= threshold
         and cycles == 0
+        and not loop_started_not_ticked
     )
+    if loop_started_not_ticked and rollout_count >= threshold:
+        print()
+        print(f"[{PLUGIN_NAME}] WARN: auto_loop is enabled and rollouts={rollout_count} >= threshold={threshold},")
+        print(f"[{PLUGIN_NAME}]   but cycles_run={cycles}. The loop has started and should fire on its first tick;")
+        print(f"[{PLUGIN_NAME}]   re-run this check after auto_loop_interval_sec has elapsed.")
     if loop_stalled:
         print()
         print(f"[{PLUGIN_NAME}] HEALTH CHECK FAILED.")

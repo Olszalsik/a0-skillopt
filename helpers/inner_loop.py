@@ -47,6 +47,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -93,12 +94,19 @@ DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_MAX_AGE_SECONDS = 7 * 86400  # 7 days
 DEFAULT_MIN_ROLLOUT_CONFIDENCE = 0.4
 DEFAULT_LLM_MODEL = "minimax-m3"
+# v1.8.1: per-tick parse window (0 = unlimited)
+DEFAULT_MAX_SCAN_FILES = 2000
 
 
 def _config() -> dict[str, Any]:
     """Read inner_loop_* keys from the merged config + env overrides."""
     try:
-        from helpers.sleep_runner import merged_config  # type: ignore
+        # v1.8.1: two-path import — the bare `helpers` resolves to the
+        # framework's helpers package in the framework runtime.
+        try:
+            from usr.plugins.skillopt.helpers.sleep_runner import merged_config  # type: ignore
+        except ImportError:
+            from helpers.sleep_runner import merged_config  # type: ignore
         cfg = merged_config()
     except Exception:
         cfg = {}
@@ -108,6 +116,13 @@ def _config() -> dict[str, Any]:
         "max_age_seconds": int(cfg.get("inner_loop_max_suggestion_age_seconds", DEFAULT_MAX_AGE_SECONDS)),
         "min_rollout_confidence": float(cfg.get("inner_loop_min_rollout_confidence", DEFAULT_MIN_ROLLOUT_CONFIDENCE)),
         "llm_model": str(cfg.get("inner_loop_llm_model", cfg.get("target_model", DEFAULT_LLM_MODEL))),
+        # v1.8.1: the LLM endpoint was previously only reachable via the
+        # (nonexistent) `llm_endpoint` config key or the env var, so the
+        # tick always fell back to stub suggestions. New dedicated key.
+        "llm_endpoint": str(cfg.get("inner_loop_llm_endpoint", "") or ""),
+        # v1.8.1: bound the per-tick parse window (0 = unlimited) so a large
+        # rollout backlog cannot make every 60s tick re-read everything.
+        "max_scan_files": int(cfg.get("inner_loop_max_scan_files", DEFAULT_MAX_SCAN_FILES) or 0),
     }
     if os.environ.get("SKILLOPT_INNER_LOOP_ENABLED"):
         out["enabled"] = os.environ["SKILLOPT_INNER_LOOP_ENABLED"].strip().lower() in ("1", "true", "yes", "on")
@@ -239,6 +254,12 @@ def enqueue_suggestion(
         ts = time.time()
         ts_int = int(ts)
         out_path = suggestions_dir() / f"{safe_skill}_{safe_rid}_{ts_int}.md"
+        # v1.8.1: two suggestions for the same rollout within the same
+        # second produced the same filename and silently overwrote the
+        # first. Disambiguate with a short random suffix on collision
+        # (the `*_` glob in _rollout_needs_suggestion still matches).
+        if out_path.exists():
+            out_path = suggestions_dir() / f"{safe_skill}_{safe_rid}_{ts_int}_{uuid.uuid4().hex[:6]}.md"
         task = str(rollout.get("task") or "")[:240]
         failure_mode = str(rollout.get("outcome") or "none")
         try:
@@ -348,12 +369,18 @@ def list_pending_suggestions(
 def drain_suggestions(
     skill_name: str,
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
+    keep_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Return AND delete suggestions older than `max_age_seconds` for `skill_name`.
+    """Return AND delete suggestions for `skill_name`.
 
-    This is the consume half of the queue. The outer loop calls it
-    once per cycle to mark suggestions as processed. Anything older
-    than `max_age_seconds` is treated as stale and dropped
+    v1.8.1: adds `keep_ids` (rollout_ids to KEEP in the queue). Previously
+    every drain deleted ALL pending suggestions for the skill — including
+    the ones below build_targeted_prompt's top-N that were never consumed —
+    silently dropping them. The auto-loop now passes the ids it actually
+    consumed; unconsumed ones stay queued for the next cycle. Callers that
+    omit `keep_ids` keep the old delete-everything behaviour.
+
+    Anything older than `max_age_seconds` is treated as stale and dropped
     (it was a hint the outer loop never acted on).
 
     Returns the list of dicts that were removed, in ts-ascending order.
@@ -364,6 +391,7 @@ def drain_suggestions(
     if not needle:
         return out
     now = time.time()
+    keep: set[str] = {str(i) for i in (keep_ids or []) if i}
     for child in sorted(sd.glob("*.md")):
         rec = _parse_suggestion_file(child)
         if rec is None:
@@ -376,6 +404,9 @@ def drain_suggestions(
                 child.unlink()
             except OSError:
                 pass
+            continue
+        # v1.8.1: when keep_ids is provided, only drain the consumed ones.
+        if keep and str(rec.get("rollout_id") or "") not in keep:
             continue
         # Delete the file we just read (the contract is "return AND delete")
         try:
@@ -506,7 +537,6 @@ def inner_loop_tick(llm_endpoint: str | None = None) -> dict[str, Any]:
         _last_tick_at = time.time()
         _append_tick_log(counters)
         return counters
-    endpoint = (llm_endpoint or os.environ.get("SKILLOPT_SUGGEST_ENDPOINT") or "").strip()
     rd = _rollouts_dir()
     try:
         files = sorted(rd.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -519,22 +549,41 @@ def inner_loop_tick(llm_endpoint: str | None = None) -> dict[str, Any]:
         return counters
     min_conf = float(cfg["min_rollout_confidence"])
     model = cfg["llm_model"]
+    # v1.8.1: resolve the LLM endpoint. The old `llm_endpoint` config key
+    # never existed in any config file, so without the env var the tick
+    # always produced stub suggestions. The new `inner_loop_llm_endpoint`
+    # key (and the caller-provided arg) now work; env still wins last.
+    endpoint = (
+        llm_endpoint
+        or cfg.get("llm_endpoint")
+        or os.environ.get("SKILLOPT_SUGGEST_ENDPOINT")
+        or ""
+    ).strip()
     # Cap the per-tick work so a backlog of 1000 rollouts doesn't
-    # block the worker for an hour. 50 is the v1.2.0 default; the
-    # outer loop catches up on the next tick.
+    # block the worker for an hour. v1.8.1: the cap now counts only
+    # rollouts that actually NEED a suggestion — previously every
+    # scanned file counted, so a needy rollout buried under >=50 newer
+    # already-suggested ones was starved forever. A second cap
+    # (inner_loop_max_scan_files) bounds how many files are parsed.
     PER_TICK_CAP = 50
+    max_scan = int(cfg.get("max_scan_files") or 0)
+    parsed = 0
     for f in files:
         if counters["scanned"] >= PER_TICK_CAP:
             break
+        if max_scan and parsed >= max_scan:
+            break
+        parsed += 1
         try:
             rec = json.loads(f.read_text(encoding="utf-8", errors="replace"))
         except Exception:
             counters["skipped"] += 1
             continue
-        counters["scanned"] += 1
         if not _rollout_needs_suggestion(rec):
-            counters["skipped"] += 1
+            # v1.8.1: already-suggested files no longer count toward the
+            # per-tick processing cap (they still count toward max_scan).
             continue
+        counters["scanned"] += 1
         # Confidence gate: skip rollouts the reward model is unsure about
         try:
             conf = float((rec.get("reward") or {}).get("confidence") or 0.0)
@@ -602,7 +651,17 @@ def _append_tick_log(counters: dict[str, Any]) -> None:
     """Append one line to logs/runs/inner_loop.log (cycle log = source of truth)."""
     try:
         ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-        with open(inner_log_path(), "a", encoding="utf-8") as fp:
+        log_path = inner_log_path()
+        # v1.8.1: rotate when large instead of growing without bound.
+        try:
+            try:
+                from usr.plugins.skillopt.helpers import sleep_runner as _sr  # type: ignore
+            except ImportError:
+                from helpers import sleep_runner as _sr  # type: ignore
+            _sr.rotate_log_if_large(log_path)
+        except Exception:
+            pass
+        with open(log_path, "a", encoding="utf-8") as fp:
             fp.write(
                 f"{ts} inner_loop_tick "
                 f"scanned={counters['scanned']} "

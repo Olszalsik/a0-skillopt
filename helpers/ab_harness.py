@@ -307,7 +307,13 @@ def _replay_under_skill(rollout: dict[str, Any], skill_text: str) -> float:
     real model is doing the work.
     """
     try:
-        from helpers import reward_model  # type: ignore  # noqa: E402
+        # v1.8.1: two-path import — the bare `helpers` resolves to the
+        # framework's helpers package in the framework runtime, so the
+        # A/B replay silently degraded to the neutral fallback there.
+        try:
+            from usr.plugins.skillopt.helpers import reward_model  # type: ignore  # noqa: E402
+        except ImportError:
+            from helpers import reward_model  # type: ignore  # noqa: E402
         # Build a synthetic rollout that exposes the skill text to the
         # model. We append a `[skill]` marker so the model's heuristic
         # can find the skill and a snippet (when a real model is loaded

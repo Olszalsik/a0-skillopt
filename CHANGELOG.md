@@ -6,9 +6,45 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
-Nothing staged yet. The two v1.7.0 follow-ups (real replay executor + reward
-training) landed in v1.8.0 — see below. Live verification of the v1.8.0 opt-in
-paths (L1–L4 in the plan) is the remaining work.
+## [1.8.1] — 2026-08-11
+
+**Windows portability — every hardcoded `/a0/...` container path fixed.** The plugin was
+silently dead on Windows installs: 10 consumers resolved files/dirs under a Linux path that
+never exists there, so every opt-in path silently saw an empty skills list, a missing
+last-error file, and a missing workdir. v1.7.0/v1.8.0 behavior is preserved byte-for-byte on
+container layouts (the container path is kept as a secondary candidate everywhere it applied).
+
+### Fixed
+- `helpers/sleep_runner.py` — `a0_skills_dir()` now derives from `plugin_root()`
+  (`<project>/usr/plugins/skillopt` → `<project>/usr/skills`) instead of the hardcoded
+  `Path("/a0/usr/skills")`; honors the `SKILLOPT_SKILLS_DIR` override. `plugin_root()`
+  resolves via the framework's `plugins.plugin_root()` (cached 60s), falling back to this
+  file's own location (4 parents up from `helpers/`) when the framework module is absent.
+- `helpers/auto_loop.py` — `rotate_log_if_large()` recreates an empty live log after rotating
+  (append-mode writers already recreated the file; tailing readers did not).
+- `helpers/governance.py` — the `plugin_root()`- and `budget`-fallback imports resolve via
+  the framework path first (portable), falling back to `helpers.*` last.
+- `helpers/inner_loop.py` — the `sleep_runner` fallback import resolves via the framework
+  path first (portable).
+- `helpers/official_adapter.py` — the `sleep_runner` fallback import resolves via the
+  framework path first (portable); `_resolve_skill_path()` resolves via
+  `sleep_runner.a0_skills_dir()` (honors `SKILLOPT_SKILLS_DIR`) instead of a hardcoded
+  `<a0>/usr/skills`.
+- `helpers/ab_harness.py`, `helpers/replay_harness.py` — fallback imports resolve via the
+  framework path first (portable).
+- `extensions/python/monologue_start/_40_skillopt_warn.py` — the last-error file resolves from
+  this extension's own location first (portable); the container path is a secondary
+  candidate. The warning banner now fires on Windows installs.
+- User-facing strings: the staged-proposal env-file instructions
+  (`helpers/direct_optimizer.py`) and the `api/adopt.py` docstring reference plugin-relative
+  paths instead of `/a0/usr/plugins/skillopt/...`.
+
+### Verified
+- 50 files `py_compile` OK; 133/133 smoke tests pass (11 `t_v18_*` new; the full
+  deterministic suite, no LLM/network); 13/13 targeted v1.8.1 probes pass
+  (two-path imports, `_expand_env`, `is_running`, gate marker, rotation, merged-config);
+  `execute.py --self-check` Health check PASSED (manifest version 1.8.1); 8/8 skills
+  resolve on the live install.
 
 ---
 

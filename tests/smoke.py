@@ -2500,7 +2500,8 @@ def t_v150_governance_default_opt_out() -> bool:
         gov = _gov_setup(tmp)
         ok, reason = gov.check_skill_eligible("ghost_skill")
         assert ok is False, f"default should be opt_out (not eligible), got: {(ok, reason)!r}"
-        assert reason == "mode_opt_in_no_marker", f"expected mode_opt_in_no_marker, got: {reason!r}"
+        # v1.8.1: opt_out and opt_in now report distinct reason strings.
+        assert reason == "mode_opt_out_no_marker", f"expected mode_opt_out_no_marker, got: {reason!r}"
         print("  t_v150_governance_default_opt_out: OK")
         return True
     finally:
@@ -2913,17 +2914,17 @@ def t_v150_governance_auto_loop_skip() -> bool:
 _section_v160 = "v1.6.0 NEW (Solution B): official-engine bridge, gate delegation, per-skill gating, side-findings"
 
 
-@test("v1.8.0: version strings aligned across plugin.py / hooks.py / plugin.yaml")
+@test("v1.8.1: version strings aligned across plugin.py / hooks.py / plugin.yaml")
 def t_v170_version_alignment() -> None:
     import re
     plugin_py = (PLUGIN_ROOT / "plugin.py").read_text(encoding="utf-8")
     hooks_py = (PLUGIN_ROOT / "hooks.py").read_text(encoding="utf-8")
     manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
     execute_py = (PLUGIN_ROOT / "execute.py").read_text(encoding="utf-8")
-    assert 'PLUGIN_VERSION = "1.8.0"' in plugin_py, "plugin.py not 1.8.0"
-    assert 'PLUGIN_VERSION = "1.8.0"' in hooks_py, "hooks.py not 1.8.0"
-    assert re.search(r'^version:\s*1\.8\.0', manifest, re.M), "plugin.yaml not 1.8.0"
-    assert 'EXPECTED_VERSION = "1.8.0"' in execute_py, "execute.py not 1.8.0"
+    assert 'PLUGIN_VERSION = "1.8.1"' in plugin_py, "plugin.py not 1.8.1"
+    assert 'PLUGIN_VERSION = "1.8.1"' in hooks_py, "hooks.py not 1.8.1"
+    assert re.search(r'^version:\s*1\.8\.1', manifest, re.M), "plugin.yaml not 1.8.1"
+    assert 'EXPECTED_VERSION = "1.8.1"' in execute_py, "execute.py not 1.8.1"
 
 
 @test("v1.6.1: default_config.yaml declares the official-engine bridge keys")
@@ -4150,8 +4151,9 @@ def t_c4_check_eligible_after_auto_optin_and_approval() -> None:
     skill = "c4_flow_skill"
     try:
         # Brand-new skill: no marker, default mode=opt_out -> not eligible.
+        # v1.8.1: opt_out mode reports its own reason string.
         e0, r0 = gov.check_skill_eligible(skill)
-        assert not e0 and r0 == "mode_opt_in_no_marker", (e0, r0)
+        assert not e0 and r0 == "mode_opt_out_no_marker", (e0, r0)
         # Auto-optin: markers created, but pending human approval.
         res = gov.auto_optin_new_skill(skill)
         assert res["ok"] and res["reason"] == "created", res

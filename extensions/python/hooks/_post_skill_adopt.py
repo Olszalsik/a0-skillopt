@@ -2,22 +2,22 @@
 SkillOpt - post-adopt validation gate.
 
 Runs after `skillopt_sleep verb=adopt` (or a direct API call to
-/api/plugins/skillopt/adopt) and performs a final sanity check before
-the proposal is considered final. This is the safety net that keeps
-silent regressions from sneaking into the agent's skills.
-
-v1.1.0 changes:
-- Delegates to the shared `validate_proposal()` in sleep_runner
-  (whitespace-normalised equality, mandatory example block, shrink
-  ceiling, optional held-out enforcement). The v1.0 inline check
-  accepted a 1904->1904 byte-identical 'qa' adoption.
+/api/plugins/skillopt/adopt) and performs a final audit of the adoption.
+NOTE (v1.8.1): this hook runs AFTER the target file was already written —
+it cannot revert the adoption. It is the audit trail (post_adopt.log)
+that keeps silent regressions visible, not an enforcement gate; the real
+gate runs in validate_proposal() BEFORE any write (auto-loop _auto_adopt,
+api/adopt, skillopt_sleep tool).
 """
 
 import json
 import time
 from pathlib import Path
 
-from usr.plugins.skillopt.helpers import sleep_runner # type: ignore
+try:
+    from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
+except ImportError:
+    from helpers import sleep_runner  # type: ignore  # noqa: F401
 
 
 PLUGIN_NAME = "skillopt"
@@ -59,6 +59,9 @@ def execute(context: dict, **kwargs): # type: ignore[no-untyped-def]
     cfg = sleep_runner.merged_config()
     last_log = _latest_sleep_log()
     held_out = sleep_runner.parse_held_out(last_log) if last_log else None
+    # v1.8.1: honour the official-gate provenance marker (see api/adopt.py).
+    marker = sleep_runner.read_official_gate_marker(Path(src))
+    official_gated = bool(marker.get("official_gated")) if marker else False
     ok, reason = sleep_runner.validate_proposal(
         proposed,
         current,
@@ -66,6 +69,7 @@ def execute(context: dict, **kwargs): # type: ignore[no-untyped-def]
         min_improvement_pp=float(cfg.get("gate_min_improvement_pp", 0.0)),
         max_shrink_ratio=float(cfg.get("gate_max_shrink_ratio", 0.5)),
         held_out=held_out,
+        official_gated=official_gated,
     )
 
     audit_entry = {

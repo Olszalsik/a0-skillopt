@@ -31,7 +31,7 @@ import sys
 log = logging.getLogger(__name__)
 
 PLUGIN_NAME = "skillopt"
-PLUGIN_VERSION = "1.8.0"
+PLUGIN_VERSION = "1.8.1"
 
 # Base `skillopt` (no extras). The [webui] extra pulls gradio +
 # huggingface_hub >= 1.2 + msal + azure-identity, which conflicts with
@@ -63,6 +63,16 @@ def _a0_python() -> str:
         # Windows: A0 dev setup puts the venv in the project root as
         # .venv\\Scripts\\python.exe. Also accept the legacy ProgramData
         # layout used by the bundled Docker image's Windows variant.
+        # v1.8.1: also derive the project root from this plugin's location
+        # (<root>/usr/plugins/skillopt), so a CWD other than the project
+        # root (e.g. the UI server started from elsewhere) still finds it.
+        # And honour the A0_VENV_PYTHON override on Windows too.
+        env_py = os.environ.get("A0_VENV_PYTHON")
+        if env_py:
+            candidates.append(env_py)
+        here = os.path.dirname(os.path.abspath(__file__))
+        proj_root = os.path.abspath(os.path.join(here, os.pardir, os.pardir, os.pardir))
+        candidates.append(os.path.join(proj_root, ".venv", "Scripts", "python.exe"))
         cwd = os.getcwd()
         candidates.append(os.path.join(cwd, ".venv", "Scripts", "python.exe"))
         candidates.append(os.path.join(cwd, "venv", "Scripts", "python.exe"))

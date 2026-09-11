@@ -22,6 +22,7 @@ ROADMAP engineering principles honored:
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import time
@@ -152,23 +153,29 @@ class BudgetTracker:
     # ------------------------------------------------------------------ #
 
     def _next_reset_after(self, ts: float) -> float:
-        """Return the next daily reset boundary (UTC seconds) after `ts`."""
+        """Return the next daily reset boundary (UTC seconds) after `ts`.
+
+        v1.8.1 fix: the UTC struct from ``time.gmtime`` was fed into
+        ``time.mktime`` (which interprets it as LOCAL time), so the daily
+        reset drifted by the machine's UTC offset. ``calendar.timegm``
+        interprets the struct as UTC, matching the ``*_utc`` config key.
+        """
         try:
             t = time.gmtime(ts)
         except Exception:
             t = time.gmtime()
         # Today's reset at reset_hour_utc
-        today_reset = time.mktime(
+        today_reset = calendar.timegm(
             (t.tm_year, t.tm_mon, t.tm_mday, self.reset_hour_utc, 0, 0, 0, 0, 0)
         )
         if today_reset > ts:
-            return today_reset
+            return float(today_reset)
         # Tomorrow's reset
         tomorrow = time.gmtime(today_reset + 86400)
-        return time.mktime(
+        return float(calendar.timegm(
             (tomorrow.tm_year, tomorrow.tm_mon, tomorrow.tm_mday,
              self.reset_hour_utc, 0, 0, 0, 0, 0)
-        )
+        ))
 
     def _maybe_rollover(self, ts: float) -> None:
         state = self._load()

@@ -213,6 +213,11 @@ async def _run_monologue(
     # Belt-and-suspenders containment: file tools read workdir from
     # settings["workdir_path"], but chdir is free and covers any tool that
     # resolves a relative path from cwd.
+    # v1.8.1: restore the original cwd in finally — main() rmtree()s the
+    # temp workdir, and on Windows a directory that is any process's cwd
+    # cannot be deleted (the old code left empty skillopt_replay_* dirs
+    # behind in the temp root on every replay).
+    _orig_cwd = os.getcwd()
     os.chdir(workdir)
 
     config = initialize_agent(override_settings={"workdir_path": str(workdir)})
@@ -233,6 +238,10 @@ async def _run_monologue(
     finally:
         try:
             AgentContext.remove(ctx.id)
+        except Exception:
+            pass
+        try:
+            os.chdir(_orig_cwd)
         except Exception:
             pass
 

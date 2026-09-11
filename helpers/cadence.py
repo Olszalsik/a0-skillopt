@@ -207,9 +207,13 @@ def _rollouts_dir() -> Path:
 
 
 def count_new_rollouts(skill_name: str, since_ts: float) -> int:
-    """Count rollout JSONs whose mtime > since_ts AND whose skill_hint == skill_name.
+    """Count rollout JSONs whose mtime > since_ts AND whose skill matches skill_name.
 
-    Exact attribution isn't needed for cadence — this is a cheap heuristic.
+    v1.8.1 fix: this only matched `skill_hint`, a field NO code writes (the
+    harvester writes the authoritative `skill_used`), so the count was
+    always 0 and per-skill cadence was permanently cold (ceiling lockout
+    after every cycle, hot skills never accelerated). Match `skill_used`
+    first, falling back to the historical `skill_hint` for legacy records.
     """
     rd = _rollouts_dir()
     if not rd.is_dir():
@@ -230,7 +234,9 @@ def count_new_rollouts(skill_name: str, since_ts: float) -> int:
                     rec = json.load(fp)
             except (OSError, json.JSONDecodeError):
                 continue
-            hint = str((rec or {}).get("skill_hint") or "").strip().lower()
+            hint = str(
+                (rec or {}).get("skill_used") or (rec or {}).get("skill_hint") or ""
+            ).strip().lower()
             if hint == needle:
                 n += 1
     except OSError:

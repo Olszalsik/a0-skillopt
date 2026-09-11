@@ -403,8 +403,12 @@ def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
         }
         if (
             rm_result.get("source") == "model"
-            and float(rm_result.get("confidence") or 0.0) >= 0.6
+            and float(rm_result.get("confidence") or 0.0)
+            >= float(rm_result.get("prefer_model_above") or 0.6)
         ):
+            # v1.8.1: use the calibrated threshold the reward helper computes
+            # (calibration.json > reward_model_prefer_above > 0.6) instead of
+            # the hardcoded 0.6, which silently ignored the v1.8.0 P6 wiring.
             record["outcome"] = rm_result.get("outcome") or heuristic_label
     except Exception as e:
         # The reward helper itself is supposed to never raise, but

@@ -3,7 +3,7 @@ SkillOpt - adopt endpoint.
 
 Route: POST /api/plugins/skillopt/adopt
 
-Promotes a staged proposal to /a0/usr/skills/<name>/SKILL.md after a final
+Promotes a staged proposal to usr/skills/<name>/SKILL.md after a final
 validation-gate sanity check. The post-adopt hook writes a one-line audit
 entry to logs/runs/.
 
@@ -97,6 +97,15 @@ class Adopt(ApiHandler):
         cfg = sleep_runner.merged_config()
         last_log = _latest_sleep_log()
         held_out = sleep_runner.parse_held_out(last_log) if last_log else None
+        # v1.8.1: honour the per-proposal official-gate provenance marker.
+        # Previously a proposal staged by the OFFICIAL engine was re-gated
+        # locally with held_out parsed from the LATEST sleep log (possibly
+        # another skill's run) and could be wrongly rejected. When the
+        # marker is present the official held-out verdict is authoritative
+        # and only the cheap structural stages run (same rule as the
+        # auto-loop).
+        marker = sleep_runner.read_official_gate_marker(src)
+        official_gated = bool(marker.get("official_gated")) if marker else False
         ok, reason = sleep_runner.validate_proposal(
             proposed,
             current,
@@ -105,6 +114,7 @@ class Adopt(ApiHandler):
             max_shrink_ratio=float(cfg.get("gate_max_shrink_ratio", 0.5)),
             held_out=held_out,
             skill_name=skill_name,  # v1.2.0: enables the A/B harness stage
+            official_gated=official_gated,
         )
 
         entry = {
@@ -140,6 +150,13 @@ class Adopt(ApiHandler):
             snapshot = {"ok": False, "error": f"snapshot_default raised: {e}"}
 
         target.write_text(proposed, encoding="utf-8")
+
+        # v1.8.1: the proposal is consumed — clear its provenance marker so
+        # a later re-adopt re-runs the full local gate.
+        try:
+            sleep_runner.clear_official_gate_marker(src)
+        except Exception:
+            pass
 
         # v1.7.0: record an `adopted` cycle_history entry for the
         # dashboard's human-in-the-loop audit trail.

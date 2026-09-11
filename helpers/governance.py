@@ -211,9 +211,12 @@ def check_skill_eligible(skill_name: str) -> tuple[bool, str]:
         return False, "mode_immutable"
 
     # 3 + 4. Opt-in vs opt-out mode + marker check.
-    if mode in ("opt_in", "opt_out"):
-        if not has_optin:
-            return False, "mode_opt_in_no_marker"
+    # v1.8.1: distinct reason strings so the dashboard/log can tell the two
+    # modes apart (both previously reported "mode_opt_in_no_marker").
+    if mode == "opt_in" and not has_optin:
+        return False, "mode_opt_in_no_marker"
+    if mode == "opt_out" and not has_optin:
+        return False, "mode_opt_out_no_marker"
     # mode == "rate_limited" or "open": always allow; rate-limit / budget below.
 
     # 5. Rate-limit by min_interval_seconds.
@@ -441,6 +444,19 @@ def _append_log(entry: dict[str, Any]) -> dict[str, Any]:
     try:
         runs = _runs_dir()
         out_path = runs / "governance.log"
+        # v1.8.1: rotate when large (see sleep_runner.rotate_log_if_large).
+        try:
+            from usr.plugins.skillopt.helpers import sleep_runner as _sr  # type: ignore
+        except Exception:
+            try:
+                from helpers import sleep_runner as _sr  # type: ignore
+            except Exception:
+                _sr = None  # type: ignore[assignment]
+        if _sr is not None:
+            try:
+                _sr.rotate_log_if_large(out_path)
+            except Exception:
+                pass
         with open(out_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             f.flush()
@@ -453,6 +469,32 @@ def _append_log(entry: dict[str, Any]) -> dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
+def _read_log_tail(log: Path, max_bytes: int = 262_144) -> list[str]:
+    """Read the last ~max_bytes of a JSONL decision log as lines.
+
+    v1.8.1: the two lookups below used ``f.readlines()`` on the WHOLE
+    governance.log on every eligibility check for every candidate skill —
+    O(log size) per tick, forever growing. Reading a bounded tail is enough
+    for "most recent entry wins" lookups (entries older than the tail are
+    far past any min_interval window). Best-effort: returns [] on error.
+    """
+    try:
+        import os as _os
+        size = log.stat().st_size
+        with open(log, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read()
+        text = data.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        # Drop the (possibly truncated) first line when we seeked.
+        if size > max_bytes and lines:
+            lines = lines[1:]
+        return lines
+    except Exception:
+        return []
+
+
 def _last_eligible_decision_ts(skill_name: str) -> float | None:
     """Find the most recent eligible=True decision ts for this skill
     in governance.log, or None if not found."""
@@ -460,9 +502,7 @@ def _last_eligible_decision_ts(skill_name: str) -> float | None:
     if not log.is_file():
         return None
     try:
-        with open(log, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        for line in reversed(lines):
+        for line in reversed(_read_log_tail(log)):
             try:
                 entry = json.loads(line)
             except Exception:
@@ -501,7 +541,9 @@ def _today_spent_cents(skill_name: str) -> int | None:
     try:
         tracker = budget.BudgetTracker(skill_name)
         s = tracker.get_status()
-        return int(s.get("spent_today_cents", 0))
+        # v1.8.1 fix: get_status() returns `daily_total_cents` (the old key
+        # `spent_today_cents` never existed, so the cap never triggered).
+        return int(s.get("daily_total_cents", s.get("spent_today_cents", 0)) or 0)
     except Exception:
         return None
 
@@ -513,9 +555,7 @@ def _human_approved(skill_name: str) -> bool:
     if not log.is_file():
         return False
     try:
-        with open(log, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        for line in reversed(lines):
+        for line in reversed(_read_log_tail(log)):
             try:
                 entry = json.loads(line)
             except Exception:

@@ -203,7 +203,13 @@ def _real_score(
     os.environ["SKILLOPT_REPLAY_MODE"] = "1"
     sf = tf = of = None
     try:
-        from helpers import sleep_runner  # type: ignore  # noqa: E402
+        # v1.8.1: two-path import — the bare `helpers` resolves to the
+        # framework's helpers package in the framework runtime, which made
+        # the real replay executor unreachable in production.
+        try:
+            from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore  # noqa: E402
+        except ImportError:
+            from helpers import sleep_runner  # type: ignore  # noqa: E402
 
         py = sleep_runner._a0_python()
         worker = sleep_runner.plugin_root() / "scripts" / "replay_worker.py"

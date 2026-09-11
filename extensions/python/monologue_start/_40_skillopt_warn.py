@@ -30,11 +30,17 @@ MAX_AGE_SEC = 3600  # 1 hour
 
 def _last_error_path() -> Path | None:
     """Locate the persisted error file written by helpers/auto_loop.py."""
+    # v1.8.1 fix: the primary candidate was the hardcoded Linux path
+    # Path("/a0/usr/plugins/skillopt/..."), which never exists on Windows,
+    # so the warning banner silently never fired there. Resolve from this
+    # extension's own location first (portable), keep the container path
+    # as a secondary candidate.
     candidates = [
-        # Live plugin path
-        Path("/a0/usr/plugins/skillopt/logs/runs/.auto_loop_last_error.json"),
-        # Workdir path (when running outside the installed plugin)
+        # This extension: <plugin>/extensions/python/monologue_start/<file>.py
+        # -> 4 parents up = <plugin>/logs/runs/
         Path(__file__).resolve().parent.parent.parent.parent / "logs" / "runs" / ".auto_loop_last_error.json",
+        # Live plugin path (Linux/Docker container layout)
+        Path("/a0/usr/plugins/skillopt/logs/runs/.auto_loop_last_error.json"),
     ]
     for c in candidates:
         if c.is_file():

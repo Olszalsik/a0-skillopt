@@ -56,6 +56,10 @@ _DEFAULT_MODEL_NAME = "reward_model"
 # is correct: the harvester runs in the A0 framework process and
 # the API endpoints run in the same process.
 _lock = threading.Lock()
+# v1.8.1: inference gets its OWN lock. Previously _lock (the lazy-load
+# lock) was held across the whole tokenizer+forward call, serializing
+# scoring for every concurrent chat on one lock.
+_infer_lock = threading.Lock()
 _tokenizer = None
 _model = None
 _model_dir: Path | None = None
@@ -98,7 +102,13 @@ def model_path() -> Path:
     if override:
         return Path(override)
     try:
-        from helpers.sleep_runner import merged_config  # type: ignore
+        # v1.8.1: two-path import — in the framework runtime the bare
+        # `helpers` resolves to the FRAMEWORK's helpers package (which has
+        # no sleep_runner), so the config key was silently ignored there.
+        try:
+            from usr.plugins.skillopt.helpers.sleep_runner import merged_config  # type: ignore
+        except ImportError:
+            from helpers.sleep_runner import merged_config  # type: ignore
         cp = merged_config().get("reward_model_path")
     except Exception:
         cp = None
@@ -239,7 +249,7 @@ def _infer(text: str) -> tuple[str, float, list[float]] | None:
         return None
     try:
         import torch  # type: ignore  # local import - we already paid the load cost
-        with _lock:  # serialize torch.no_grad() inference for thread safety
+        with _infer_lock:  # v1.8.1: dedicated inference lock (load uses _lock)
             inputs = _tokenizer(
                 text,
                 return_tensors="pt",
@@ -283,7 +293,13 @@ def _config_prefer_above() -> float:
         pass
     # 2. config key
     try:
-        from helpers.sleep_runner import merged_config  # type: ignore
+        # v1.8.1: two-path import (see model_path) — the bare `helpers`
+        # import failed in the framework runtime, so the configured
+        # threshold was silently ignored there.
+        try:
+            from usr.plugins.skillopt.helpers.sleep_runner import merged_config  # type: ignore
+        except ImportError:
+            from helpers.sleep_runner import merged_config  # type: ignore
         v = merged_config().get("reward_model_prefer_above")
         if v is not None:
             return max(0.0, min(1.0, float(v)))

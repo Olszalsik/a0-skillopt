@@ -96,14 +96,18 @@ def runs_dir() -> Path:
 def a0_skills_dir() -> Path:
     """Path to Agent Zero's user-facing skills directory.
 
-    Defaults to the canonical /a0/usr/skills. Overridable via the
-    SKILLOPT_SKILLS_DIR environment variable for native Windows
-    installs or alternate deployments.
+    v1.8.1 fix: the default was the hardcoded Linux path Path("/a0/usr/skills"),
+    which never exists on Windows — every consumer silently saw an empty
+    skills list there. plugin_root() is <project>/usr/plugins/skillopt, so
+    the fallback is plugin_root().parent.parent / "skills" (= <project>/usr/skills),
+    which matches both the framework install and the standalone extension
+    layout. Overridable via the SKILLOPT_SKILLS_DIR environment variable
+    for alternate deployments.
     """
     override = os.environ.get("SKILLOPT_SKILLS_DIR")
     if override:
         return Path(override)
-    return Path("/a0/usr/skills")
+    return plugin_root().parent.parent / "skills"
 
 
 def default_config() -> dict[str, Any]:
@@ -134,9 +138,56 @@ def default_config() -> dict[str, Any]:
     return out
 
 
+def _framework_registry_config() -> dict[str, Any]:
+    """Read the plugin's live framework config (the user's WebUI settings).
+
+    v1.8.1: previously ONLY the auto-loop saw the framework config (it
+    passed get_config() explicitly); every other consumer — the shared
+    validation gate, /adopt, the skillopt_sleep tool, the post-adopt
+    hook, reward_model — read default_config.yaml only, so user-tuned
+    gate / replay keys were silently ignored. This resolver merges the
+    framework plugin-config registry (``helpers.plugins.get_plugin_config``)
+    best-effort. It is skipped when the registry is unavailable (the smoke
+    harness / standalone scripts, where ``helpers`` resolves to the
+    plugin-local package with no ``plugins`` module) or when the
+    ``SKILLOPT_NO_FRAMEWORK_CONFIG=1`` kill switch is set. Cached for a
+    few seconds so a per-gate-call read stays cheap. Never raises.
+    """
+    if os.environ.get("SKILLOPT_NO_FRAMEWORK_CONFIG", "").strip().lower() in ("1", "true", "yes"):
+        return {}
+    now = time.time()
+    cached = _FRAMEWORK_CFG_CACHE["cfg"]
+    if isinstance(cached, dict) and (now - _FRAMEWORK_CFG_CACHE["at"]) < _FRAMEWORK_CFG_TTL:
+        return cached
+    cfg: dict[str, Any] = {}
+    try:
+        from helpers import plugins as plugins_helper  # type: ignore  # noqa: E402
+        loaded = plugins_helper.get_plugin_config(PLUGIN_NAME) or {}
+        if isinstance(loaded, dict):
+            cfg = loaded
+    except Exception:
+        cfg = {}
+    _FRAMEWORK_CFG_CACHE["at"] = now
+    _FRAMEWORK_CFG_CACHE["cfg"] = cfg
+    return cfg
+
+
+_FRAMEWORK_CFG_CACHE: dict[str, Any] = {"at": 0.0, "cfg": {}}
+_FRAMEWORK_CFG_TTL = 5.0
+
+
 def merged_config(framework_config: dict | None = None) -> dict[str, Any]:
-    """Merge default_config.yaml with the framework plugin config (framework wins)."""
+    """Merge config sources; later wins:
+      1. default_config.yaml (shipped defaults)
+      2. framework plugin-config registry (the user's WebUI settings;
+         v1.8.1 — skipped when unavailable so the smoke harness and
+         standalone scripts keep the byte-for-byte YAML-only behaviour)
+      3. the explicit ``framework_config`` argument (highest priority)
+    """
     merged = default_config()
+    reg = _framework_registry_config()
+    if reg:
+        merged.update(reg)
     if isinstance(framework_config, dict):
         merged.update(framework_config)
     return merged
@@ -358,7 +409,10 @@ def validate_proposal(
     # judge; in that case we fall through to the structural stages.
     if skill_name:
         try:
-            from helpers import ab_harness  # type: ignore  # noqa: E402
+            try:
+                from usr.plugins.skillopt.helpers import ab_harness  # type: ignore  # noqa: E402
+            except ImportError:
+                from helpers import ab_harness  # type: ignore  # noqa: E402
             ab_result = ab_harness.run_paired_test(
                 skill_name=skill_name,
                 proposed_text=proposed or "",
@@ -401,7 +455,10 @@ def validate_proposal(
         try:
             _cfg = merged_config()
             if bool(_cfg.get("replay_local_gate_enabled", True)):
-                from helpers import replay_harness  # type: ignore  # noqa: E402
+                try:
+                    from usr.plugins.skillopt.helpers import replay_harness  # type: ignore  # noqa: E402
+                except ImportError:
+                    from helpers import replay_harness  # type: ignore  # noqa: E402
                 _held = _load_held_out(skill_name)
                 _replay = replay_harness.run_counterfactual(
                     skill_name=skill_name,
@@ -443,7 +500,10 @@ def validate_proposal(
         try:
             cfg = merged_config()
             if bool(cfg.get("fragment_per_fragment_gate", True)):
-                from helpers import fragment_store  # type: ignore  # noqa: E402
+                try:
+                    from usr.plugins.skillopt.helpers import fragment_store  # type: ignore  # noqa: E402
+                except ImportError:
+                    from helpers import fragment_store  # type: ignore  # noqa: E402
                 fragments = fragment_store.read_fragments(skill_path)
                 if len(fragments) > 1 or (fragments and fragments[0].get("id") != "_default"):
                     per_fragment_ran = True
@@ -689,6 +749,12 @@ def launch_sleep_subprocess(
         popen_kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(cmd, **popen_kwargs)
+    # v1.8.1: enforce the (previously dead) max_runs_retained retention so
+    # every cycle doesn't leave a log behind forever. Best-effort.
+    try:
+        enforce_run_log_retention()
+    except Exception:
+        pass
     return {
         "pid": proc.pid,
         "verb": verb,
@@ -701,8 +767,14 @@ def launch_sleep_subprocess(
 
 
 def _expand_env(val: str, env: dict) -> str:
-    """Expand $VAR and ${VAR} references in `val` from `env`."""
-    pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\|\$([A-Za-z_][A-Za-z0-9_]*)")
+    """Expand $VAR and ${VAR} references in `val` from `env`.
+
+    v1.8.1 fix: the previous pattern escaped the alternation pipe
+    (``\\}\\|\\$``), which made it a literal ``${FOO}|$BAR`` match — plain
+    ``$VAR`` / ``${VAR}`` references were NEVER expanded. Shared by
+    sleep_runner.build_subprocess_env and direct_optimizer._read_env_file.
+    """
+    pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
     def repl(m: "re.Match") -> str:
         name = m.group(1) or m.group(2)
         return env.get(name, m.group(0))
@@ -710,8 +782,44 @@ def _expand_env(val: str, env: dict) -> str:
 
 
 def is_running(pid: int) -> bool:
+    """Liveness probe for a detached subprocess pid.
+
+    v1.8.1 fix: ``os.kill(pid, 0)`` is NOT a status check on Windows — it
+    maps to ``GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid)`` (a Ctrl+C
+    delivery), and TerminateProcess semantics for any other signal value.
+    Use OpenProcess/GetExitCodeProcess via ctypes instead. POSIX keeps the
+    signal-0 probe (there it is the documented non-destructive check).
+    """
+    if not pid or int(pid) <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            k32.OpenProcess.restype = ctypes.c_void_p
+            k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            k32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
+            handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, int(pid))
+            if not handle:
+                return False
+            try:
+                exit_code = ctypes.c_ulong(0)
+                if not k32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return exit_code.value == STILL_ACTIVE
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:
+            return False
     try:
-        os.kill(pid, 0)
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # process exists, we just may not signal it
     except OSError:
         return False
     return True
@@ -730,6 +838,135 @@ def tail_log(path: str | os.PathLike, max_bytes: int = 8192) -> str:
         return data.decode("utf-8", errors="replace")
     except Exception:
         return repr(data)
+
+
+# ----------------------------------------------------------------------- #
+# v1.8.1: official-engine provenance markers for staged proposals
+# ----------------------------------------------------------------------- #
+
+OFFICIAL_GATE_MARKER_SUFFIX = ".gate.json"
+
+
+def _gate_marker_path(staged_path: str | os.PathLike) -> Path:
+    """`<staging>/<skill>.md` -> `<staging>/<skill>.md.gate.json` (not matched
+    by find_staged_proposals, which filters on .md/.proposed suffixes)."""
+    p = Path(staged_path)
+    return p.with_suffix(p.suffix + OFFICIAL_GATE_MARKER_SUFFIX)
+
+
+def write_official_gate_marker(
+    staged_path: str | os.PathLike,
+    *,
+    skill_name: str,
+    gate: dict[str, Any] | None = None,
+) -> Path:
+    """Record that a staged proposal was produced (and gate-accepted) by the
+    OFFICIAL Sleep engine.
+
+    v1.8.1: provenance used to live only in auto-loop in-process state
+    (``state["last_engine"]``), which is per-skill-last-run — multi-skill
+    ticks could mark a direct-engine proposal as official-gated or vice
+    versa, and the manual /adopt path had no way to know at all. The
+    marker travels WITH the proposal file. Best-effort: never raises.
+    """
+    marker = _gate_marker_path(staged_path)
+    payload = {
+        "official_gated": True,
+        "skill": skill_name,
+        "proposal_id": Path(staged_path).stem,
+        "gate_action": (gate or {}).get("gate_action"),
+        "baseline_score": (gate or {}).get("baseline_score"),
+        "candidate_score": (gate or {}).get("candidate_score"),
+        "written_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    try:
+        marker.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return marker
+
+
+def read_official_gate_marker(staged_path: str | os.PathLike) -> dict[str, Any] | None:
+    """Return the official-gate marker dict for a staged proposal, or None
+    when absent/unreadable (i.e. the proposal is NOT official-gated)."""
+    marker = _gate_marker_path(staged_path)
+    if not marker.is_file():
+        return None
+    try:
+        data = json.loads(marker.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def clear_official_gate_marker(staged_path: str | os.PathLike) -> None:
+    """Remove the marker after the proposal has been consumed (adopted)."""
+    try:
+        marker = _gate_marker_path(staged_path)
+        if marker.exists():
+            marker.unlink()
+    except Exception:
+        pass
+
+
+def rotate_log_if_large(path: str | os.PathLike, max_bytes: int = 5_000_000) -> bool:
+    """Rotate a plugin log to `<name>.1` when it exceeds max_bytes.
+
+    v1.8.1: plugin logs (auto_loop.log, inner_loop.log, governance.log,
+    adoptions.log, post_adopt.log) previously grew without bound and some
+    were fully re-read on every check. One rotated generation is kept;
+    older data is dropped. Best-effort: never raises.
+    """
+    try:
+        p = Path(path)
+        if not p.is_file() or p.stat().st_size < max_bytes:
+            return False
+        rotated = p.with_suffix(p.suffix + ".1")
+        try:
+            if rotated.exists():
+                rotated.unlink()
+        except OSError:
+            pass
+        os.replace(p, rotated)
+        # Recreate an empty live log so readers never see a missing file
+        # (append-mode writers would recreate it, but tailing readers
+        # between rotations would not).
+        try:
+            p.touch()
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def enforce_run_log_retention() -> int:
+    """Prune old `sleep-*.log` run logs per `max_runs_retained` (0 disables).
+
+    v1.8.1: the `max_runs_retained` config key existed but no code read it,
+    so every cycle left a log behind forever. Best-effort: never raises.
+    """
+    try:
+        keep = int(merged_config().get("max_runs_retained", 10) or 0)
+    except Exception:
+        keep = 10
+    if keep <= 0:
+        return 0
+    try:
+        logs = sorted(
+            runs_dir().glob("sleep-*.log"),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+    except Exception:
+        return 0
+    removed = 0
+    for p in logs[keep:]:
+        try:
+            p.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 # ----------------------------------------------------------------------- #

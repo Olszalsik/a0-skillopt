@@ -122,7 +122,12 @@ def _judge_model(model: str | None) -> str:
     if env_model:
         return env_model
     _ensure_path()
-    from helpers import direct_optimizer  # type: ignore
+    # v1.8.1: two-path import — the bare `helpers` resolves to the
+    # framework's helpers package in the framework runtime.
+    try:
+        from usr.plugins.skillopt.helpers import direct_optimizer  # type: ignore
+    except ImportError:
+        from helpers import direct_optimizer  # type: ignore
     return direct_optimizer._default_model()
 
 
@@ -133,11 +138,18 @@ def judge_outcome(rollout: dict[str, Any], *, model: str | None = None) -> dict[
     {label: None, error: ...} on any failure (LLM unreachable, bad response).
     """
     try:
+        # v1.8.1: resolve the model ONCE (the old code called _judge_model
+        # twice — once for the call, once for the recorded field — which
+        # re-read the env file and could record a different model than used).
+        resolved_model = _judge_model(model)
         _ensure_path()
-        from helpers import direct_optimizer  # type: ignore
+        try:
+            from usr.plugins.skillopt.helpers import direct_optimizer  # type: ignore
+        except ImportError:
+            from helpers import direct_optimizer  # type: ignore
         prompt = _build_judge_prompt(rollout)
         raw = direct_optimizer._call_llm(
-            prompt, _judge_model(model), max_tokens=300, system=JUDGE_SYSTEM,
+            prompt, resolved_model, max_tokens=300, system=JUDGE_SYSTEM,
         )
         parsed = _parse_judge_response(raw)
         if parsed.get("label") is None:
@@ -146,7 +158,7 @@ def judge_outcome(rollout: dict[str, Any], *, model: str | None = None) -> dict[
             "label": parsed["label"],
             "confidence": parsed["confidence"],
             "reason": parsed["reason"],
-            "model": _judge_model(model),
+            "model": resolved_model,
         }
     except Exception as e:  # noqa: BLE001
         return {"label": None, "error": f"{type(e).__name__}: {e}"}

@@ -300,6 +300,14 @@ inner_loop_interval_seconds: 60
 inner_loop_max_suggestion_age_seconds: 604800
 inner_loop_min_rollout_confidence: 0.4
 inner_loop_llm_model: ""
+# v1.8.1: the inner-loop LLM endpoint. Previously the tick read a
+# nonexistent `llm_endpoint` key, so without the SKILLOPT_SUGGEST_ENDPOINT
+# env var it always enqueued stub suggestions. Example: http://127.0.0.1:11434/api/generate
+inner_loop_llm_endpoint: ""
+# v1.8.1: bound how many rollout files the inner loop parses per tick
+# (0 = unlimited). Prevents a large backlog from re-reading everything
+# every 60 seconds.
+inner_loop_max_scan_files: 2000
 
 sleep_schedule: "02:00"
 skill_target: "all"

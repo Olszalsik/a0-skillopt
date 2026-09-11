@@ -53,14 +53,21 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
+try:
+    from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
+except ImportError:
+    from helpers import sleep_runner  # type: ignore  # noqa: F401
 
 
-A0_SKILLS_DIR = Path("/a0/usr/skills")
+# v1.8.1: A0_SKILLS_DIR used to be the hardcoded Linux path Path("/a0/usr/skills"),
+# which never exists on Windows — the optimizer always saw an empty current skill
+# there. _read_skill_doc now resolves via sleep_runner.a0_skills_dir() (which
+# honors SKILLOPT_SKILLS_DIR). The constant is kept only so old imports don't break.
+A0_SKILLS_DIR = None  # deprecated (v1.8.1): use sleep_runner.a0_skills_dir()
 
 
 def _read_skill_doc(skill_name: str) -> str:
-    p = A0_SKILLS_DIR / skill_name / "SKILL.md"
+    p = sleep_runner.a0_skills_dir() / skill_name / "SKILL.md"
     if p.is_file():
         return p.read_text(encoding="utf-8")
     return ""
@@ -84,12 +91,10 @@ def _read_env_file() -> dict:
             key = key.strip()
             val = val.strip().strip('"').strip("'")
             if val.startswith("$") or "${" in val:
-                import re
-                pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}\|\$([A-Za-z_][A-Za-z0-9_]*)")
-                def repl(m):
-                    name = m.group(1) or m.group(2)
-                    return os.environ.get(name, m.group(0))
-                val = pattern.sub(repl, val)
+                # v1.8.1: delegate to the FIXED shared expander. The local
+                # copy had the same escaped-pipe regex bug as
+                # sleep_runner._expand_env ($VAR was never expanded).
+                val = sleep_runner._expand_env(val, dict(os.environ))
             out[key] = val
     return out
 
@@ -127,7 +132,7 @@ def _call_llm(prompt: str, model: str, max_tokens: int = 2000, system: str | Non
     if not api_key:
         raise RuntimeError(
             "No LLM API key found. Set OLLAMA_API_KEY in the container env, "
-            "or write it to /a0/usr/plugins/skillopt/logs/runs/.skillopt-env."
+            "or write it to usr/plugins/skillopt/logs/runs/.skillopt-env."
         )
     from openai import OpenAI
     client = OpenAI(base_url=base_url, api_key=api_key)

@@ -34,7 +34,18 @@ class Sleep(ApiHandler):
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
-        extra = ["--skill", skill] if skill else []
+        extra = []
+        # v1.8.1 fix: the official CLI has no `--skill` flag (argparse error);
+        # resolve the skill to its live SKILL.md path (--target-skill-path)
+        # the same way the auto-loop does, and omit when it doesn't exist.
+        if skill:
+            try:
+                from usr.plugins.skillopt.helpers import official_adapter  # type: ignore
+                skill_path = official_adapter._resolve_skill_path(skill)
+            except Exception:
+                skill_path = None
+            if skill_path:
+                extra = ["--target-skill-path", skill_path]
         run = sleep_runner.launch_sleep_subprocess(verb, extra_args=extra)
         run["ok"] = True
         run["timestamp"] = datetime.now(timezone.utc).isoformat()

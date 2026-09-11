@@ -69,13 +69,20 @@ class SkilloptSleep(Tool):
             return self._adopt()
 
         # Async verbs (dry-run, run, harvest) launch a background subprocess.
+        # v1.8.1 fix: the CLI has no `--skill` flag (verified against
+        # microsoft/skillopt — the flag is `--target-skill-path`), so the old
+        # `--skill <name>` extra made the subprocess die on an argparse
+        # error. Resolve the skill to its live SKILL.md path instead, and
+        # omit the flag entirely when the skill dir doesn't exist.
         extra_args: list[str] = []
         if skill:
-            # SkillOpt accepts --skill via env or config; for v1 we pass
-            # it as a positional marker. The actual scoping is done by
-            # the user editing default_config.yaml if they want it
-            # hard-pinned. Future versions will wire --skill through.
-            extra_args += ["--skill", skill]
+            try:
+                from usr.plugins.skillopt.helpers import official_adapter  # type: ignore
+                skill_path = official_adapter._resolve_skill_path(skill)
+            except Exception:
+                skill_path = None
+            if skill_path:
+                extra_args += ["--target-skill-path", skill_path]
 
         run = sleep_runner.launch_sleep_subprocess(verb, extra_args=extra_args)
         return Response(
@@ -138,6 +145,9 @@ class SkilloptSleep(Tool):
         cfg = sleep_runner.merged_config()
         last_log = _latest_sleep_log()
         held_out = sleep_runner.parse_held_out(last_log) if last_log else None
+        # v1.8.1: honour the official-gate provenance marker (see api/adopt.py).
+        marker = sleep_runner.read_official_gate_marker(src)
+        official_gated = bool(marker.get("official_gated")) if marker else False
         ok, reason = sleep_runner.validate_proposal(
             proposed,
             current,
@@ -145,6 +155,7 @@ class SkilloptSleep(Tool):
             min_improvement_pp=float(cfg.get("gate_min_improvement_pp", 0.0)),
             max_shrink_ratio=float(cfg.get("gate_max_shrink_ratio", 0.5)),
             held_out=held_out,
+            official_gated=official_gated,
         )
         if not ok:
             return Response(
@@ -159,6 +170,11 @@ class SkilloptSleep(Tool):
                 break_loop=False,
             )
         target.write_text(proposed, encoding="utf-8")
+        # v1.8.1: proposal consumed — clear its provenance marker.
+        try:
+            sleep_runner.clear_official_gate_marker(src)
+        except Exception:
+            pass
         return Response(
             message=(
                 f"Adopted proposal for skill `{skill_name}`.\n"

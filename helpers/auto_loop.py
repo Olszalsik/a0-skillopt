@@ -179,7 +179,10 @@ class AutoLoopThread(threading.Thread):
                 f"(new_rollouts={new_rollouts}, threshold={min_new}, target={target})"
             )
             try:
-                self._run_cycle_for_eligible_skills(target, cfg, state, rollout_count)
+                self._run_cycle_for_eligible_skills(
+                    target, cfg, state, rollout_count,
+                    records=self._load_rollout_records(),
+                )
             except Exception as e:
                 self._log(f"cycle failed: {e}")
                 _record_error(e, "cycle")
@@ -241,13 +244,37 @@ class AutoLoopThread(threading.Thread):
     # official-engine path is fail-soft: any error returns
     # fallback_to_direct and we retry that skill on the direct optimizer.
 
+    def _load_rollout_records(self) -> list[dict[str, Any]]:
+        """Parse every rollout ONCE per cycle.
+
+        v1.8.1 (optimization): the tick previously re-scanned and re-parsed
+        the whole rollouts dir separately in _candidate_skills AND
+        _build_targeted_prompts (O(N·k) JSON parses per cycle on an
+        unbounded directory). One scan is now threaded through both.
+        """
+        out: list[dict[str, Any]] = []
+        try:
+            for rp in sleep_runner.rollouts_dir().glob("*.json"):
+                try:
+                    r = json.loads(rp.read_text(encoding="utf-8", errors="replace"))
+                except Exception:
+                    continue
+                if isinstance(r, dict):
+                    out.append(r)
+        except Exception as e:
+            self._log(f"rollout scan failed: {e}")
+        return out
+
     def _run_cycle_for_eligible_skills(
         self, target: str | None, cfg: dict[str, Any],
         state: dict[str, Any], rollout_count: int,
+        records: list[dict[str, Any]] | None = None,
     ) -> None:
         """Gate candidate skills, then run the official or direct engine."""
         use_official = bool(cfg.get("use_official_engine", True))
-        candidates = self._candidate_skills(target)
+        if records is None:
+            records = self._load_rollout_records()
+        candidates = self._candidate_skills(target, records=records)
         if not candidates:
             self._log("auto-loop: no skills with rollouts to optimize")
             return
@@ -272,7 +299,7 @@ class AutoLoopThread(threading.Thread):
         # Only consumed by the direct path (the official engine does not
         # take free-form prompts). We still build them so the direct
         # fallback / direct-only path uses them.
-        custom_prompts = self._build_targeted_prompts(target)
+        custom_prompts = self._build_targeted_prompts(target, records=records)
 
         ran_engine: str | None = None
         for skill in eligible:
@@ -285,8 +312,13 @@ class AutoLoopThread(threading.Thread):
             )
             # Drain inner-loop suggestions only when the direct path
             # actually consumed them (official path doesn't take prompts).
+            # v1.8.1: only the CONSUMED ids are drained; unconsumed ones
+            # stay queued for the next cycle.
             if engine_used == "direct" and result.get("ok"):
-                self._drain_consumed_suggestions([skill], cfg)
+                self._drain_consumed_suggestions(
+                    [skill], cfg,
+                    consumed_ids=(custom_prompts.get(skill) or {}).get("consumed_ids"),
+                )
             # Per-skill cadence + budget bookkeeping (best-effort).
             self._mark_skill_cycle(skill, cfg)
             state["last_cycle_at"] = time.time()
@@ -335,7 +367,10 @@ class AutoLoopThread(threading.Thread):
                 )
         # Direct optimizer (the existing working path, also the fallback).
         from usr.plugins.skillopt.helpers import direct_optimizer  # type: ignore
-        cp = custom_prompts.get(skill)
+        # v1.8.1: custom_prompts values are now {"prompt", "consumed_ids"};
+        # accept a plain string too for backwards compatibility.
+        cp_entry = custom_prompts.get(skill)
+        cp = cp_entry.get("prompt") if isinstance(cp_entry, dict) else cp_entry
         res = direct_optimizer.optimize_skill(
             skill, min_rollouts=int(cfg.get("auto_loop_min_rollouts", 3)),
             custom_prompt=cp,
@@ -343,16 +378,17 @@ class AutoLoopThread(threading.Thread):
         res["engine"] = "direct"
         return res
 
-    def _candidate_skills(self, target: str | None) -> list[str]:
-        """Skills with rollouts. A configured target is the only candidate."""
+    def _candidate_skills(self, target: str | None, records: list[dict[str, Any]] | None = None) -> list[str]:
+        """Skills with rollouts. A configured target is the only candidate.
+
+        v1.8.1: accepts preloaded rollout records (single scan per cycle).
+        """
         if target:
             return [target]
         out: set[str] = set()
-        for rp in sleep_runner.rollouts_dir().glob("*.json"):
-            try:
-                r = json.loads(rp.read_text(encoding="utf-8", errors="replace"))
-            except Exception:
-                continue
+        if records is None:
+            records = self._load_rollout_records()
+        for r in records:
             sk = (r.get("skill_used") or "").strip()
             if sk:
                 out.add(sk)
@@ -459,8 +495,11 @@ class AutoLoopThread(threading.Thread):
     # v1.3.0 (Day-4 item 4) - inner-loop integration
     # ----------------------------------------------------------------- #
 
-    def _build_targeted_prompts(self, target: str | None) -> dict[str, str]:
-        """Return {skill_name: targeted_prompt} for skills with pending suggestions.
+    def _build_targeted_prompts(
+        self, target: str | None,
+        records: list[dict[str, Any]] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return {skill_name: {"prompt": str, "consumed_ids": [rollout_id...]}}.
 
         Per the inner-loop contract: inner_loop writes to
         logs/runs/suggestions/; the outer loop reads via
@@ -469,12 +508,16 @@ class AutoLoopThread(threading.Thread):
         generic 'rewrite the whole skill' prompt for that skill only.
         Skills without suggestions keep the default behavior.
 
+        v1.8.1: the value is now a dict carrying the CONSUMED rollout ids
+        alongside the prompt, so _drain_consumed_suggestions can delete
+        only what was actually used instead of the whole queue.
+
         A bug here can never crash the cycle - we swallow all errors
         and return an empty dict, which makes the direct optimizer
         fall back to the generic prompt (the documented v1.3.0
         fallback).
         """
-        out: dict[str, str] = {}
+        out: dict[str, dict[str, Any]] = {}
         try:
             from usr.plugins.skillopt.helpers import inner_loop  # type: ignore
         except Exception as e:
@@ -483,13 +526,12 @@ class AutoLoopThread(threading.Thread):
         # Collect the set of skills we'll iterate. If a target is set
         # we only look at that skill; otherwise we look at every skill
         # that has a rollout (so we don't waste effort on empty skills).
+        # v1.8.1: reuses the single per-cycle scan when provided.
         skills_to_consider: set[str] = set()
         try:
-            for rp in sleep_runner.rollouts_dir().glob("*.json"):
-                try:
-                    r = json.loads(rp.read_text(encoding="utf-8", errors="replace"))
-                except Exception:
-                    continue
+            if records is None:
+                records = self._load_rollout_records()
+            for r in records:
                 sk = (r.get("skill_used") or "").strip()
                 if not sk:
                     continue
@@ -539,18 +581,29 @@ class AutoLoopThread(threading.Thread):
                     prompt = prompt + "\n\n" + ctx
             except Exception as e:
                 self._log(f"failure_memory.build_failure_context({skill}) failed: {e}")
-            out[skill] = prompt
+            out[skill] = {
+                "prompt": prompt,
+                # v1.8.1: the ids actually consumed (top-N by confidence).
+                "consumed_ids": [
+                    str(p.get("rollout_id") or "") for p in pending if p.get("rollout_id")
+                ],
+            }
         return out
 
-    def _drain_consumed_suggestions(self, skills: list[str], cfg: dict[str, Any]) -> None:
+    def _drain_consumed_suggestions(
+        self, skills: list[str], cfg: dict[str, Any],
+        consumed_ids: list[str] | None = None,
+    ) -> None:
         """After a cycle consumes suggestions, delete them so the queue stays bounded.
 
-        We don't drain suggestions we DIDN'T consume (different skill
-        in a multi-skill cycle, or suggestions the optimizer rejected
-        for low confidence). Those stay in the queue for the next
-        cycle. Anything older than max_age_seconds is treated as
-        stale and dropped - it was a hint the outer loop never acted
-        on.
+        v1.8.1: passes the consumed rollout ids through to
+        inner_loop.drain_suggestions(keep_ids=...) so only the CONSUMED
+        suggestions are deleted; unconsumed ones stay queued for the next
+        cycle (previously the whole queue was wiped, silently dropping the
+        suggestions below build_targeted_prompt's top-N). We still don't
+        drain suggestions of a DIFFERENT skill in a multi-skill cycle.
+        Anything older than max_age_seconds is treated as stale and
+        dropped - it was a hint the outer loop never acted on.
         """
         try:
             from usr.plugins.skillopt.helpers import inner_loop  # type: ignore
@@ -559,7 +612,9 @@ class AutoLoopThread(threading.Thread):
         max_age = int(cfg.get("inner_loop_max_suggestion_age_seconds", 7 * 86400))
         for skill in skills:
             try:
-                drained = inner_loop.drain_suggestions(skill, max_age_seconds=max_age)
+                drained = inner_loop.drain_suggestions(
+                    skill, max_age_seconds=max_age, keep_ids=consumed_ids,
+                )
                 if drained:
                     self._log(
                         f"auto-loop: drained {len(drained)} suggestion(s) for skill {skill!r}"
@@ -575,6 +630,26 @@ class AutoLoopThread(threading.Thread):
         staged.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         src = staged[0]
         skill_name = src.stem if src.suffix == ".md" else "unknown"
+
+        # v1.8.1 guard: an official run WITHOUT a concrete target copies its
+        # proposal to staging/best_skill.md; adopting that would create a
+        # bogus usr/skills/best_skill/ skill. Skip such proposals loudly.
+        if skill_name in ("", "unknown", "best_skill"):
+            self._log(
+                f"auto-loop: skipping staged proposal {src.name!r} "
+                f"(no resolvable skill name in the filename)"
+            )
+            return
+
+        # v1.8.1: provenance now comes from the per-proposal marker written
+        # by official_adapter (state["last_engine"] was the engine of the
+        # LAST skill run in the tick, which mismatches on multi-skill ticks).
+        # Fall back to the old state heuristic for pre-marker staged files.
+        marker = sleep_runner.read_official_gate_marker(src)
+        if marker is not None:
+            official_gated = bool(marker.get("official_gated"))
+        else:
+            official_gated = state.get("last_engine") == "official"
 
         # v1.5.0-Dev (Day-5 item 8): per-skill governance. Run BEFORE the
         # gate so an opt-out / immutable / rate-limited skill never even
@@ -618,7 +693,8 @@ class AutoLoopThread(threading.Thread):
         # cheap structural pre-filter (official_gated=True skips the local
         # held-out stage and the advisory A/B harness). The direct
         # optimizer path keeps the full local gate.
-        official_gated = state.get("last_engine") == "official"
+        # (v1.8.1: official_gated is resolved above, from the per-proposal
+        # provenance marker with the state heuristic as legacy fallback.)
         ab_enabled = bool(cfg.get("ab_harness_enabled", False)) and not official_gated
         ok, reason = sleep_runner.validate_proposal(
             proposed,
@@ -674,6 +750,12 @@ class AutoLoopThread(threading.Thread):
 
         if ok:
             target.write_text(proposed, encoding="utf-8")
+            # v1.8.1: the proposal is consumed — clear its provenance marker
+            # so a later manual re-adopt re-runs the full local gate.
+            try:
+                sleep_runner.clear_official_gate_marker(src)
+            except Exception:
+                pass
             state["proposals_adopted"] = int(state.get("proposals_adopted", 0)) + 1
             _save_state(state)
             self._log(f"auto-loop: ADOPTED {skill_name} ({reason})")
@@ -749,6 +831,11 @@ class AutoLoopThread(threading.Thread):
         try:
             log = sleep_runner.runs_dir() / "auto_loop.log"
             log.parent.mkdir(parents=True, exist_ok=True)
+            # v1.8.1: rotate when large instead of growing without bound.
+            try:
+                sleep_runner.rotate_log_if_large(log)
+            except Exception:
+                pass
             with open(log, "a", encoding="utf-8") as f:
                 f.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S%z')}] {msg}\n")
         except Exception:

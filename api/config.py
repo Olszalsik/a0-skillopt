@@ -28,7 +28,10 @@ from usr.plugins.skillopt.helpers import sleep_runner # type: ignore
 
 
 PLUGIN_NAME = "skillopt"
-PLUGIN_DIR = Path("/a0/usr/plugins/skillopt")
+# v1.8.1 fix: the hardcoded Linux path Path("/a0/usr/plugins/skillopt") never
+# exists on Windows, so config.json was silently ignored there. Resolve from
+# the module's own location instead.
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = PLUGIN_DIR / "config.json"
 
 

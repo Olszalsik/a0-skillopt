@@ -125,10 +125,13 @@ def _resolve_skill_path(target: str | None) -> str | None:
     `--target-skill-path` flag wants this real path (NOT a bare skill name).
     Returns None when the skill dir doesn't exist so the caller can omit
     the flag (the engine then evolves whatever skills it finds, or none).
+
+    v1.8.1: resolves via sleep_runner.a0_skills_dir() (which honors the
+    SKILLOPT_SKILLS_DIR override) instead of a hardcoded <a0>/usr/skills.
     """
     if not target:
         return None
-    p = _a0_root() / "usr" / "skills" / target / "SKILL.md"
+    p = sleep_runner.a0_skills_dir() / target / "SKILL.md"
     return str(p) if p.is_file() else None
 
 
@@ -482,6 +485,15 @@ def run_official_sleep_cycle(
             "official_staging_dir": str(staging_dir),
             "gate": verdict,
         }
+    # v1.8.1: write the provenance marker so _auto_adopt / /adopt know this
+    # proposal already passed the official held-out gate (replaces the
+    # per-skill-last-run `state["last_engine"]` heuristic).
+    try:
+        sleep_runner.write_official_gate_marker(
+            dest, skill_name=skill_name, gate=verdict,
+        )
+    except Exception:
+        pass
     try:
         size = dest.stat().st_size
     except Exception:

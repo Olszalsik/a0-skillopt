@@ -2,7 +2,7 @@
 
 > Microsoft SkillOpt text-space skill optimizer, bridged as an Agent Zero self-evolution engine. Harvests the agent's own task rollouts, drives the official `skillopt_sleep` pipeline (or a fallback direct optimizer), gates proposals behind a monotonic validation gate, and stages gated skill edits for human-in-the-loop adoption.
 
-**Version:** 1.8.0 · **Plugin ID:** `skillopt`
+**Version:** 1.8.1 · **Plugin ID:** `skillopt`
 
 ## Purpose
 
@@ -14,14 +14,23 @@ official Microsoft `skillopt_sleep` pipeline instead of a hand-rolled optimizer,
 fixes the silently-broken rollout harvester (it read a nonexistent `loop_data.messages`), adds a
 local counterfactual replay gate (deterministic mock executor + real-executor stub), a
 human-in-the-loop adopt UI (Approve/Reject/Rollback with whole-file snapshots), and auto-opt-in for
-new skills behind a human-approval guardrail. **v1.8.0 implements the two pieces v1.7.0 deliberately
-stubbed — both opt-in and default-off** (v1.7.0 behavior is preserved byte-for-byte unless an operator
+new skills behind a human-approval guardrail. v1.8.0 implements the two pieces v1.7.0 deliberately
+stubbed — both opt-in and default-off (v1.7.0 behavior is preserved byte-for-byte unless an operator
 flips the flags): a subprocess-isolated real A0-agent-loop replay executor, and DistilBERT
 reward-model training fed by an LLM-judge labelling pass, with a calibration step that picks the
 `prefer_model_above` threshold and wires the previously-dead `reward_model_path` /
 `reward_model_prefer_above` config keys.
 
-## Architecture (v1.8.0)
+**v1.8.1 (Windows portability):** fixes every hardcoded `/a0/...` container path that made the
+plugin silently dead on Windows installs. A0 skills now resolve via
+`sleep_runner.a0_skills_dir()` (`<project>/usr/skills`, honoring the `SKILLOPT_SKILLS_DIR`
+override) instead of a hardcoded Linux path in 5 consumers (the framework path resolver, the
+framework-path fallbacks in 5 helper modules, the official-adapter skill resolver, and the
+monologue-start warning banner's last-error file). The logger-rotation helper now recreates an
+empty live log after rotating (append-mode writers already recreated it; readers did not). All
+paths in user-facing strings and staged-proposal instructions are plugin-relative.
+
+## Architecture (v1.8.1)
 
 - **Two-loop:** outer `AutoLoopThread` (`helpers/auto_loop.py`, 600s) + inner `InnerLoopThread`
   (`helpers/inner_loop.py`, 60s suggestion miner).
