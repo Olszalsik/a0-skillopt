@@ -88,6 +88,27 @@ def _runs_dir() -> Path:
     return p
 
 
+def _fallback_skills_dir(here: Path) -> Path:
+    """Best-effort <project>/usr/skills resolution from this file's own
+    location (v1.8.2). Pure path math — no filesystem access — so it is
+    trivially testable. `here` is normally
+    .../usr/plugins/skillopt/helpers/governance.py.
+
+    v1.8.1 regression: the old formula (here.parent.parent.parent /
+    "usr" / "skills") was one parent short and resolved to the bogus
+    <project>/usr/plugins/usr/skills tree, so governance markers created
+    from bare-python contexts (skillopt_trainer subordinate, standalone
+    scripts) landed outside the real skills dir.
+    """
+    for ancestor in here.parents:
+        if ancestor.name == "plugins" and ancestor.parent.name == "usr":
+            return ancestor.parent / "skills"
+    for ancestor in here.parents:
+        if ancestor.name == "skillopt" and ancestor.parent.name == "plugins":
+            return ancestor.parent.parent / "skills"
+    return Path("/a0/usr/skills")
+
+
 def _a0_skills_dir() -> Path:
     """Locate <a0>/usr/skills/. Test override wins, then sleep_runner,
     then a best-effort path walk from the plugin dir."""
@@ -98,9 +119,7 @@ def _a0_skills_dir() -> Path:
         return sleep_runner.a0_skills_dir()
     except Exception:
         here = Path(__file__).resolve()
-        # plugin lives at .../usr/plugins/skillopt/helpers/governance.py
-        # so the skills dir is .../usr/skills
-        return here.parent.parent.parent / "usr" / "skills"
+        return _fallback_skills_dir(here)
 
 
 def _skill_dir(skill_name: str) -> Path:

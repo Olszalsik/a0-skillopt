@@ -2914,17 +2914,17 @@ def t_v150_governance_auto_loop_skip() -> bool:
 _section_v160 = "v1.6.0 NEW (Solution B): official-engine bridge, gate delegation, per-skill gating, side-findings"
 
 
-@test("v1.8.1: version strings aligned across plugin.py / hooks.py / plugin.yaml")
+@test("v1.8.2: version strings aligned across plugin.py / hooks.py / plugin.yaml")
 def t_v170_version_alignment() -> None:
     import re
     plugin_py = (PLUGIN_ROOT / "plugin.py").read_text(encoding="utf-8")
     hooks_py = (PLUGIN_ROOT / "hooks.py").read_text(encoding="utf-8")
     manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
     execute_py = (PLUGIN_ROOT / "execute.py").read_text(encoding="utf-8")
-    assert 'PLUGIN_VERSION = "1.8.1"' in plugin_py, "plugin.py not 1.8.1"
-    assert 'PLUGIN_VERSION = "1.8.1"' in hooks_py, "hooks.py not 1.8.1"
-    assert re.search(r'^version:\s*1\.8\.1', manifest, re.M), "plugin.yaml not 1.8.1"
-    assert 'EXPECTED_VERSION = "1.8.1"' in execute_py, "execute.py not 1.8.1"
+    assert 'PLUGIN_VERSION = "1.8.2"' in plugin_py, "plugin.py not 1.8.2"
+    assert 'PLUGIN_VERSION = "1.8.2"' in hooks_py, "hooks.py not 1.8.2"
+    assert re.search(r'^version:\s*1\.8\.2', manifest, re.M), "plugin.yaml not 1.8.2"
+    assert 'EXPECTED_VERSION = "1.8.2"' in execute_py, "execute.py not 1.8.2"
 
 
 @test("v1.6.1: default_config.yaml declares the official-engine bridge keys")
@@ -4562,6 +4562,40 @@ def t_v18_call_site_real_when_enabled() -> None:
             os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = old_ab
         # restore the suite-wide default the harness header sets
         os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = "1"
+
+
+@test("v1.8.2: governance _a0_skills_dir fallback resolves <project>/usr/skills")
+def t_v182_governance_fallback_skills_dir() -> None:
+    """v1.8.1 regression: the bare-import fallback computed
+    here.parent.parent.parent / 'usr' / 'skills', which from
+    helpers/governance.py lands on <project>/usr/plugins/usr/skills — one
+    level short. The extracted _fallback_skills_dir() must resolve the
+    container layout, portable layouts, renamed plugin dirs, Windows-style
+    drive paths (pure math), and the documented last resort."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from pathlib import Path
+    from helpers.governance import _fallback_skills_dir
+
+    # exact production layout (the v1.8.1 bug)
+    assert _fallback_skills_dir(
+        Path("/a0/usr/plugins/skillopt/helpers/governance.py")
+    ) == Path("/a0/usr/skills")
+    # portable / arbitrary project root
+    assert _fallback_skills_dir(
+        Path("/home/u/a0/usr/plugins/skillopt/helpers/governance.py")
+    ) == Path("/home/u/a0/usr/skills")
+    # renamed plugin dir still resolves via the usr/plugins walk
+    assert _fallback_skills_dir(
+        Path("/x/usr/plugins/renamed/helpers/governance.py")
+    ) == Path("/x/usr/skills")
+    # windows-style drive path (pure path math, no fs access)
+    assert _fallback_skills_dir(
+        Path("E:/proj/usr/plugins/skillopt/helpers/governance.py")
+    ) == Path("E:/proj/usr/skills")
+    # unrecognized layout -> documented last resort
+    assert _fallback_skills_dir(
+        Path("/opt/somewhere/governance.py")
+    ) == Path("/a0/usr/skills")
 
 
 if __name__ == "__main__":
