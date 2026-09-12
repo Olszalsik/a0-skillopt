@@ -132,7 +132,7 @@ def _call_llm(prompt: str, model: str, max_tokens: int = 2000, system: str | Non
     if not api_key:
         raise RuntimeError(
             "No LLM API key found. Set OLLAMA_API_KEY in the container env, "
-            "or write it to usr/plugins/skillopt/logs/runs/.skillopt-env."
+            "or set AZURE_OPENAI_API_KEY in the project usr/.env file.",
         )
     from openai import OpenAI
     client = OpenAI(base_url=base_url, api_key=api_key)

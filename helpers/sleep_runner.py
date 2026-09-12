@@ -766,6 +766,39 @@ def launch_sleep_subprocess(
     }
 
 
+def _dotenv_fallback(env_file: "Path | None" = None) -> dict:
+    """Parse the project's ``usr/.env`` (framework dotenv) as a fallback.
+
+    v1.8.4 SECURITY: optimizer credentials moved from the plugin-local
+    ``logs/runs/.skillopt-env`` (plaintext) to ``<project>/usr/.env``
+    (chmod 600, outside the plugin repo). ``.skillopt-env`` now holds
+    ``$VAR``/``${VAR}`` references only. The live backend or bare-python
+    subprocesses started before the migration (e.g. replay workers) do
+    not carry the referenced names in ``os.environ``, so expansion falls
+    back to parsing the file directly. Portable: resolved relative to
+    this plugin root, no hardcoded paths. Best-effort: on any error
+    returns ``{}`` and the caller keeps the literal ``$VAR`` text.
+    """
+    try:
+        path = env_file or (plugin_root().parent.parent / ".env")
+        if not path.is_file():
+            return {}
+        out: dict = {}
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            out[key.strip()] = val.strip().strip(chr(34)).strip(chr(39))
+        return out
+    except Exception:
+        return {}
+
+
 def _expand_env(val: str, env: dict) -> str:
     """Expand $VAR and ${VAR} references in `val` from `env`.
 
@@ -773,11 +806,27 @@ def _expand_env(val: str, env: dict) -> str:
     (``\\}\\|\\$``), which made it a literal ``${FOO}|$BAR`` match — plain
     ``$VAR`` / ``${VAR}`` references were NEVER expanded. Shared by
     sleep_runner.build_subprocess_env and direct_optimizer._read_env_file.
+
+    v1.8.4: names unresolved in both ``env`` and ``os.environ`` fall back
+    to the project's ``usr/.env`` (framework dotenv), so ``$VAR``
+    indirection also resolves in processes started before the credential
+    migration and in bare-python subprocesses.
     """
     pattern = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+    fallback: dict = {}
+    fallback_loaded = False
+
     def repl(m: "re.Match") -> str:
+        nonlocal fallback, fallback_loaded
         name = m.group(1) or m.group(2)
-        return env.get(name, m.group(0))
+        if name in env:
+            return env[name]
+        if not fallback_loaded:
+            fallback_loaded = True
+            fallback = _dotenv_fallback()
+        if name in fallback:
+            return fallback[name]
+        return m.group(0)
     return pattern.sub(repl, val)
 
 

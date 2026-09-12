@@ -6,6 +6,23 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
+## [1.8.4] — 2026-09-12
+
+### Security: plaintext credentials removed from the plugin tree
+- Optimizer credentials migrated from `logs/runs/.skillopt-env` (plaintext)
+  to the framework's `<project>/usr/.env` (chmod 600, outside the plugin
+  repo, loaded by the framework at startup). `.skillopt-env` now contains
+  `$VAR`/`${VAR}` references only — the file is kept because 12 code paths
+  require it to exist.
+- `sleep_runner._dotenv_fallback()`: portable `<project>/usr/.env` parser
+  wired into the shared `_expand_env`, so indirection resolves in the live
+  backend (a pre-migration process) and in bare-python subprocesses
+  (replay workers) that lack the names in `os.environ`. No hardcoded
+  paths; the v1.8.1 Windows-portability contract is preserved.
+- `direct_optimizer`: the no-API-key error now points to `usr/.env`.
+- Smoke suite: +3 tests (fallback parser, indirection expansion with a
+  monkeypatched fallback, live env-file reference check).
+
 ## [1.8.3] — 2026-09-12
 
 ### Fixed

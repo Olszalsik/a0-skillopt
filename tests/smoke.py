@@ -2914,17 +2914,17 @@ def t_v150_governance_auto_loop_skip() -> bool:
 _section_v160 = "v1.6.0 NEW (Solution B): official-engine bridge, gate delegation, per-skill gating, side-findings"
 
 
-@test("v1.8.2: version strings aligned across plugin.py / hooks.py / plugin.yaml")
+@test("v1.8.4: version strings aligned across plugin.py / hooks.py / plugin.yaml")
 def t_v170_version_alignment() -> None:
     import re
     plugin_py = (PLUGIN_ROOT / "plugin.py").read_text(encoding="utf-8")
     hooks_py = (PLUGIN_ROOT / "hooks.py").read_text(encoding="utf-8")
     manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
     execute_py = (PLUGIN_ROOT / "execute.py").read_text(encoding="utf-8")
-    assert 'PLUGIN_VERSION = "1.8.2"' in plugin_py, "plugin.py not 1.8.2"
-    assert 'PLUGIN_VERSION = "1.8.2"' in hooks_py, "hooks.py not 1.8.2"
-    assert re.search(r'^version:\s*1\.8\.2', manifest, re.M), "plugin.yaml not 1.8.2"
-    assert 'EXPECTED_VERSION = "1.8.2"' in execute_py, "execute.py not 1.8.2"
+    assert 'PLUGIN_VERSION = "1.8.4"' in plugin_py, "plugin.py not 1.8.4"
+    assert 'PLUGIN_VERSION = "1.8.4"' in hooks_py, "hooks.py not 1.8.4"
+    assert re.search(r'^version:\s*1\.8\.4', manifest, re.M), "plugin.yaml not 1.8.4"
+    assert 'EXPECTED_VERSION = "1.8.4"' in execute_py, "execute.py not 1.8.4"
 
 
 @test("v1.6.1: default_config.yaml declares the official-engine bridge keys")
@@ -4597,6 +4597,74 @@ def t_v182_governance_fallback_skills_dir() -> None:
         Path("/opt/somewhere/governance.py")
     ) == Path("/a0/usr/skills")
 
+
+# ----------------------------------------------------------------------
+# v1.8.4 — SECURITY: env indirection + usr/.env fallback
+# ----------------------------------------------------------------------
+
+@test("v1.8.4 SECURITY: _dotenv_fallback parses a framework-style .env")
+def t_v184_dotenv_fallback_parses() -> None:
+    import sys as _sys
+    import tempfile
+    from pathlib import Path
+    _sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers.sleep_runner import _dotenv_fallback
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / ".env"
+        f.write_text(
+            "# comment\n"
+            "SKILLOPT_T184_A=plain\n"
+            'export SKILLOPT_T184_B="quoted"\n'
+            "SKILLOPT_T184_C='single'\n"
+            "SKILLOPT_T184_EMPTY=\n",
+            encoding="utf-8",
+        )
+        fb = _dotenv_fallback(f)
+        assert fb.get("SKILLOPT_T184_A") == "plain"
+        assert fb.get("SKILLOPT_T184_B") == "quoted"
+        assert fb.get("SKILLOPT_T184_C") == "single"
+        assert fb.get("SKILLOPT_T184_EMPTY") == ""
+        assert _dotenv_fallback(Path(td) / "missing.env") == {}
+
+
+@test("v1.8.4 SECURITY: $VAR indirection resolves through usr/.env fallback")
+def t_v184_expand_env_indirection() -> None:
+    import sys as _sys
+    _sys.path.insert(0, str(PLUGIN_ROOT))
+    import helpers.sleep_runner as _sr
+    # explicit env wins
+    assert _sr._expand_env("$SKILLOPT_T184", {"SKILLOPT_T184": "one"}) == "one"
+    assert _sr._expand_env("${SKILLOPT_T184}", {"SKILLOPT_T184": "one"}) == "one"
+    # undefined name passes through loudly (never silently emptied)
+    assert _sr._expand_env("$SKILLOPT_T184_UNDEF", {}) == "$SKILLOPT_T184_UNDEF"
+    # fallback resolution via monkeypatched loader (portable, no real .env)
+    orig = _sr._dotenv_fallback
+    _sr._dotenv_fallback = lambda: {"SKILLOPT_T184": "from_fallback"}
+    try:
+        assert _sr._expand_env("$SKILLOPT_T184", {}) == "from_fallback"
+        assert _sr._expand_env("${SKILLOPT_T184}", {}) == "from_fallback"
+        assert _sr._expand_env("$SKILLOPT_T184_MISSING", {}) == "$SKILLOPT_T184_MISSING"
+    finally:
+        _sr._dotenv_fallback = orig
+
+
+@test("v1.8.4 SECURITY: .skillopt-env holds references only; values resolve")
+def t_v184_env_file_indirection_live() -> None:
+    import sys as _sys
+    _sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import sleep_runner as _sr
+    envf = PLUGIN_ROOT / "logs" / "runs" / ".skillopt-env"
+    if not envf.is_file():
+        print(" (skip: no .skillopt-env on this install)")
+        return
+    for line in envf.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if s.startswith("export "):
+            k, _, v = s[7:].partition("=")
+            expected = "${" + k.strip() + "}"
+            assert v.strip() == expected, "plaintext value remains in " + k
+    resolved = _sr.build_subprocess_env()
+    assert bool(resolved.get("AZURE_OPENAI_API_KEY")), "indirection did not resolve"
 
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
