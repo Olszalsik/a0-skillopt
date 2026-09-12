@@ -421,3 +421,18 @@ def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
         sr.write_rollout(record)
     except Exception as e:
         log.debug("[skillopt] write_rollout failed: %s", e)
+
+# v1.8.3 fix (root cause of the v1.8.2 dashboard zeros): the A0 loader
+# (helpers.modules.load_classes_from_folder) only discovers Extension
+# subclasses, so the bare module-level execute() above was never
+# dispatched by the live runtime. execute() stays for the smoke suite;
+# the wrapper class below delegates to it.
+try:
+    from helpers.extension import Extension as _SkilloptExtension
+except Exception:
+    _SkilloptExtension = object
+
+
+class SkilloptHarvestRollout(_SkilloptExtension):
+    def execute(self, *args, **kwargs):
+        return execute(*args, **kwargs)

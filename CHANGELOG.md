@@ -6,6 +6,12 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
+## [1.8.3] — 2026-09-12
+
+### Fixed
+- **Extension hooks were silently never dispatched by the live runtime — the root cause of the v1.8.2 dashboard showing zeros.** The A0 extension loader (`helpers.modules.load_classes_from_folder`) only discovers `Extension` subclasses, but all four skillopt hooks were bare module-level `execute()` functions: present in the tree, discoverable by nothing. No auto-loop start, no rollout harvest, no loop-error warnings, no discovery banner ever fired in a live backend, while the smoke suite kept passing because it calls `execute()` directly and masked the dead wiring. Each hook file now also defines a delegating `Extension` subclass (SkilloptAutoLoopStarter, SkilloptLoopErrorWarn, SkilloptHarvestRollout, SkilloptDiscoveryBanner) that the loader discovers and dispatches; the module-level `execute()` implementations are unchanged and remain the single source of truth, so direct callers (and the smoke suite) keep working.
+- **Process-wide thread guards in the auto-loop starter.** The loader re-imports the extension module per profile/project, resetting the module-level `_watchdog_thread` global, so duplicate `skillopt-auto-loop` and `skillopt-auto-loop-watchdog` threads could accumulate across contexts. Both start paths now dedupe by live thread name before spawning.
+
 ## [1.8.1] — 2026-08-11
 
 **Windows portability — every hardcoded `/a0/...` container path fixed.** The plugin was

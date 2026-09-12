@@ -89,6 +89,11 @@ def _start_loop_if_needed() -> None:
         except Exception as e:
             log.warning("[skillopt] cannot import auto_loop: %s", e)
             return
+        # v1.8.3 process-wide guard: the A0 loader re-imports this
+        # module per profile/project; dedupe by live thread name.
+        import threading as _sk_th
+        if any(th.name == 'skillopt-auto-loop' and th.is_alive() for th in _sk_th.enumerate()):
+            return
         _loop_thread = auto_loop.AutoLoopThread(get_config=_get_config)
         _loop_thread.start()
         log.info(
@@ -146,6 +151,11 @@ def _start_watchdog() -> None:
     if _watchdog_thread is not None and _watchdog_thread.is_alive():
         log.debug("[skillopt] watchdog already running")
         return
+    # v1.8.3 process-wide guard: the A0 loader re-imports this
+    # module per profile/project; dedupe by live thread name.
+    import threading as _sk_th
+    if any(th.name == 'skillopt-auto-loop-watchdog' and th.is_alive() for th in _sk_th.enumerate()):
+        return
     _watchdog_thread = threading.Thread(
         target=_watchdog_loop,
         name="skillopt-auto-loop-watchdog",
@@ -176,3 +186,19 @@ def execute(**kwargs):  # type: ignore[no-untyped-def]
     if os.environ.get("SKILLOPT_REPLAY_MODE"):
         return
     _start_watchdog()
+
+
+# v1.8.3 fix (root cause of the v1.8.2 dashboard zeros): the A0 loader
+# (helpers.modules.load_classes_from_folder) only discovers Extension
+# subclasses, so the bare module-level execute() above was never
+# dispatched by the live runtime. execute() stays for the smoke suite;
+# the wrapper class below delegates to it.
+try:
+    from helpers.extension import Extension as _SkilloptExtension
+except Exception:
+    _SkilloptExtension = object
+
+
+class SkilloptAutoLoopStarter(_SkilloptExtension):
+    def execute(self, *args, **kwargs):
+        return execute(*args, **kwargs)

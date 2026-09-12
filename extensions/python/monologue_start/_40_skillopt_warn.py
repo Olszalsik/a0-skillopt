@@ -95,3 +95,19 @@ def execute(*args, banners=None, **kwargs):  # type: ignore[no-untyped-def]
         "dismissible": True,
         "source": "backend",
     })
+
+
+# v1.8.3 fix (root cause of the v1.8.2 dashboard zeros): the A0 loader
+# (helpers.modules.load_classes_from_folder) only discovers Extension
+# subclasses, so the bare module-level execute() above was never
+# dispatched by the live runtime. execute() stays for the smoke suite;
+# the wrapper class below delegates to it.
+try:
+    from helpers.extension import Extension as _SkilloptExtension
+except Exception:
+    _SkilloptExtension = object
+
+
+class SkilloptLoopErrorWarn(_SkilloptExtension):
+    def execute(self, *args, **kwargs):
+        return execute(*args, **kwargs)
