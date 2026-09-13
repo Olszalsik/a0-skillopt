@@ -33,4 +33,7 @@ tags:
   - agents
   - prompting
   - development
-  - automation
+  - automationscreenshots:
+  - https://raw.githubusercontent.com/Olszalsik/a0-skillopt/main/docs/screenshot-config.png
+  - https://raw.githubusercontent.com/Olszalsik/a0-skillopt/main/docs/screenshot-settings.png
+  - https://raw.githubusercontent.com/Olszalsik/a0-skillopt/main/docs/screenshot-main.png
