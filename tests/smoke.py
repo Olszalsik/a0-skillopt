@@ -2914,17 +2914,17 @@ def t_v150_governance_auto_loop_skip() -> bool:
 _section_v160 = "v1.6.0 NEW (Solution B): official-engine bridge, gate delegation, per-skill gating, side-findings"
 
 
-@test("v1.8.4: version strings aligned across plugin.py / hooks.py / plugin.yaml")
+@test("v1.8.5: version strings aligned across plugin.py / hooks.py / plugin.yaml")
 def t_v170_version_alignment() -> None:
     import re
     plugin_py = (PLUGIN_ROOT / "plugin.py").read_text(encoding="utf-8")
     hooks_py = (PLUGIN_ROOT / "hooks.py").read_text(encoding="utf-8")
     manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
     execute_py = (PLUGIN_ROOT / "execute.py").read_text(encoding="utf-8")
-    assert 'PLUGIN_VERSION = "1.8.4"' in plugin_py, "plugin.py not 1.8.4"
-    assert 'PLUGIN_VERSION = "1.8.4"' in hooks_py, "hooks.py not 1.8.4"
-    assert re.search(r'^version:\s*1\.8\.4', manifest, re.M), "plugin.yaml not 1.8.4"
-    assert 'EXPECTED_VERSION = "1.8.4"' in execute_py, "execute.py not 1.8.4"
+    assert 'PLUGIN_VERSION = "1.8.5"' in plugin_py, "plugin.py not 1.8.4"
+    assert 'PLUGIN_VERSION = "1.8.5"' in hooks_py, "hooks.py not 1.8.4"
+    assert re.search(r'^version:\s*1\.8\.5', manifest, re.M), "plugin.yaml not 1.8.4"
+    assert 'EXPECTED_VERSION = "1.8.5"' in execute_py, "execute.py not 1.8.4"
 
 
 @test("v1.6.1: default_config.yaml declares the official-engine bridge keys")
@@ -4665,6 +4665,72 @@ def t_v184_env_file_indirection_live() -> None:
             assert v.strip() == expected, "plaintext value remains in " + k
     resolved = _sr.build_subprocess_env()
     assert bool(resolved.get("AZURE_OPENAI_API_KEY")), "indirection did not resolve"
+
+# ----------------------------------------------------------------------
+# v1.8.5 — SECURITY: credential-safe setup (references, never plaintext)
+# ----------------------------------------------------------------------
+
+@test('v1.8.5 SECURITY: build writes refs; sanitize rewrites plaintext')
+def t_v185_setup_env_build_sanitize() -> None:
+    import sys as _sys
+    _sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import setup_env as se
+    Q = chr(34)
+    NL = chr(10)
+    block = se.build_env_block(
+        'openai_compatible',
+        {'OPENAI_API_KEY': 'sentinel-not-a-real-credential'},
+    )
+    assert block['AZURE_OPENAI_API_KEY'] == '${OPENAI_API_KEY}'
+    assert block['AZURE_OPENAI_AUTH_MODE'] == 'openai_compatible'
+    assert block['AZURE_OPENAI_API_VERSION'] == '2024-12-01-preview'
+    assert block['SKILLOPT_BACKEND'] == 'openai_compatible'
+    line1 = 'export SKILLOPT_OPTIMIZER_MODEL=' + Q + 'minimax-m3' + Q
+    line2 = 'export AZURE_OPENAI_API_KEY=' + Q + 'fake-credential-value-000' + Q
+    text = line1 + NL + line2 + NL
+    new, fixed = se.sanitize_env_text(text, {})
+    assert fixed == ['AZURE_OPENAI_API_KEY']
+    assert 'fake-credential-value-000' not in new
+    assert 'export AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}' in new
+    assert line1 in new
+    ref = 'export AZURE_OPENAI_API_KEY=${OPENAI_API_KEY}' + NL
+    new2, fixed2 = se.sanitize_env_text(ref, {})
+    assert fixed2 == []
+    assert new2 == ref
+    prov, fixed3 = se.sanitize_env_text(
+        text, {'OPENAI_API_KEY': 'fake-credential-value-000'}
+    )
+    assert 'export AZURE_OPENAI_API_KEY=${OPENAI_API_KEY}' in prov
+    assert fixed3 == ['AZURE_OPENAI_API_KEY']
+
+
+@test('v1.8.5 SECURITY: apply merges, sanitizes, atomic 0600, idempotent')
+def t_v185_setup_env_apply() -> None:
+    import stat as _stat
+    import sys as _sys
+    import tempfile as _tempfile
+    _sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import setup_env as se
+    Q = chr(34)
+    NL = chr(10)
+    with _tempfile.TemporaryDirectory() as td:
+        envf = Path(td) / '.skillopt-env'
+        envf.write_text(
+            'export SKILLOPT_OPTIMIZER_MODEL=' + Q + 'minimax-m3' + Q + NL
+            + 'export AZURE_OPENAI_API_KEY=' + Q + 'AAAA-not-a-real-credential' + Q + NL
+        )
+        result = se.apply('openai_compatible', env_file=envf)
+        assert result['ok'], result.get('error')
+        text = envf.read_text(encoding='utf-8')
+        assert 'AAAA-not-a-real-credential' not in text
+        assert ('export AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}' in text) or ('export AZURE_OPENAI_API_KEY=${OPENAI_API_KEY}' in text)
+        assert 'SKILLOPT_OPTIMIZER_MODEL=' + Q + 'minimax-m3' + Q in text
+        assert 'AZURE_OPENAI_AUTH_MODE=openai_compatible' in text
+        assert _stat.S_IMODE(envf.stat().st_mode) == 0o600
+        assert 'AZURE_OPENAI_API_KEY' in result['fixed']
+        assert result['path'] == str(envf)
+        again = se.apply('openai_compatible', env_file=envf)
+        assert again['ok'] and again['fixed'] == []
 
 if __name__ == "__main__":
     # Print the section headers once at the top of the run

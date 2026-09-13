@@ -6,6 +6,24 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
+## [1.8.5] — 2026-09-12
+
+### Security: skillopt_setup can no longer write plaintext credentials
+- NEW helpers/setup_env.py — credential-safe env-file builder/sanitizer:
+mapped source vars are written as ${SOURCE_NAME} references (resolved at
+consumption time via the shared sleep_runner._expand_env: os.environ
+first, then the v1.8.4 usr/.env fallback). Only non-secret literals
+(api version, auth mode, backend) are written verbatim.
+- Sanitize pass: any plaintext credential value found in an existing
+.skillopt-env is rewritten to a reference (provenance match against
+visible source variables when possible, self-${KEY} otherwise);
+merge-preserving so unrelated keys survive re-runs.
+- Atomic write (tmp + os.replace) with 0600 permissions.
+- Dry-run output now contains key NAMES and resolution booleans only —
+it previously echoed full plaintext values into the chat transcript.
+- Smoke suite: +2 v1.8.5 security tests (build/sanitize with provenance
+and idempotency; apply end-to-end with merge preservation and 0600).
+
 ## [1.8.4] — 2026-09-12
 
 ### Security: plaintext credentials removed from the plugin tree

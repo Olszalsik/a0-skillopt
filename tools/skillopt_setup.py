@@ -3,64 +3,32 @@
 SkillOpt has an env-var naming gotcha: it reuses the `AZURE_OPENAI_*`
 family for plain OpenAI, and `AZURE_OPENAI_ENDPOINT` is required for
 every OpenAI auth mode. This tool reads A0's existing chat-LLM env
-(usually `A0_CHAT_LLM_*` or a `chat_llm` provider config) and writes
-the equivalent SkillOpt env into a small `.skillopt-env` file in the
+and writes the equivalent SkillOpt env into `.skillopt-env` in the
 plugin's runs dir. The next `skillopt_sleep` invocation will `source`
 this file automatically.
 
+v1.8.5 SECURITY: credential values are NEVER written to `.skillopt-env`.
+Mapped keys are written as `${SOURCE_NAME}` references (resolution via
+`sleep_runner._expand_env`: os.environ first, then the framework
+usr/.env fallback). Credential values live only in `<project>/usr/.env`
+(chmod 600, outside the plugin repo). Dry-run output contains key NAMES
+and resolution booleans only — never values. An existing plaintext
+credential found in the file is rewritten to a reference by the
+sanitize pass. See helpers/setup_env.py.
+
 Args:
-  backend: auto | azure_openai | openai_compatible | claude | qwen | minimax
-  dry_run: true | false (default false)
+ backend: auto | azure_openai | openai_compatible | claude | qwen | minimax
+ dry_run: true | false (default false)
 """
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 from helpers.tool import Response, Tool  # type: ignore
 
-from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
-
-
-ENV_FILENAME = ".skillopt-env"
-
-
-# Common A0 env var names (vary by deployment — extend as needed)
-A0_VAR_MAP = {
-    # A0 chat LLM endpoint and key
-    "A0_CHAT_LLM_BASE_URL": "AZURE_OPENAI_ENDPOINT",
-    "A0_CHAT_LLM_API_KEY": "AZURE_OPENAI_API_KEY",
-    "A0_LLM_API_KEY": "AZURE_OPENAI_API_KEY",
-    "OPENAI_API_KEY": "AZURE_OPENAI_API_KEY",
-    "OPENAI_BASE_URL": "AZURE_OPENAI_ENDPOINT",
-    "ANTHROPIC_API_KEY": "ANTHROPIC_API_KEY",
-}
-
-
-def _build_env_block(backend: str) -> dict[str, str]:
-    """Map A0's env into SkillOpt's expected variable names."""
-    out: dict[str, str] = {}
-    for src_var, dst_var in A0_VAR_MAP.items():
-        v = os.environ.get(src_var)
-        if v:
-            out[dst_var] = v
-
-    # Azure API version has a sensible default; keep whatever A0 exposes
-    if not out.get("AZURE_OPENAI_API_VERSION"):
-        out["AZURE_OPENAI_API_VERSION"] = os.environ.get(
-            "A0_CHAT_LLM_API_VERSION", "2024-12-01-preview"
-        )
-
-    # Pick the right auth mode for the requested backend
-    if backend == "openai_compatible":
-        out["AZURE_OPENAI_AUTH_MODE"] = "openai_compatible"
-    elif backend == "azure_openai":
-        # Default to API key; user can override by setting the env var themselves
-        out.setdefault("AZURE_OPENAI_AUTH_MODE", "api_key")
-    # claude / qwen / minimax use the backend's own vars (already mapped above)
-
-    return out
+try:
+    from usr.plugins.skillopt.helpers import setup_env, sleep_runner  # type: ignore
+except Exception:  # dev/test import path
+    from helpers import setup_env, sleep_runner  # type: ignore
 
 
 class SkilloptSetup(Tool):
@@ -68,50 +36,70 @@ class SkilloptSetup(Tool):
         backend = (self.args.get("backend") or "auto").lower()
         dry_run = str(self.args.get("dry_run") or "").lower() in ("1", "true", "yes")
 
-        if backend not in ("auto", "azure_openai", "openai_compatible", "claude", "qwen", "minimax"):
+        if backend not in setup_env.BACKENDS:
             return Response(
-                message=f"Unknown backend: {backend!r}. Valid: auto, azure_openai, openai_compatible, claude, qwen, minimax.",
+                message=(
+                    f"Unknown backend: {backend!r}. "
+                    f"Valid: {', '.join(setup_env.BACKENDS)}."
+                ),
                 break_loop=False,
             )
 
+        names = setup_env._source_names()
         if backend == "auto":
-            # Pick the first backend whose key is present in the env
             for candidate in ("openai_compatible", "azure_openai", "claude", "qwen", "minimax"):
-                env = _build_env_block(candidate)
-                if env.get("AZURE_OPENAI_API_KEY") or env.get("ANTHROPIC_API_KEY"):
+                block = setup_env.build_env_block(candidate, names)
+                if any(str(v).startswith("${") for v in block.values()):
                     backend = candidate
                     break
             else:
                 backend = "openai_compatible"
 
-        env = _build_env_block(backend)
-        env["SKILLOPT_BACKEND"] = backend
-
-        target = sleep_runner.runs_dir() / ENV_FILENAME
-        body = "\n".join(f'export {k}="{v}"' for k, v in env.items()) + "\n"
-
         if dry_run:
+            block = setup_env.build_env_block(backend, names)
+            refs = [
+                (
+                    k
+                    + " -> "
+                    + ("resolves" if setup_env.ref_resolves(v) else "UNRESOLVED (add to usr/.env)")
+                )
+                for k, v in sorted(block.items())
+                if str(v).startswith("${")
+            ]
+            literals = [k for k, v in sorted(block.items()) if not str(v).startswith("${")]
             return Response(
                 message=(
-                    f"[dry-run] Would write {len(env)} env vars to {target}:\n\n"
-                    + body
+                    "[dry-run] Would write key REFERENCES to "
+                    f"{sleep_runner.runs_dir() / setup_env.ENV_FILENAME}"
+                    " (no plaintext values):\n"
+                    + "\n".join(refs)
+                    + "\nLiterals (non-secret): "
+                    + ", ".join(literals)
                     + f"\nBackend: {backend}"
                 ),
                 break_loop=False,
             )
 
-        sleep_runner.runs_dir().mkdir(parents=True, exist_ok=True)
-        target.write_text(body, encoding="utf-8")
-
-        # Also surface the merged config for transparency
+        result = setup_env.apply(backend)
+        if not result.get("ok"):
+            return Response(
+                message=f"Setup failed: {result.get('error')}", break_loop=False
+            )
         cfg = sleep_runner.merged_config()
         cfg["backend"] = backend
         return Response(
             message=(
-                f"Setup complete. Backend={backend}, env written to {target}.\n"
-                f"Use `skillopt_sleep verb=run` to start a cycle — it will "
-                f"`source` this file automatically.\n\n"
-                f"Vars set ({len(env)}): {', '.join(sorted(env.keys()))}"
+                f"Setup complete. Backend={result['backend']}, env written to "
+                f"{result['path']} (atomic, chmod 600).\n"
+                "Credential keys were written as ${VAR} references; values live "
+                "in the project usr/.env only.\n"
+                f"Keys ({len(result['keys'])}): {', '.join(result['keys'])}\n"
+                "Sanitized (plaintext -> reference): "
+                + (", ".join(result["fixed"]) or "none")
+                + "\nUnresolved references (add these names to usr/.env): "
+                + (", ".join(result["unresolved"]) or "none")
+                + "\nUse `skillopt_sleep verb=run` to start a cycle — it will "
+                "`source` this file automatically."
             ),
             break_loop=False,
         )
