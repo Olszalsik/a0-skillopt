@@ -417,7 +417,7 @@ These need answers before items 4-6 can land:
 
 This roadmap lives at the plugin root. The CHANGELOG.md tracks what has actually shipped. The smoke test in `usr/workdir/skillopt-plugin/` is the live signal that the loop still works.
 
-Last updated: 2026-08-31 (post v1.8.0 live verification).
+Last updated: 2026-09-13 (item 9 public release: hub PR #512 open, CI validate PASS).
 
 ### Status addendum (2026-08-31, post v1.8.0 live verification)
 
@@ -426,3 +426,11 @@ Last updated: 2026-08-31 (post v1.8.0 live verification).
 - **Solution B live follow-up: DONE** — `skillopt_sleep` 0.2.0 confirmed installed in the A0 venv; `probe_official(force=True)` returns `available=true, error=null`. The adapter bridge now runs against the installed package, not just the source tree.
 - **Smoke suite**: 133/133 green (all pre-existing v1.2.0/v1.5.0 isolation failures + the v1.6.1 package-presence assumption fixed; replay namespace fix committed as `91e8999`).
 - **Still open**: item 8 formal completion (per-skill policy scopes), item 9 public release (steps 2–5: plugin review, hub PR, release tag, hub listing), open questions 2/3/5 (failure-memory backup, budget cap tuning, stuck-skill indicator).
+
+### Status addendum (2026-09-13, item 9 public release)
+
+- **Release tag v1.8.5: PUSHED** — commit 489358f (annotated tag on origin); repo public with MIT LICENSE at root; `plugin.yaml` `name: skillopt` verified by hub CI.
+- **Screenshots published** — docs/screenshot-main|settings|config.png on origin/main; main shot cropped right of the sidebar so private chat titles are not exposed; fail-state capture pruned.
+- **Plugin Hub PR: OPEN + CI PASS** — agent0ai/a0-plugins#512 (branch `add-skillopt` @ b41bb85), `validate` = success. Root cause of the first failure: branch built on a stale fork main, so the validator's two-dot diff saw multiple modified plugin folders; fixed by rebuilding the branch as one clean commit on fresh upstream main.
+- **Hub listing** — pending maintainer review/merge of #512 (auto-updates the generated index on merge).
+- **Fork hygiene** — Olszalsik/a0-plugins `main` synced to upstream main (cf2f7c7) via the merge-upstream API for future submissions.
