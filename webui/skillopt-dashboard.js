@@ -106,6 +106,25 @@
       });
     },
 
+  /**
+   * v1.8.8 (open question 5): one-click pause/resume.
+   * - governancePause(skill, hours) -> POST /governance_pause
+   *   writes the .skillopt.pause_until marker (default 24h, clamped
+   *   0.25h..720h) so the governance gate skips the skill at once.
+   * - governanceResume(skill) removes the marker immediately.
+   */
+  governancePause(skill, hours) {
+    const body = { skill: String(skill || ''), action: 'pause' };
+    const h = Number(hours);
+    if (Number.isFinite(h) && h > 0) body.hours = h;
+    return call('/governance_pause', { body: body });
+  },
+  governanceResume(skill) {
+    return call('/governance_pause', {
+      body: { skill: String(skill || ''), action: 'resume' },
+    });
+  },
+
     /**
      * Per-cycle dashboard — Day-5 item 7.
      * Reads the most recent N cycle_history.jsonl entries (newest-first)

@@ -468,3 +468,16 @@ Last updated: 2026-09-14 (open questions 2 + 3 shipped as v1.8.7).
   unchanged; auto_loop logs the soft warning to the cadence log.
   `soft_warn_pct: 0` disables the soft tier entirely.
 - **Still open**: open question 5 one-click UI, item 9 hub merge (PR #512 open).
+
+### Status addendum (2026-09-14, open question 5 one-click UI shipped as v1.8.8)
+
+- **Open question 5 (one-click pause/resume): DONE** - governance
+  helpers `pause_skill(skill, hours=24)` / `resume_skill(skill)`, the
+  name-validated `/governance_pause` endpoint, dashboard JS methods,
+  and config.html UI (Pause 24h / Resume buttons per opted-in skill,
+  `Paused: N` stat, per-skill paused chip) wired to the `paused` list
+  already surfaced by governance_status. Verified: smoke 144/144,
+  framework-runtime compile OK, node --check OK.
+- **Still open**: item 9 hub merge (PR #512 open); first live gated
+  cycle (needs A0 restart to load v1.8.8 and a reachable LLM endpoint).
+

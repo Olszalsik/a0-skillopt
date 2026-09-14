@@ -2921,10 +2921,10 @@ def t_v170_version_alignment() -> None:
     hooks_py = (PLUGIN_ROOT / "hooks.py").read_text(encoding="utf-8")
     manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
     execute_py = (PLUGIN_ROOT / "execute.py").read_text(encoding="utf-8")
-    assert 'PLUGIN_VERSION = "1.8.7"' in plugin_py, "plugin.py not 1.8.7"
-    assert 'PLUGIN_VERSION = "1.8.7"' in hooks_py, "hooks.py not 1.8.7"
-    assert re.search(r'^version:\s*1\.8\.7', manifest, re.M), "plugin.yaml not 1.8.7"
-    assert 'EXPECTED_VERSION = "1.8.7"' in execute_py, "execute.py not 1.8.7"
+    assert 'PLUGIN_VERSION = "1.8.8"' in plugin_py, "plugin.py not 1.8.7"
+    assert 'PLUGIN_VERSION = "1.8.8"' in hooks_py, "hooks.py not 1.8.7"
+    assert re.search(r'^version:\s*1\.8\.8', manifest, re.M), "plugin.yaml not 1.8.7"
+    assert 'EXPECTED_VERSION = "1.8.8"' in execute_py, "execute.py not 1.8.7"
 
 
 @test('v1.8.7: budget soft tier warns once at threshold, hard gate intact')
@@ -4789,6 +4789,107 @@ def t_v185_setup_env_apply() -> None:
         assert result['path'] == str(envf)
         again = se.apply('openai_compatible', env_file=envf)
         assert again['ok'] and again['fixed'] == []
+
+
+
+@test('v1.8.8 OQ5: pause_skill blocks eligibility, resume_skill clears')
+def t_v188_pause_skill_roundtrip() -> None:
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+    from helpers import governance
+    tmp = _tempfile.mkdtemp(prefix='v188smoke_pause_')
+    prev = governance._TEST_SKILLS_DIR
+    try:
+        governance.set_skills_dir_for_tests(_Path(tmp))
+        sd = governance._skill_dir('skillA')
+        (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+        base_elig, base_reason = governance.check_skill_eligible('skillA')
+        res = governance.pause_skill('skillA', 1)
+        assert res.get('ok') is True, 'pause_skill failed: %r' % (res,)
+        marker = sd / '.skillopt.pause_until'
+        assert marker.is_file(), 'pause marker missing'
+        assert float(marker.read_text(encoding='utf-8').strip()) > 0
+        elig, reason = governance.check_skill_eligible('skillA')
+        assert reason == 'paused_until_marker', 'expected pause block, got %r (base %r)' % ((elig, reason), (base_elig, base_reason))
+        status = governance.get_governance_status()
+        if str(status.get('skills_dir') or '') == str(tmp):
+            paused_list = status.get('paused') or []
+            assert 'skillA' in paused_list, 'paused list: %r' % (paused_list,)
+        res2 = governance.resume_skill('skillA')
+        assert res2.get('ok') is True and res2.get('was_paused') is True, 'resume failed: %r' % (res2,)
+        assert not marker.exists(), 'marker still present after resume'
+        elig2, reason2 = governance.check_skill_eligible('skillA')
+        assert (elig2, reason2) == (base_elig, base_reason), 'post-resume %r != base %r' % ((elig2, reason2), (base_elig, base_reason))
+    finally:
+        governance.set_skills_dir_for_tests(prev)
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test('v1.8.8 OQ5: governance_pause API pause/resume + name validation')
+def t_v188_governance_pause_api() -> None:
+    import asyncio
+    import importlib.util as _ilu
+    import shutil as _shutil
+    import sys as _sys
+    import os as _os
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+    from helpers import governance
+    spec = _ilu.spec_from_file_location(
+        'skillopt_api_governance_pause',
+        str(PLUGIN_ROOT / 'api' / 'governance_pause.py'))
+    assert spec is not None and spec.loader is not None
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    tmp = _tempfile.mkdtemp(prefix='v188smoke_apipause_')
+    a0_root = str(PLUGIN_ROOT.parents[2])
+    if a0_root not in _sys.path:
+        _sys.path.insert(0, a0_root)
+    old_env = _os.environ.get('SKILLOPT_SKILLS_DIR')
+    _os.environ['SKILLOPT_SKILLS_DIR'] = tmp
+    mods = [governance]
+    try:
+        from usr.plugins.skillopt.helpers import governance as _gov2
+        if _gov2 is not governance:
+            mods.append(_gov2)
+    except Exception:
+        pass
+    prevs = []
+    try:
+        for _g in mods:
+            prevs.append((_g, getattr(_g, '_TEST_SKILLS_DIR', None)))
+            _g.set_skills_dir_for_tests(_Path(tmp))
+        handler = mod.GovernancePause()
+        bad = asyncio.run(handler.process({'skill': '../escape', 'action': 'pause'}, None))
+        assert bad.get('ok') is False, 'traversal name not rejected: %r' % (bad,)
+        r1 = asyncio.run(handler.process({'skill': 'skillB', 'action': 'pause', 'hours': 2}, None))
+        assert r1.get('ok') is True, 'api pause failed: %r' % (r1,)
+        marker = governance._skill_dir('skillB') / '.skillopt.pause_until'
+        assert marker.is_file(), 'marker missing after api pause'
+        r2 = asyncio.run(handler.process({'skill': 'skillB', 'action': 'resume'}, None))
+        assert r2.get('ok') is True, 'api resume failed: %r' % (r2,)
+        assert not marker.exists(), 'marker still present after api resume'
+    finally:
+        for _g, _p in prevs:
+            _g.set_skills_dir_for_tests(_p)
+        if old_env is None:
+            _os.environ.pop('SKILLOPT_SKILLS_DIR', None)
+        else:
+            _os.environ['SKILLOPT_SKILLS_DIR'] = old_env
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+@test('v1.8.8 OQ5: dashboard UI wiring for pause/resume')
+def t_v188_ui_wiring() -> None:
+    html = (PLUGIN_ROOT / 'webui' / 'config.html').read_text(encoding='utf-8')
+    js = (PLUGIN_ROOT / 'webui' / 'skillopt-dashboard.js').read_text(encoding='utf-8')
+    for needle in ('/governance_pause', 'governancePause(s, 24)', 'governanceResume(s)', 'Paused:', 'async governancePause(', 'async governanceResume('):
+        assert needle in html, 'config.html missing %r' % needle
+    for needle in ('governancePause(skill, hours)', 'governanceResume(skill)'):
+        assert needle in js, 'dashboard js missing %r' % needle
+    head = (PLUGIN_ROOT / 'extensions' / 'webui' / 'page-head' / 'skillopt-head.html').read_text(encoding='utf-8')
+    assert 'cb=2' in head, 'cache-bust missing'
+
 
 if __name__ == "__main__":
     # Print the section headers once at the top of the run

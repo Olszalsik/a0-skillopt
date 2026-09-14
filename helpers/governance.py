@@ -573,6 +573,59 @@ def get_governance_status() -> dict[str, Any]:
         return {"available": False, "enabled": True, "error": str(e)}
 
 
+
+# ----------------------------------------------------------------------- #
+# One-click pause/resume (v1.8.8, roadmap open question 5)
+# ----------------------------------------------------------------------- #
+
+def pause_skill(skill_name: str, hours: float = 24.0) -> dict[str, Any]:
+    # v1.8.8: write .skillopt.pause_until (epoch seconds). The marker is
+    # the same gate check_skill_eligible step 1.5 already honors, so the
+    # auto-loop skips the skill immediately. hours clamped 0.25..720.
+    try:
+        if not skill_name:
+            return {'ok': False, 'error': 'missing skill'}
+        try:
+            _h = float(hours)
+        except (TypeError, ValueError):
+            _h = 24.0
+        _h = min(max(_h, 0.25), 720.0)
+        until = time.time() + _h * 3600.0
+        sd = _skill_dir(skill_name)
+        if _TEST_SKILLS_DIR is None and not sd.is_dir():
+            return {'ok': False, 'error': 'unknown skill dir'}
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / '.skillopt.pause_until').write_text(str(until), encoding='utf-8')
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            _iso = _dt.now(_tz.utc).isoformat()
+        except Exception:
+            _iso = ''
+        _append_log({'event': 'pause', 'skill': skill_name,
+                     'until_ts': until, 'until_iso': _iso,
+                     'hours': _h, 'by': 'dashboard'})
+        return {'ok': True, 'skill': skill_name, 'until': until, 'hours': _h}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+
+def resume_skill(skill_name: str) -> dict[str, Any]:
+    # v1.8.8: remove .skillopt.pause_until (idempotent). was_paused tells
+    # the caller whether a marker was actually removed.
+    try:
+        if not skill_name:
+            return {'ok': False, 'error': 'missing skill'}
+        marker = _skill_dir(skill_name) / '.skillopt.pause_until'
+        was = marker.is_file()
+        if was:
+            marker.unlink()
+        _append_log({'event': 'resume', 'skill': skill_name,
+                     'was_paused': was, 'by': 'dashboard'})
+        return {'ok': True, 'skill': skill_name, 'was_paused': was}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+
 def reset_for_tests() -> None:
     """Wipe test state. Called by smoke tests in setUp/tearDown."""
     set_skills_dir_for_tests(None)

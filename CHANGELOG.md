@@ -6,6 +6,25 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
+## [1.8.8] - 2026-09-14
+
+### Open question 5: one-click dashboard pause/resume (ROADMAP)
+- Governance helpers: `pause_skill(skill, hours=24)` writes the
+  `.skillopt.pause_until` skip marker (epoch or ISO-8601, both
+  supported since v1.8.6) and `resume_skill(skill)` removes it;
+  both are idempotent and log to governance.log.
+- New endpoint `POST /api/plugins/skillopt/governance_pause`
+  (api/governance_pause.py): validates skill names (path traversal
+  rejected), routes to the helpers, returns `{ok, skill, hours}`.
+- Dashboard JS: `governancePause(skill, hours)` and
+  `governanceResume(skill)` methods delegating to the endpoint.
+- Config UI (Governance card): Pause 24h / Resume buttons per
+  opted-in skill, a `Paused: N` stat, and a per-skill paused chip,
+  reading the `paused` list already surfaced by governance_status
+  (no backend change needed).
+- page-head cache-bust bumped (cb=2).
+- Tests: +2 v1.8.8 smoke tests (pause/resume roundtrip + API
+  validation; dashboard UI wiring). Suite: 144 tests.
 ## [1.8.7] - 2026-09-14
 
 ### Open questions 2 + 3: failure-memory backups + budget soft tier (ROADMAP)
