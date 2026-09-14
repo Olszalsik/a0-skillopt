@@ -32,6 +32,7 @@ from typing import Any
 DEFAULT_DAILY_CAP_CENTS = 100
 DEFAULT_COST_PER_CALL_CENTS = 1
 DEFAULT_RESET_HOUR_UTC = 0
+DEFAULT_SOFT_WARN_PCT = 80  # v1.8.7 soft tier (percent of cap; 0 = off)
 
 _NEW_PREFIX = "budget_"
 _NEW_SUFFIX = ".json"
@@ -79,12 +80,14 @@ class BudgetTracker:
         daily_cap_cents: int = DEFAULT_DAILY_CAP_CENTS,
         reset_hour_utc: int = DEFAULT_RESET_HOUR_UTC,
         cost_per_call_cents: int = DEFAULT_COST_PER_CALL_CENTS,
+        soft_warn_pct: int = DEFAULT_SOFT_WARN_PCT,
         state_dir: str | Path | None = None,
     ) -> None:
         self.skill_name = (skill_name.strip().lower() if skill_name else None) or None
         self.daily_cap_cents = max(0, int(daily_cap_cents))
         self.reset_hour_utc = int(reset_hour_utc) % 24
         self.cost_per_call_cents = max(0, int(cost_per_call_cents))
+        self.soft_warn_pct = max(0, int(soft_warn_pct))
         self._state_dir = Path(state_dir) if state_dir else _default_state_dir()
         self._state_dir.mkdir(parents=True, exist_ok=True)
         # In-process cache; loaded on first access
@@ -105,6 +108,7 @@ class BudgetTracker:
             "daily_total_cents": 0,
             "reset_at": self._next_reset_after(time.time()),
             "blocked_calls": 0,
+            "soft_warned": False,
         }
 
     def _load(self) -> dict[str, Any]:
@@ -184,6 +188,7 @@ class BudgetTracker:
         if ts >= reset_at and reset_at > 0:
             state["daily_total_cents"] = 0
             state["blocked_calls"] = 0
+            state["soft_warned"] = False
             state["reset_at"] = self._next_reset_after(ts)
             self._save()
 
@@ -220,11 +225,20 @@ class BudgetTracker:
         self._maybe_rollover(now)
         state = self._load()
         state["daily_total_cents"] = int(state.get("daily_total_cents") or 0) + c
+        # v1.8.7 soft tier: one warning per day when the threshold is crossed.
+        soft_warning = False
+        if (self.daily_cap_cents > 0 and self.soft_warn_pct > 0
+                and not state.get("soft_warned")):
+            _th = self.daily_cap_cents * self.soft_warn_pct // 100
+            if _th > 0 and int(state["daily_total_cents"]) >= _th:
+                state["soft_warned"] = True
+                soft_warning = True
         self._save()
         return {
             "recorded": c,
             "new_total": int(state["daily_total_cents"]),
             "day": time.strftime("%Y-%m-%d", time.gmtime(now)),
+            "soft_warning": soft_warning,
         }
 
     def get_status(self) -> dict[str, Any]:
@@ -232,6 +246,7 @@ class BudgetTracker:
         total = int(state.get("daily_total_cents") or 0)
         cap = self.daily_cap_cents
         cap_pct = (total / cap * 100.0) if cap > 0 else 0.0
+        soft_threshold = (cap * self.soft_warn_pct // 100) if (cap > 0 and self.soft_warn_pct > 0) else 0
         return {
             "daily_total_cents": total,
             "daily_cap_cents": cap,
@@ -239,6 +254,9 @@ class BudgetTracker:
             "reset_at": float(state.get("reset_at") or 0.0),
             "blocked_calls": int(state.get("blocked_calls") or 0),
             "skill_name": self.skill_name or "global",
+            "soft_warn_pct": self.soft_warn_pct,
+            "soft_threshold_cents": soft_threshold,
+            "soft_triggered": bool(soft_threshold > 0 and total >= soft_threshold),
         }
 
     def reset_for_tests(self) -> None:

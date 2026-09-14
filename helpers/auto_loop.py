@@ -463,7 +463,8 @@ class AutoLoopThread(threading.Thread):
         # Budget: can we spend one more LLM call on this skill today?
         if budget is not None:
             try:
-                bt = budget.BudgetTracker(skill_name=skill)
+                soft_pct = int(cfg.get("budget", {}).get("soft_warn_pct", 80) or 0)
+                bt = budget.BudgetTracker(skill_name=skill, soft_warn_pct=soft_pct)
                 cost = int(cfg.get("budget", {}).get("cost_per_call_cents", 1) or 1)
                 ok, reason = bt.can_spend(cost)
                 if not ok:
@@ -485,9 +486,16 @@ class AutoLoopThread(threading.Thread):
                 self._log(f"cadence state save failed for {skill!r}: {e}")
         if budget is not None:
             try:
-                bt = budget.BudgetTracker(skill_name=skill)
+                soft_pct = int(cfg.get("budget", {}).get("soft_warn_pct", 80) or 0)
+                bt = budget.BudgetTracker(skill_name=skill, soft_warn_pct=soft_pct)
                 cost = int(cfg.get("budget", {}).get("cost_per_call_cents", 1) or 1)
-                bt.record_spend(cost)
+                _res = bt.record_spend(cost)
+                if _res.get("soft_warning"):
+                    self._log(
+                        f"budget soft warning for {skill!r}: "
+                        f"{_res.get('new_total')}c spent "
+                        f"(cap {bt.daily_cap_cents}c, soft {bt.soft_warn_pct}%)"
+                    )
             except Exception as e:
                 self._log(f"budget record failed for {skill!r}: {e}")
 

@@ -2914,17 +2914,75 @@ def t_v150_governance_auto_loop_skip() -> bool:
 _section_v160 = "v1.6.0 NEW (Solution B): official-engine bridge, gate delegation, per-skill gating, side-findings"
 
 
-@test("v1.8.6: version strings aligned across plugin.py / hooks.py / plugin.yaml")
+@test("v1.8.7: version strings aligned across plugin.py / hooks.py / plugin.yaml")
 def t_v170_version_alignment() -> None:
     import re
     plugin_py = (PLUGIN_ROOT / "plugin.py").read_text(encoding="utf-8")
     hooks_py = (PLUGIN_ROOT / "hooks.py").read_text(encoding="utf-8")
     manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
     execute_py = (PLUGIN_ROOT / "execute.py").read_text(encoding="utf-8")
-    assert 'PLUGIN_VERSION = "1.8.6"' in plugin_py, "plugin.py not 1.8.6"
-    assert 'PLUGIN_VERSION = "1.8.6"' in hooks_py, "hooks.py not 1.8.6"
-    assert re.search(r'^version:\s*1\.8\.6', manifest, re.M), "plugin.yaml not 1.8.6"
-    assert 'EXPECTED_VERSION = "1.8.6"' in execute_py, "execute.py not 1.8.6"
+    assert 'PLUGIN_VERSION = "1.8.7"' in plugin_py, "plugin.py not 1.8.7"
+    assert 'PLUGIN_VERSION = "1.8.7"' in hooks_py, "hooks.py not 1.8.7"
+    assert re.search(r'^version:\s*1\.8\.7', manifest, re.M), "plugin.yaml not 1.8.7"
+    assert 'EXPECTED_VERSION = "1.8.7"' in execute_py, "execute.py not 1.8.7"
+
+
+@test('v1.8.7: budget soft tier warns once at threshold, hard gate intact')
+def t_v187_budget_soft_tier() -> None:
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from helpers import budget
+    tmp = _tempfile.mkdtemp(prefix='v187smoke_budget_')
+    try:
+        bt = budget.BudgetTracker(skill_name='smoke', daily_cap_cents=10,
+                                  soft_warn_pct=50, state_dir=tmp)
+        r1 = bt.record_spend(4)
+        assert r1['soft_warning'] is False, r1
+        r2 = bt.record_spend(4)
+        assert r2['soft_warning'] is True, r2
+        r3 = bt.record_spend(4)
+        assert r3['soft_warning'] is False, r3
+        st = bt.get_status()
+        assert st['soft_threshold_cents'] == 5, st
+        assert st['soft_triggered'] is True, st
+        ok, _reason = bt.can_spend(1)
+        assert ok is False, 'hard gate must still block over the cap'
+    finally:
+        _shutil.rmtree(tmp, ignore_errors=True)
+
+@test('v1.8.7: failure memory keeps rolling backups with keep-N rotation')
+def t_v187_fm_backup_rotation() -> None:
+    import json as _json
+    import os as _os
+    import shutil as _shutil
+    from helpers import failure_memory
+    baks = PLUGIN_ROOT / 'logs' / 'runs' / 'failure_memory_backups'
+    store = PLUGIN_ROOT / 'logs' / 'runs' / 'failure_memory'
+    old_keep = _os.environ.get('SKILLOPT_FM_BACKUP_KEEP')
+    _os.environ['SKILLOPT_FM_BACKUP_KEEP'] = '3'
+    failure_memory.reset_for_tests()
+    try:
+        for i in range(5):
+            r = failure_memory.record_failure('smoke_skill', 's%d' % i,
+                                              'reason %d' % i)
+            assert r['ok'] is True, r
+        d = baks / 'smoke_skill'
+        snaps = [p for p in d.glob('*.json') if p.name != 'latest.json']
+        assert len(snaps) == 3, 'expected 3 snapshots, got %d' % len(snaps)
+        latest = _json.loads((d / 'latest.json').read_text(encoding='utf-8'))
+        assert latest['metadata']['proposal_summary'] == 's4', latest['metadata']
+        _os.environ['SKILLOPT_FM_BACKUP_KEEP'] = '0'
+        rz = failure_memory.record_failure('smoke_skill', 'sz', 'rz')
+        assert rz['ok'] is True, rz
+        assert rz.get('backup') is None, rz
+    finally:
+        failure_memory.reset_for_tests()
+        if old_keep is None:
+            _os.environ.pop('SKILLOPT_FM_BACKUP_KEEP', None)
+        else:
+            _os.environ['SKILLOPT_FM_BACKUP_KEEP'] = old_keep
+        _shutil.rmtree(baks, ignore_errors=True)
+        _shutil.rmtree(store, ignore_errors=True)
 
 
 @test("v1.6.1: default_config.yaml declares the official-engine bridge keys")

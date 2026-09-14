@@ -6,6 +6,24 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
+## [1.8.7] - 2026-09-14
+
+### Open questions 2 + 3: failure-memory backups + budget soft tier (ROADMAP)
+- Budget two-tier cap: `budget.soft_warn_pct` (default 80) adds a soft
+  warning tier in `BudgetTracker.record_spend` (`soft_warning` flag) and
+  `get_status` (`soft_threshold_cents`, `soft_triggered`); the hard gate
+  at 100% of the daily cap is unchanged. auto_loop logs the soft warning
+  into the cadence log; `soft_warn_pct: 0` disables the soft tier.
+- Failure-memory rolling backup: every successful `record_failure` now
+  writes a timestamped per-skill snapshot plus an atomic `latest.json`
+  mirror under `logs/runs/failure_memory_backups/<skill>/`, keep-last-N
+  via `failure_memory_backup_keep` (default 5; env `SKILLOPT_FM_BACKUP_KEEP`
+  wins; 0 disables). The backup path is returned as `backup`; restore =
+  copy a snapshot back over the local store. Never crashes the record path.
+- New smoke tests: budget soft tier (warn-once-at-threshold, hard gate,
+  disable switch) and backup rotation (keep-3-of-5, latest.json mirror,
+  keep-0 kill switch). Version pins aligned at 1.8.7.
+
 ## [1.8.6] - 2026-09-14
 
 ### Governance and gate: item 8 per-skill policy scopes (ROADMAP)

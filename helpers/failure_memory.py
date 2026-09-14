@@ -90,6 +90,7 @@ def _config() -> dict[str, Any]:
         "max_per_skill": int(
             cfg.get("failure_memory_max_per_skill", DEFAULT_MAX_PER_SKILL)
         ),
+            "backup_keep": _backup_keep(),
     }
     if os.environ.get("SKILLOPT_FAILURE_MEMORY_ENABLED"):
         out["enabled"] = os.environ["SKILLOPT_FAILURE_MEMORY_ENABLED"].strip().lower() in (
@@ -131,6 +132,93 @@ def _local_store_dir(skill_name: str | None = None) -> Path:
         base = base / safe
     base.mkdir(parents=True, exist_ok=True)
     return base
+
+
+# ----------------------------------------------------------------------- #
+# v1.8.7: rolling backup of failure records (open question 3)
+# ----------------------------------------------------------------------- #
+
+DEFAULT_BACKUP_KEEP = 5
+
+
+def _backup_keep() -> int:
+    "Resolve failure_memory_backup_keep (config key; env wins). 0 = off."
+    keep = DEFAULT_BACKUP_KEEP
+    try:
+        from helpers.sleep_runner import merged_config  # type: ignore
+        _val = merged_config().get("failure_memory_backup_keep")
+        if _val is not None:
+            keep = int(_val)
+    except Exception:
+        pass
+    _env = os.environ.get("SKILLOPT_FM_BACKUP_KEEP", "").strip()
+    if _env.isdigit():
+        keep = int(_env)
+    try:
+        return max(0, keep)
+    except Exception:
+        return 0
+
+
+def _backup_dir(skill_name: str) -> Path:
+    base = _runs_dir() / "failure_memory_backups"
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", str(skill_name))[:64] or "unknown"
+    d = base / safe
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def backup_failure_record(
+    skill_name: str,
+    text: str,
+    metadata: dict[str, Any],
+    memory_id: str,
+) -> dict[str, Any]:
+    "Snapshot one failure record; rotate keep-last-N. Never raises."
+    out: dict[str, Any] = {"ok": False, "skill": skill_name}
+    try:
+        keep = _backup_keep()
+        if keep <= 0:
+            out["skipped"] = True
+            return out
+        d = _backup_dir(skill_name)
+        ts = float((metadata or {}).get("ts") or time.time())
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(ts))
+        mid = re.sub(r"[^A-Za-z0-9_\-]", "_", str(memory_id))[:40] or "noid"
+        payload = {
+            "memory_id": str(memory_id),
+            "skill": skill_name,
+            "area": DEFAULT_AREA,
+            "text": text,
+            "metadata": dict(metadata or {}),
+            "backed_up_at": time.time(),
+        }
+        snap = d / (stamp + "_" + mid + ".json")
+        tmp = d / (snap.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, snap)
+        latest = d / "latest.json"
+        tmp2 = d / ("latest.json.tmp." + mid)
+        tmp2.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp2, latest)
+        snaps = sorted(
+            (p for p in d.glob("*.json") if p.name != "latest.json"),
+            key=lambda p: (p.stat().st_mtime, p.name),
+        )
+        excess = len(snaps) - keep
+        removed = 0
+        for old in snaps[:max(0, excess)]:
+            try:
+                old.unlink()
+                removed += 1
+            except OSError:
+                pass
+        out["ok"] = True
+        out["path"] = str(snap)
+        out["kept"] = len(snaps) - removed
+    except Exception as e:
+        out["error"] = type(e).__name__ + ": " + str(e)
+    return out
 
 
 # ----------------------------------------------------------------------- #
@@ -433,9 +521,14 @@ def record_failure(
         memory_id=str(memory_id),
         backend=kind,
     )
+    # v1.8.7: best-effort rolling backup; never blocks the record.
+    _bk = backup_failure_record(skill_name, text, metadata, str(memory_id))
+    if not _bk.get("ok") and not _bk.get("skipped"):
+        log.debug("[skillopt] failure backup failed: %s", _bk)
     return {
         "ok": True,
         "memory_id": str(memory_id),
+        "backup": _bk.get("path"),
         "skill": skill_name,
         "ts": metadata["ts"],
         "backend": kind,

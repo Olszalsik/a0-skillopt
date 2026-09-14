@@ -153,6 +153,7 @@ failure_memory_max_age_days: 30
 # A0 store is unbounded; this only affects the local JSON fallback.
 # Default 100.
 failure_memory_max_per_skill: 100
+failure_memory_backup_keep: 5
 
 # =====================================================================
 # REWARD MODEL (v1.2.0 — Day-3, item 3)
@@ -331,6 +332,7 @@ budget:
   daily_cap_cents: 100
   cost_per_call_cents: 1
   reset_hour_utc: 0
+  soft_warn_pct: 80
 
 # ----------------------------------------------------------------------- #
 # Cycle history (Day-5 item 7)

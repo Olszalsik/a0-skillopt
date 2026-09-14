@@ -417,7 +417,7 @@ These need answers before items 4-6 can land:
 
 This roadmap lives at the plugin root. The CHANGELOG.md tracks what has actually shipped. The smoke test in `usr/workdir/skillopt-plugin/` is the live signal that the loop still works.
 
-Last updated: 2026-09-14 (item 8 formal completion: per-skill policy scopes).
+Last updated: 2026-09-14 (open questions 2 + 3 shipped as v1.8.7).
 
 ### Status addendum (2026-08-31, post v1.8.0 live verification)
 
@@ -448,9 +448,23 @@ Last updated: 2026-09-14 (item 8 formal completion: per-skill policy scopes).
   window) is surfaced in the status snapshot; `.pause_until` now accepts
   ISO dates (the skip mechanism). The one-click dashboard part remains
   UI-side.
-- **Still open**: open question 2 (failure-memory backup; proposal: daily
-  local export to `<plugin>/backups/failure_memory-YYYY-MM-DD.jsonl.gz`,
-  keep 14 days, restore via re-import), open question 3 (per-skill budget
-  cap; proposal: default `daily_budget_cents: 200`, a documented
-  per-deployment knob), open question 5 one-click UI, item 9 hub merge
-  (PR #512 open).
+- **Still open**: open question 5 one-click UI (dashboard button),
+  item 9 hub merge (PR #512 open).
+
+### Status addendum (2026-09-14, open questions 2 + 3 shipped as v1.8.7)
+
+- **Open question 2 (failure-memory backup): DONE** - every successful
+  `record_failure` writes a timestamped per-skill snapshot plus an atomic
+  `latest.json` mirror under `logs/runs/failure_memory_backups/<skill>/`;
+  keep-last-N via `failure_memory_backup_keep` (default 5, env
+  `SKILLOPT_FM_BACKUP_KEEP` wins, 0 disables); restore = copy a snapshot
+  back over the store. Verified: keep-3-of-5 rotation, latest.json mirror,
+  kill switch (smoke + functional check).
+- **Open question 3 (per-skill budget cap): DONE (two-tier)** -
+  `BudgetTracker` gains `soft_warn_pct` (config `budget.soft_warn_pct`,
+  default 80): the soft warning fires when the daily total crosses 80%
+  of the cap (`record_spend` returns `soft_warning`, `get_status` exposes
+  `soft_threshold_cents` / `soft_triggered`); the hard gate at 100% is
+  unchanged; auto_loop logs the soft warning to the cadence log.
+  `soft_warn_pct: 0` disables the soft tier entirely.
+- **Still open**: open question 5 one-click UI, item 9 hub merge (PR #512 open).
