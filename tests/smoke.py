@@ -2914,17 +2914,17 @@ def t_v150_governance_auto_loop_skip() -> bool:
 _section_v160 = "v1.6.0 NEW (Solution B): official-engine bridge, gate delegation, per-skill gating, side-findings"
 
 
-@test("v1.8.5: version strings aligned across plugin.py / hooks.py / plugin.yaml")
+@test("v1.8.6: version strings aligned across plugin.py / hooks.py / plugin.yaml")
 def t_v170_version_alignment() -> None:
     import re
     plugin_py = (PLUGIN_ROOT / "plugin.py").read_text(encoding="utf-8")
     hooks_py = (PLUGIN_ROOT / "hooks.py").read_text(encoding="utf-8")
     manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
     execute_py = (PLUGIN_ROOT / "execute.py").read_text(encoding="utf-8")
-    assert 'PLUGIN_VERSION = "1.8.5"' in plugin_py, "plugin.py not 1.8.4"
-    assert 'PLUGIN_VERSION = "1.8.5"' in hooks_py, "hooks.py not 1.8.4"
-    assert re.search(r'^version:\s*1\.8\.5', manifest, re.M), "plugin.yaml not 1.8.4"
-    assert 'EXPECTED_VERSION = "1.8.5"' in execute_py, "execute.py not 1.8.4"
+    assert 'PLUGIN_VERSION = "1.8.6"' in plugin_py, "plugin.py not 1.8.6"
+    assert 'PLUGIN_VERSION = "1.8.6"' in hooks_py, "hooks.py not 1.8.6"
+    assert re.search(r'^version:\s*1\.8\.6', manifest, re.M), "plugin.yaml not 1.8.6"
+    assert 'EXPECTED_VERSION = "1.8.6"' in execute_py, "execute.py not 1.8.6"
 
 
 @test("v1.6.1: default_config.yaml declares the official-engine bridge keys")

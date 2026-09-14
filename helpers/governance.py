@@ -161,6 +161,110 @@ def _default_policy() -> dict[str, Any]:
 # Public API
 # ----------------------------------------------------------------------- #
 
+def _parse_pause_until(raw):
+    # v1.8.6: parse a .skillopt.pause_until value (epoch or ISO-8601).
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _stuck_log():
+    # v1.8.6: locate cycle_history.jsonl (module _runs_dir first, then
+    # a module-relative fallback).
+    cands = []
+    try:
+        cands.append(_runs_dir() / "cycle_history.jsonl")
+    except Exception:
+        pass
+    cands.append(Path(__file__).resolve().parent.parent
+                 / "logs" / "runs" / "cycle_history.jsonl")
+    for c in cands:
+        try:
+            if c.is_file():
+                return c
+        except Exception:
+            continue
+    return cands[0]
+
+
+def _entry_epoch(e):
+    # v1.8.6: best-effort epoch seconds for a cycle_history entry.
+    v = e.get("ts_epoch") or e.get("ts")
+    if isinstance(v, (int, float)) and v > 0:
+        return float(v)
+    s = str(v or "")
+    if s.replace(".", "", 1).isdigit():
+        try:
+            f = float(s)
+            if f > 0:
+                return f
+        except Exception:
+            pass
+    iso = str(e.get("ts_iso") or "")
+    if iso:
+        p = _parse_pause_until(iso)
+        if p > 0:
+            return p
+    return None
+
+
+def get_stuck_skills(min_consecutive_rejects=3, days_window=7):
+    # v1.8.6 (open question 5): a skill is stuck when its newest
+    # cycle_history entries show >= min_consecutive_rejects consecutive
+    # rejected/errored cycles AND no adoption within days_window days.
+    # Read-only; never raises (loud-not-crash).
+    try:
+        log = _stuck_log()
+        if not log.is_file():
+            return []
+        with open(log, "r", encoding="utf-8") as f:
+            raw_lines = f.readlines()[-500:]
+        by_skill = {}
+        for line in raw_lines:
+            try:
+                e = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(e, dict):
+                continue
+            sk = str(e.get("skill") or "")
+            if not sk or sk == "_tick":
+                continue
+            by_skill.setdefault(sk, []).append(e)
+        now = time.time()
+        out = []
+        for sk, es in by_skill.items():
+            consec = 0
+            for e in reversed(es):
+                if e.get("outcome") in ("rejected", "errored"):
+                    consec += 1
+                else:
+                    break
+            adopted_epoch = None
+            adopted_raw = None
+            for e in es:
+                if e.get("outcome") == "adopted":
+                    adopted_raw = e.get("ts_iso") or e.get("ts")
+                    adopted_epoch = _entry_epoch(e)
+                    break
+            stale = adopted_epoch is None or (
+                (now - adopted_epoch) > float(days_window) * 86400.0)
+            if consec >= min_consecutive_rejects and stale:
+                out.append({
+                    "skill": sk,
+                    "consecutive_rejects": consec,
+                    "last_adopted_ts": adopted_raw,
+                })
+        return out
+    except Exception:
+        return []
+
+
 def load_skill_policy(skill_name: str) -> dict[str, Any]:
     """Read the effective policy for a skill. Returns a dict with at
     least `{mode, min_interval_seconds, daily_budget_cents, require_human_approval, _source}`.
@@ -178,7 +282,7 @@ def load_skill_policy(skill_name: str) -> dict[str, Any]:
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(data, dict):
-                known = {"mode", "min_interval_seconds", "daily_budget_cents", "require_human_approval"}
+                known = {"mode", "min_interval_seconds", "daily_budget_cents", "require_human_approval", "allowed_fragments", "max_verbosity_delta_ratio", "forbid_patterns"}
                 extras = {k: v for k, v in data.items() if k not in known}
                 for k in known:
                     if k in data:
@@ -219,6 +323,17 @@ def check_skill_eligible(skill_name: str) -> tuple[bool, str]:
     # 1. Optout wins everything.
     if (sd / ".skillopt.optout").is_file():
         return False, "opted_out_via_marker"
+    # 1.5. v1.8.6: one-click pause marker (.skillopt.pause_until).
+    # Epoch seconds or ISO-8601; past/unparsable = not paused.
+    _pu = sd / ".skillopt.pause_until"
+    if _pu.is_file():
+        _raw = _pu.read_text(encoding="utf-8").strip()
+        if _raw.replace(".", "", 1).isdigit():
+            _until = float(_raw)
+        else:
+            _until = _parse_pause_until(_raw)
+        if _until and time.time() < _until:
+            return False, "paused_until_marker"
 
     # Opt-in marker is read once and used in steps 3 + 4.
     has_optin = (sd / ".skillopt.optin").is_file()
@@ -390,6 +505,7 @@ def get_governance_status() -> dict[str, Any]:
         opted_out: list[str] = []
         opted_in: list[str] = []
         governed: list[str] = []
+        paused: list[str] = []
         skills_root = _a0_skills_dir()
         if skills_root.is_dir():
             try:
@@ -400,6 +516,18 @@ def get_governance_status() -> dict[str, Any]:
                         opted_out.append(entry.name)
                     if (entry / ".skillopt.optin").is_file():
                         opted_in.append(entry.name)
+                        _pu2 = entry / ".skillopt.pause_until"
+                        if _pu2.is_file():
+                            try:
+                                _praw = _pu2.read_text(encoding="utf-8").strip()
+                                if _praw.replace(".", "", 1).isdigit():
+                                    _puntil = float(_praw)
+                                else:
+                                    _puntil = _parse_pause_until(_praw)
+                                if _puntil and time.time() < _puntil:
+                                    paused.append(entry.name)
+                            except Exception:
+                                pass
                     if (entry / ".skillopt.policy.json").is_file():
                         governed.append(entry.name)
             except Exception:
@@ -429,12 +557,14 @@ def get_governance_status() -> dict[str, Any]:
                 pass
         return {
             "available": True,
+            "stuck": get_stuck_skills(),
             "enabled": True,
             "default_policy": default_policy,
             "opted_out": opted_out,
             "opted_in": opted_in,
             "governed": governed,
             "last_decisions": last_decisions,
+            "paused": paused,
             "skills_dir": str(skills_root),
             "log_path": str(log),
             "file_size_bytes": (log.stat().st_size if log.is_file() else 0),

@@ -6,6 +6,30 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
+## [1.8.6] - 2026-09-14
+
+### Governance and gate: item 8 per-skill policy scopes (ROADMAP)
+- Policy scope overlay: a per-skill `.skillopt.policy.json` now constrains
+  loop edits with three user keys: `allowed_fragments` (only these fragment
+  ids may change), `max_verbosity_delta_ratio` (relative growth cap vs
+  current), and `forbid_patterns` (banned literal substrings).
+- NEW stage 0.75 per-skill policy scope gate in
+  sleep_runner.validate_proposal (runs only when the skill has named
+  fragments and a policy file exists; unchanged fragments are skipped; a
+  user constraint, not a quality judgment).
+- auto_loop now always passes skill_name into validate_proposal so the
+  scope gate can address the skill; stage 0 stays unconditional and
+  run_paired_test keeps returning can_run=False when no judge is
+  configured (advisory-only under default configs).
+- Governance: .pause_until markers now accept ISO dates (YYYY-MM-DD) in
+  addition to epoch seconds; list_governed walks pauses; the status
+  snapshot gains a stuck block (skills with consecutive rejects and no
+  adoption).
+- Test tooling: boundary-safe policy-scope fixtures (mutations stay inside
+  fragment interiors so both parses segment identically).
+- Verification: smoke 139/139, v1.8.4 security block 3/3, policy-scope
+  sanity 4/4, framework-runtime compile OK.
+
 ## [1.8.5] — 2026-09-12
 
 ### Security: skillopt_setup can no longer write plaintext credentials

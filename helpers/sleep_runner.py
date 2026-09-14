@@ -413,6 +413,12 @@ def validate_proposal(
                 from usr.plugins.skillopt.helpers import ab_harness  # type: ignore  # noqa: E402
             except ImportError:
                 from helpers import ab_harness  # type: ignore  # noqa: E402
+            # v1.8.6: callers now always pass skill_name (the policy scope gate
+            # needs it), but stage 0 stays unconditional exactly as in v1.8.5:
+            # run_paired_test returns can_run=False when no judge/data is
+            # configured, which keeps the harness advisory-only under default
+            # configs. The ab_harness_enabled guard lives at the auto_loop
+            # call-site, not here.
             ab_result = ab_harness.run_paired_test(
                 skill_name=skill_name,
                 proposed_text=proposed or "",
@@ -485,6 +491,77 @@ def validate_proposal(
             except Exception:
                 pass
 
+    # v1.8.6: stage 0.75 - per-skill policy scope gate (ROADMAP item 8).
+    # Enforces the governance overlay SCOPE keys: allowed_fragments (only
+    # these fragment ids may change), max_verbosity_delta_ratio (relative
+    # growth cap vs current), forbid_patterns (banned literal substrings).
+    # Scope is a USER constraint, not a quality judgment: it runs even when
+    # official_gated=True (the official engine judges quality and must not
+    # override what the user allows us to touch).
+    if skill_name:
+        try:
+            _gov = sys.modules.get("helpers.governance")
+            if _gov is None:
+                try:
+                    from usr.plugins.skillopt.helpers import governance as _gov
+                except ImportError:
+                    from helpers import governance as _gov
+            _pol = _gov.load_skill_policy(skill_name)
+            _maxverb = _pol.get("max_verbosity_delta_ratio")
+            if _maxverb is not None and current:
+                _ratio = float(_maxverb)
+                if _ratio >= 0 and len(proposed or "") > len(current) * (1.0 + _ratio):
+                    return False, ("policy_scope_verbosity_exceeded: "
+                        + str(len(proposed or "")) + " > "
+                        + str(int(len(current) * (1.0 + _ratio))))
+            _forbid = _pol.get("forbid_patterns") or []
+            for _pat in _forbid:
+                if str(_pat) and str(_pat) in (proposed or ""):
+                    return False, "policy_scope_forbidden_pattern: " + str(_pat)
+            _allowed = _pol.get("allowed_fragments") or []
+            if _allowed:
+                _md = _gov._skill_dir(skill_name) / "SKILL.md"
+                if _md.is_file():
+                    _fs = sys.modules.get("helpers.fragment_store")
+                    if _fs is None:
+                        try:
+                            from usr.plugins.skillopt.helpers import fragment_store as _fs
+                        except ImportError:
+                            from helpers import fragment_store as _fs
+                    _named = [f for f in _fs.read_fragments(str(_md))
+                        if f.get("id") != "_default"]
+                    if _named:
+                        import tempfile as _tfs
+                        _fdS, _tpS = _tfs.mkstemp(suffix=".md", prefix="skillopt_scope_")
+                        try:
+                            os.close(_fdS)
+                            Path(_tpS).write_text(proposed or "", encoding="utf-8")
+                            _prop = _fs.read_fragments(_tpS)
+                        finally:
+                            try:
+                                os.unlink(_tpS)
+                            except Exception:
+                                pass
+                        _cur = {f.get("id"): f.get("text", "") for f in _named}
+                        _new = {f.get("id"): f.get("text", "") for f in _prop}
+                        for _fid, _ctext in _cur.items():
+                            if _fid in _allowed:
+                                continue
+                            if _new.get(_fid, "") != _ctext:
+                                return False, ("policy_scope_fragment_not_allowed: "
+                                    + str(_fid))
+                        for _fid in _new:
+                            if (_fid not in _cur and _fid != "_default"
+                                    and _fid not in _allowed):
+                                return False, ("policy_scope_new_fragment_not_allowed: "
+                                    + str(_fid))
+        except Exception as _scope_err:
+            try:
+                import logging as _logging
+                _logging.getLogger("skillopt.sleep_runner").debug(
+                    "[skillopt] policy scope gate raised: %s", _scope_err)
+            except Exception:
+                pass
     # v1.2.0: stage 0.5 - per-fragment gate. Only when skill_path is
     # provided AND fragment_per_fragment_gate is enabled. We read the
     # current fragments, compare each to the proposed (resolved) text,

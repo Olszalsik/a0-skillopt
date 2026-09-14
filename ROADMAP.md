@@ -417,7 +417,7 @@ These need answers before items 4-6 can land:
 
 This roadmap lives at the plugin root. The CHANGELOG.md tracks what has actually shipped. The smoke test in `usr/workdir/skillopt-plugin/` is the live signal that the loop still works.
 
-Last updated: 2026-09-13 (item 9 public release: hub PR #512 open, CI validate PASS).
+Last updated: 2026-09-14 (item 8 formal completion: per-skill policy scopes).
 
 ### Status addendum (2026-08-31, post v1.8.0 live verification)
 
@@ -434,3 +434,23 @@ Last updated: 2026-09-13 (item 9 public release: hub PR #512 open, CI validate P
 - **Plugin Hub PR: OPEN + CI PASS** — agent0ai/a0-plugins#512 (branch `add-skillopt` @ b41bb85), `validate` = success. Root cause of the first failure: branch built on a stale fork main, so the validator's two-dot diff saw multiple modified plugin folders; fixed by rebuilding the branch as one clean commit on fresh upstream main.
 - **Hub listing** — pending maintainer review/merge of #512 (auto-updates the generated index on merge).
 - **Fork hygiene** — Olszalsik/a0-plugins `main` synced to upstream main (cf2f7c7) via the merge-upstream API for future submissions.
+
+### Status addendum (2026-09-14, item 8 formal completion)
+
+- **Item 8 per-skill policy scopes: DONE** - `.skillopt.policy.json` per
+  skill supports `allowed_fragments`, `max_verbosity_delta_ratio`, and
+  `forbid_patterns`, enforced by sleep_runner stage 0.75 and returned as
+  `policy_scope_*` rejection reasons; auto_loop passes `skill_name` to the
+  gate. Verification: smoke 139/139, v1.8.4 security block 3/3,
+  policy-scope sanity 4/4, framework-runtime compile OK.
+- **Open question 5 (stuck-skill indicator): IMPLEMENTED in v1.8.6** -
+  `governance.get_stuck_skills()` (consecutive rejects, no adoption in the
+  window) is surfaced in the status snapshot; `.pause_until` now accepts
+  ISO dates (the skip mechanism). The one-click dashboard part remains
+  UI-side.
+- **Still open**: open question 2 (failure-memory backup; proposal: daily
+  local export to `<plugin>/backups/failure_memory-YYYY-MM-DD.jsonl.gz`,
+  keep 14 days, restore via re-import), open question 3 (per-skill budget
+  cap; proposal: default `daily_budget_cents: 200`, a documented
+  per-deployment knob), open question 5 one-click UI, item 9 hub merge
+  (PR #512 open).

@@ -703,7 +703,7 @@ class AutoLoopThread(threading.Thread):
             min_improvement_pp=float(cfg.get("gate_min_improvement_pp", 0.0)),
             max_shrink_ratio=float(cfg.get("gate_max_shrink_ratio", 0.5)),
             held_out=held_out,
-            skill_name=skill_name if ab_enabled else None,
+            skill_name=skill_name,
             official_gated=official_gated,
         )
         entry = {
