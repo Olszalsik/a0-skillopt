@@ -6,6 +6,35 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
+## [1.8.9] - 2026-09-15
+
+### Fix: zero rollouts on every live turn (harvester content extraction + attribution)
+
+- `_flatten_content()` now also prefers the real framework
+  content-dict keys `user_message` and `ai_response`. Runtime-observed
+  shapes: user turns arrive as `{'user_message': ...}` dicts and final
+  responses as `{'ai_response': ...}` dicts; the old preference tuple
+  (`text`, `content`, `tool_result`, `message`, `preview`) never
+  matched them, so the harvester flattened every live turn to an empty
+  string and early-returned on `if not user_msg` — zero rollouts
+  written since v1.7.0 despite green unit tests.
+- `SkilloptHarvestRollout.execute()` now forwards the framework agent
+  instance (`kwargs['agent']`) into the module-level `execute()`,
+  restoring authoritative `skill_used` attribution from the
+  `loaded_skills` ledger on live dispatches.
+- Verified offline: 10/10 shape cases against runtime-observed
+  payloads plus a full end-to-end hook dispatch producing a complete
+  rollout record (task, skill_used, outcome, trajectory, reward,
+  awaiting_suggestion). Verified live: 3 rollouts written by the
+  persistent runtime within 30 minutes of the fix, one with correct
+  skill attribution.
+- Folded in the uncommitted v1.8.8 dashboard CSRF follow-up: `call()`
+  fetches `/api/csrf_token`, sends `x-csrf-token`, and retries once on
+  403 after token rotation; head cache-bust bumped to `cb=3` (smoke
+  test updated accordingly).
+- Test hermeticity: the two C3 `/adopt` tests now temporarily hide real sleep-run logs (restored in finally) so the /adopt gate never reads stale held-out evidence from the live runtime.
+  held-out source so they pass regardless of real sleep logs on disk.
+
 ## [1.8.8] - 2026-09-14
 
 ### Open question 5: one-click dashboard pause/resume (ROADMAP)

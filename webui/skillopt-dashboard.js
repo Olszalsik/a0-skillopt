@@ -23,12 +23,46 @@
 
   const ENDPOINT_BASE = '/api/plugins/skillopt';
 
+  let _csrfToken = null;
+
+  async function getCsrfToken() {
+    if (_csrfToken) return _csrfToken;
+    const tr = await fetch('/api/csrf_token', {
+      method: 'GET',
+      credentials: 'same-origin',
+      headers: { 'accept': 'application/json' },
+    });
+    if (!tr.ok) throw new Error('CSRF fetch HTTP ' + tr.status);
+    const td = await tr.json();
+    _csrfToken = td.token || td.csrf_token || null;
+    return _csrfToken;
+  }
+
   async function call(path, opts = {}) {
+    const body = opts.body ? JSON.stringify(opts.body) : '{}';
+    const headers = { 'content-type': 'application/json' };
+    const token = await getCsrfToken().catch(() => null);
+    if (token) headers['x-csrf-token'] = token;
     const r = await fetch(ENDPOINT_BASE + path, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: opts.body ? JSON.stringify(opts.body) : '{}',
+      credentials: 'same-origin',
+      headers: headers,
+      body: body,
     });
+    if (r.status === 403) {
+      // Token may have rotated (e.g. server restart) — refetch once and retry.
+      _csrfToken = null;
+      const token2 = await getCsrfToken().catch(() => null);
+      if (token2) headers['x-csrf-token'] = token2;
+      const r2 = await fetch(ENDPOINT_BASE + path, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: headers,
+        body: body,
+      });
+      if (!r2.ok) throw new Error('HTTP ' + r2.status);
+      return r2.json();
+    }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }

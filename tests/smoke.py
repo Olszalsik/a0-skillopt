@@ -2921,10 +2921,10 @@ def t_v170_version_alignment() -> None:
     hooks_py = (PLUGIN_ROOT / "hooks.py").read_text(encoding="utf-8")
     manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
     execute_py = (PLUGIN_ROOT / "execute.py").read_text(encoding="utf-8")
-    assert 'PLUGIN_VERSION = "1.8.8"' in plugin_py, "plugin.py not 1.8.7"
-    assert 'PLUGIN_VERSION = "1.8.8"' in hooks_py, "hooks.py not 1.8.7"
-    assert re.search(r'^version:\s*1\.8\.8', manifest, re.M), "plugin.yaml not 1.8.7"
-    assert 'EXPECTED_VERSION = "1.8.8"' in execute_py, "execute.py not 1.8.7"
+    assert 'PLUGIN_VERSION = "1.8.9"' in plugin_py, "plugin.py not 1.8.9"
+    assert 'PLUGIN_VERSION = "1.8.9"' in hooks_py, "hooks.py not 1.8.9"
+    assert re.search(r'^version:\s*1\.8\.9', manifest, re.M), "plugin.yaml not 1.8.9"
+    assert 'EXPECTED_VERSION = "1.8.9"' in execute_py, "execute.py not 1.8.9"
 
 
 @test('v1.8.7: budget soft tier warns once at threshold, hard gate intact')
@@ -3848,6 +3848,7 @@ def t_c3_adopt_by_proposal_id() -> None:
     old_skills = os.environ.get("SKILLOPT_SKILLS_DIR")
     old_ab = os.environ.get("SKILLOPT_AB_HARNESS_ENABLED")
     tmp_skills = Path(tempfile.mkdtemp(prefix="skillopt_c3_adopt_"))
+    _c3_hidden = _hide_real_sleep_logs(sr)
     os.environ["SKILLOPT_SKILLS_DIR"] = str(tmp_skills)
     os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
     skill_a = "c3a_adopt"
@@ -3874,6 +3875,7 @@ def t_c3_adopt_by_proposal_id() -> None:
         assert snap.is_file(), f"expected pre-adopt snapshot at {snap}"
         assert resp.get("snapshot", {}).get("ok") is True, resp
     finally:
+        _restore_hidden_sleep_logs(_c3_hidden)
         for f in (file_a, file_b):
             f.unlink(missing_ok=True)
         _c3_cleanup_fragments([skill_a, skill_b])
@@ -3966,6 +3968,7 @@ def t_c3_adopt_without_id_falls_back_to_latest() -> None:
     old_skills = os.environ.get("SKILLOPT_SKILLS_DIR")
     old_ab = os.environ.get("SKILLOPT_AB_HARNESS_ENABLED")
     tmp_skills = Path(tempfile.mkdtemp(prefix="skillopt_c3_latest_"))
+    _c3_hidden = _hide_real_sleep_logs(sr)
     os.environ["SKILLOPT_SKILLS_DIR"] = str(tmp_skills)
     os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
     old_skill = "c3e_old"
@@ -3989,6 +3992,7 @@ def t_c3_adopt_without_id_falls_back_to_latest() -> None:
         # The older skill's SKILL.md is untouched
         assert "Skill v2" not in (tmp_skills / old_skill / "SKILL.md").read_text(encoding="utf-8")
     finally:
+        _restore_hidden_sleep_logs(_c3_hidden)
         for f in (f_old, f_new):
             f.unlink(missing_ok=True)
         _c3_cleanup_fragments([old_skill, new_skill])
@@ -4009,6 +4013,24 @@ def t_c3_adopt_without_id_falls_back_to_latest() -> None:
 # v1.7.0 — Solution C, Phase C4: auto opt-in with guardrails
 # (new skills auto-opted-in behind a human-approval gate)
 # ======================================================================= #
+
+ # v1.8.9 hermeticity: rename real sleep-run logs so the /adopt gate
+ # never reads stale held-out evidence from the live runtime.
+def _hide_real_sleep_logs(sr):
+    hidden=[]
+    runs=sr.runs_dir()
+    if runs.is_dir():
+        for f in sorted(runs.glob("sleep-*.log")):
+            bak=f.parent/(f.name+".c3_hidden")
+            f.rename(bak)
+            hidden.append((bak,f))
+    return hidden
+
+def _restore_hidden_sleep_logs(hidden):
+    for bak,orig in hidden:
+        if bak.is_file():
+            bak.rename(orig)
+
 
 _section_v170_c4 = "v1.7.0 NEW (C4): auto opt-in with guardrails"
 
@@ -4888,7 +4910,7 @@ def t_v188_ui_wiring() -> None:
     for needle in ('governancePause(skill, hours)', 'governanceResume(skill)'):
         assert needle in js, 'dashboard js missing %r' % needle
     head = (PLUGIN_ROOT / 'extensions' / 'webui' / 'page-head' / 'skillopt-head.html').read_text(encoding='utf-8')
-    assert 'cb=2' in head, 'cache-bust missing'
+    assert 'cb=3' in head, 'cache-bust missing'
 
 
 if __name__ == "__main__":

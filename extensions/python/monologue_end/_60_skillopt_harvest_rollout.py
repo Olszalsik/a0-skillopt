@@ -95,7 +95,7 @@ def _flatten_content(content: Any) -> str:
             return _flatten_content(content.get("raw_content"))
         # A skill-instructions / tool-result content dict: prefer the
         # text-ish fields, skip nested skill_instructions metadata.
-        for key in ("text", "content", "tool_result", "message", "preview"):
+        for key in ("text", "content", "tool_result", "message", "user_message", "ai_response", "preview"):
             if key in content and isinstance(content[key], (str, list, dict)):
                 s = _flatten_content(content[key])
                 if s:
@@ -435,4 +435,6 @@ except Exception:
 
 class SkilloptHarvestRollout(_SkilloptExtension):
     def execute(self, *args, **kwargs):
+        # v1.8.9: forward the agent instance so live skill attribution works
+        kwargs["agent"] = getattr(self, "agent", None)
         return execute(*args, **kwargs)

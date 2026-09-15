@@ -417,7 +417,7 @@ These need answers before items 4-6 can land:
 
 This roadmap lives at the plugin root. The CHANGELOG.md tracks what has actually shipped. The smoke test in `usr/workdir/skillopt-plugin/` is the live signal that the loop still works.
 
-Last updated: 2026-09-14 (open questions 2 + 3 shipped as v1.8.7).
+Last updated: 2026-09-15 (v1.8.9 zero-rollout fix).
 
 ### Status addendum (2026-08-31, post v1.8.0 live verification)
 
@@ -481,3 +481,26 @@ Last updated: 2026-09-14 (open questions 2 + 3 shipped as v1.8.7).
 - **Still open**: item 9 hub merge (PR #512 open); first live gated
   cycle (needs A0 restart to load v1.8.8 and a reachable LLM endpoint).
 
+### Status addendum (2026-09-15, v1.8.9 zero-rollout fix)
+
+- **Zero rollouts since v1.7.0: root cause found + fixed** - two
+  independent harvester bugs: (1) `_flatten_content()` never matched
+  the real framework content-dict keys (`user_message` /
+  `ai_response`), so every live turn flattened to an empty string and
+  the hook early-returned; (2) the `SkilloptHarvestRollout` wrapper
+  dropped the framework agent instance, so authoritative skill
+  attribution could never fire on live dispatches. Both fixed;
+  verified offline (10/10 shape cases, full-record E2E dispatch) and
+  live (3 rollouts written by the persistent runtime within 30
+  minutes, one with correct skill attribution).
+- **CSRF-safe dashboard calls folded in** (uncommitted v1.8.8
+  follow-up): `call()` fetches `/api/csrf_token`, sends
+  `x-csrf-token`, retries once on 403; cache-bust `cb=3`.
+- **Smoke**: post-fix installed-repo run 141/144 - the 2 C3 `/adopt`
+  failures were environmental (stale real sleep-run log parsed as
+  held-out evidence, delta 0.0pp vs required 5.0pp; the clean workdir
+  suite passed 134/134) and are fixed by hiding real sleep-run logs
+  in those tests; the OQ5 failure was the new `cb=3` assertion
+  (updated).
+- **Still open**: item 9 hub merge (PR #512 open); first live gated
+  cycle (rollouts now flow; judge needs a reachable LLM endpoint).
