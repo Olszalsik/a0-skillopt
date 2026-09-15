@@ -4915,6 +4915,63 @@ def t_v188_ui_wiring() -> None:
     assert 'cb=3' in head, 'cache-bust missing'
 
 
+@test('v1.8.11: mock scorer overlap is size-invariant (dilution fix)')
+def t_v1811_scorer_size_invariant() -> None:
+    purpose = 'Task-side coverage: broader directive sets never lower a task score (the diagnosed 45->81 dilution reject); pure noise keywords cannot raise it; a new covering keyword still lifts it.'
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import replay_harness as rh
+    task = {'task': 'refactor the parser for nested groups', 'outcome': 'success'}
+    nl = chr(10)
+    narrow = '# Refactor Parser' + nl + '**nested groups**' + nl
+    noise_kw = ' '.join('zz%d' % i for i in range(36))
+    broader = '**nested groups ' + noise_kw + '**' + nl + '# Refactor Parser' + nl
+    s_narrow = rh._mock_score(task, narrow)
+    s_broader = rh._mock_score(task, broader)
+    assert s_narrow == 1.0, s_narrow
+    assert s_broader == s_narrow, (s_narrow, s_broader)
+    partial = '# Refactor' + nl
+    fuller = '# Refactor' + nl + '**parser**' + nl
+    s_p = rh._mock_score(task, partial)
+    s_f = rh._mock_score(task, fuller)
+    assert s_f > s_p, (s_p, s_f)
+    assert rh._mock_score(task, '') == 0.75, 'empty-skill neutral'
+    print(' t_v1811_scorer_size_invariant: OK')
+
+@test('v1.8.11: judge burst throttle spaces consecutive LLM calls')
+def t_v1811_judge_throttle() -> None:
+    purpose = 'Two back-to-back judge_outcome calls are >= SKILLOPT_JUDGE_THROTTLE_S apart; env 0 disables; result shape unchanged.'
+    import os as _os
+    import json as _json
+    import time as _time
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import direct_optimizer, llm_judge
+    captured = []
+
+    def _fake_call(prompt, model, max_tokens=300, system=None):
+        captured.append(_time.monotonic())
+        return _json.dumps({'label': 'success', 'confidence': 0.9, 'reason': 'ok'})
+
+    orig = direct_optimizer._call_llm
+    direct_optimizer._call_llm = _fake_call
+    orig_env = _os.environ.get('SKILLOPT_JUDGE_THROTTLE_S')
+    _os.environ['SKILLOPT_JUDGE_THROTTLE_S'] = '0.25'
+    try:
+        r1 = llm_judge.judge_outcome({'task': 'a', 'last_response': 'b'})
+        r2 = llm_judge.judge_outcome({'task': 'a', 'last_response': 'b'})
+    finally:
+        direct_optimizer._call_llm = orig
+        if orig_env is None:
+            _os.environ.pop('SKILLOPT_JUDGE_THROTTLE_S', None)
+        else:
+            _os.environ['SKILLOPT_JUDGE_THROTTLE_S'] = orig_env
+        llm_judge._throttle_state['last'] = None
+    assert r1.get('label') == 'success', r1
+    assert r2.get('label') == 'success', r2
+    assert len(captured) == 2, captured
+    gap = captured[1] - captured[0]
+    assert gap >= 0.2, gap
+    print(' t_v1811_judge_throttle: OK')
+
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
     print(_section_v110)

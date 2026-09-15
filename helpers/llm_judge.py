@@ -131,6 +131,45 @@ def _judge_model(model: str | None) -> str:
     return direct_optimizer._default_model()
 
 
+# v1.8.11: burst throttle - batch labelling (scripts/label_rollouts.py) fires one
+# judge LLM call per rollout back-to-back, which trips provider rate limits (429)
+# and wastes retries. A module-level monotonic gate spaces consecutive judge calls
+# at least SKILLOPT_JUDGE_THROTTLE_S seconds apart (env override, default 1.5;
+# 0 disables). judge_outcome keeps its never-raises contract.
+_JUDGE_THROTTLE_DEFAULT_S = 1.5
+_throttle_state = {'last': None}
+
+
+def _judge_throttle_seconds() -> float:
+    raw = os.environ.get('SKILLOPT_JUDGE_THROTTLE_S')
+    if not raw:
+        return _JUDGE_THROTTLE_DEFAULT_S
+    try:
+        val = float(raw)
+    except ValueError:
+        return _JUDGE_THROTTLE_DEFAULT_S
+    return max(0.0, val)
+
+
+def _throttle_wait() -> float:
+    '''Sleep so consecutive judge LLM calls are spaced >= interval apart.
+
+    Returns the waited seconds (0 on the first call or when disabled). The
+    last-call stamp updates on every pass so the next call gates correctly.
+    '''
+    interval = _judge_throttle_seconds()
+    now = time.monotonic()
+    last = _throttle_state['last']
+    if interval <= 0.0 or last is None:
+        _throttle_state['last'] = now
+        return 0.0
+    wait = max(0.0, interval - (now - last))
+    if wait > 0.0:
+        time.sleep(wait)
+    _throttle_state['last'] = time.monotonic()
+    return wait
+
+
 def judge_outcome(rollout: dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
     """Judge one rollout's outcome via the LLM. Never raises.
 
@@ -147,6 +186,7 @@ def judge_outcome(rollout: dict[str, Any], *, model: str | None = None) -> dict[
             from usr.plugins.skillopt.helpers import direct_optimizer  # type: ignore
         except ImportError:
             from helpers import direct_optimizer  # type: ignore
+        _throttle_wait()
         prompt = _build_judge_prompt(rollout)
         raw = direct_optimizer._call_llm(
             prompt, resolved_model, max_tokens=300, system=JUDGE_SYSTEM,

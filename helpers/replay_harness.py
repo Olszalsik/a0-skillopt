@@ -127,42 +127,37 @@ def _directive_keywords(skill_md: str) -> list[str]:
 
 
 def _mock_score(task: dict[str, Any], skill_md: str) -> float:
-    """Deterministic relevance heuristic in [0, 1]. No LLM, no network.
+    '''Deterministic relevance heuristic in [0, 1]. No LLM, no network.
 
-    base  = the task's stored outcome (success=1.0 / partial=0.5 /
-            failure=0.0); defaults to 0.5 when the rollout has no outcome.
-    overlap = fraction of the skill's directive keywords that appear in
-            the task's task+last_response text (0..1). When the skill has
-            no directive keywords, overlap is 0.5 (neutral) so the score
-            is just the base — a no-op skill neither helps nor hurts.
-    score = base * (0.5 + 0.5 * overlap)
+    v1.8.11 dilution fix: overlap is now TASK-side coverage - the fraction
+    of the task's salient tokens (task+last_response, stopwords dropped)
+    that at least one directive keyword covers (substring either way).
+    Size-invariant: adding MORE keywords to a skill never lowers a task's
+    coverage (fixes the diagnosed 45->81 keyword-dilution reject), while
+    pure noise keywords cannot raise it. Coverage grows only when a new
+    keyword covers a task token the set previously missed.
 
-    So a fully-relevant skill multiplies the base by up to 1.0; a
-    fully-irrelevant skill multiplies it by 0.5; an empty skill leaves it
-    at base. The SAME task under a more-relevant proposed skill scores
-    higher than under the current skill — that difference is the
-    counterfactual lift the gate decides on.
+    base = stored outcome (success=1.0 / partial=0.5 / failure=0.0),
+    defaulting to 0.5. score = base * (0.5 + 0.5 * coverage); an empty
+    skill or empty task text -> coverage 0.5 (neutral).
 
-    Known limitation: this rewards keyword relevance, not actual agent
-    behaviour. A skill that simply lists the task's keywords would score
-    high. This is the documented trade-off of the mock executor; the real
-    executor (stub) is the live follow-up.
-    """
-    outcome = task.get("outcome") if isinstance(task, dict) else None
+    Known limitation: rewards keyword relevance, not real agent behaviour.
+    A skill that simply lists the task's keywords would score high - the
+    documented trade-off of the mock executor (real executor available
+    behind replay_real_executor_enabled).'''
+    outcome = task.get('outcome') if isinstance(task, dict) else None
     base = _OUTCOME_BASE.get(outcome, 0.5)  # unknown outcome -> neutral
-    keywords = _directive_keywords(skill_md)
-    if not keywords:
-        overlap = 0.5
+    keywords = set(_directive_keywords(skill_md))
+    hay = (
+        str(task.get('task', '')) + '\n' + str(task.get('last_response', ''))
+    ).lower()
+    task_tokens = set(_WORD_RE.findall(hay)) - _STOPWORDS
+    if not keywords or not task_tokens:
+        coverage = 0.5  # neutral: no-op skill / empty task text
     else:
-        hay = (
-            str(task.get("task", "")) + "\n" + str(task.get("last_response", ""))
-        ).lower()
-        if not hay.strip():
-            overlap = 0.0
-        else:
-            hits = sum(1 for k in keywords if k in hay)
-            overlap = min(1.0, hits / len(keywords))
-    return base * (0.5 + 0.5 * overlap)
+        covered = sum(1 for w in task_tokens if any(k in w or w in k for k in keywords))
+        coverage = min(1.0, covered / len(task_tokens))
+    return base * (0.5 + 0.5 * coverage)
 
 
 def _real_score(

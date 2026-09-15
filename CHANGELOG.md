@@ -6,6 +6,25 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
+## [1.8.11] - 2026-09-15
+
+### Fix: mock-scorer keyword dilution (45->81 kw reject)
+
+- replay_harness._mock_score() overlap is now TASK-side coverage: the fraction
+  of the task's salient tokens covered by at least one directive keyword.
+- Size-invariant: adding keywords never lowers a task score (the diagnosed
+  45->81 keyword-dilution reject); pure noise keywords cannot raise it.
+- Outcome base semantics unchanged; new size-invariance smoke test
+  (t_v1811_scorer_size_invariant). Smoke suite: 145/145.
+
+### Fix: judge burst throttle (429 bursts during batch labelling)
+
+- judge_outcome() now spaces consecutive judge LLM calls at least
+  SKILLOPT_JUDGE_THROTTLE_S seconds apart (env override, default 1.5, 0
+  disables) via a module-level monotonic gate (_throttle_wait).
+- Never-raises contract unchanged; new spacing smoke test
+  (t_v1811_judge_throttle).
+
 ## [1.8.10] - 2026-09-15
 
 ### Fix: Sleep engine mined 0 sessions from bridged rollouts (claude-home wiring)
