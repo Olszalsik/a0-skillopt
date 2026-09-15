@@ -2920,11 +2920,13 @@ def t_v170_version_alignment() -> None:
     plugin_py = (PLUGIN_ROOT / "plugin.py").read_text(encoding="utf-8")
     hooks_py = (PLUGIN_ROOT / "hooks.py").read_text(encoding="utf-8")
     manifest = (PLUGIN_ROOT / "plugin.yaml").read_text(encoding="utf-8")
+    mver = re.search(r'(?m)^version:\s*(\S+)', manifest)
+    assert mver, 'plugin.yaml missing version field'
+    ver = mver.group(1)
     execute_py = (PLUGIN_ROOT / "execute.py").read_text(encoding="utf-8")
-    assert 'PLUGIN_VERSION = "1.8.9"' in plugin_py, "plugin.py not 1.8.9"
-    assert 'PLUGIN_VERSION = "1.8.9"' in hooks_py, "hooks.py not 1.8.9"
-    assert re.search(r'^version:\s*1\.8\.9', manifest, re.M), "plugin.yaml not 1.8.9"
-    assert 'EXPECTED_VERSION = "1.8.9"' in execute_py, "execute.py not 1.8.9"
+    assert ('PLUGIN_VERSION = "' + ver + '"') in plugin_py, 'plugin.py not ' + ver
+    assert ('PLUGIN_VERSION = "' + ver + '"') in hooks_py, 'hooks.py not ' + ver
+    assert ('EXPECTED_VERSION = "' + ver + '"') in execute_py, 'execute.py not ' + ver
 
 
 @test('v1.8.7: budget soft tier warns once at threshold, hard gate intact')

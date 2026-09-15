@@ -502,5 +502,14 @@ Last updated: 2026-09-15 (v1.8.9 zero-rollout fix).
   suite passed 134/134) and are fixed by hiding real sleep-run logs
   in those tests; the OQ5 failure was the new `cb=3` assertion
   (updated).
-- **Still open**: item 9 hub merge (PR #512 open); first live gated
-  cycle (rollouts now flow; judge needs a reachable LLM endpoint).
+- **Done (v1.8.10)**: first live gated cycle ran end-to-end - claude-home
+  bridge wiring fixed the engine harvest (14 sessions -> 14 tasks), the
+  direct optimizer produced a real minimax-m3 proposal, and the local
+  replay gate rejected it fail-closed (mock-scorer keyword dilution,
+  45 -> 81 keywords, 0.4603 -> 0.4541). Atomic rollout writes and the
+  chat_shepherd harvest filter shipped in the same release.
+- **Still open**: item 9 hub merge (PR #512 open); replay-gate scorer
+  fix - normalize mock overlap by keyword-set size or enable the real
+  executor (replay_real_executor_enabled) so better-but-larger proposals
+  are not spuriously rejected; judge endpoint burst throttling (label
+  passes converge over sequential re-runs).

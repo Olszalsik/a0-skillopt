@@ -314,6 +314,12 @@ def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
     if not user_msg:
         # Empty conversations don't teach the engine anything.
         return
+    # v1.8.10: skip framework-generated shepherd prompts. They are
+    # recovery nudges, not user tasks, and they poison labels (the
+    # judge rated them failure/partial while the keyword heuristic
+    # called every non-error response success).
+    if user_msg.lstrip().startswith("[chat_shepherd]"):
+        return
 
     # Build a compact trajectory from tool/result messages (cap at 5).
     traj: list[dict[str, Any]] = []

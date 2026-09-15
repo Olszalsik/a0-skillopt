@@ -214,7 +214,9 @@ def write_rollout(record: dict[str, Any]) -> Path:
     rid = record.get("id") or uuid.uuid4().hex
     record["id"] = rid
     p = rollouts_dir() / f"{rid}.json"
-    p.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_p = p.with_name(p.name + ".tmp")
+    tmp_p.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_p.replace(p)  # v1.8.10: atomic write so readers never see a partial rollout
     return p
 
 
@@ -786,6 +788,14 @@ def launch_sleep_subprocess(
     except Exception as _bridge_err:
         bridge_result = {"rollouts_written": 0, "error": str(_bridge_err)}
 
+    # v1.8.10 fix: point the engine transcript source at the plugin-local
+    # bridge cache. Without this the engine reads the default ~/.claude,
+    # finds none of our bridged sessions and mines 0 tasks every cycle.
+    _bridge_root = str(bridge_result.get("bridge_root") or "")
+    if _bridge_root:
+        import os as _os
+        if _bridge_root != _os.path.expanduser("~/.claude"):
+            cmd += ["--claude-home", _bridge_root]
     # Build the subprocess env: start from the parent's env, then overlay any
     # `export FOO=bar` lines from .skillopt-env. Shared with the replay-worker
     # spawn via build_subprocess_env() so both paths apply the same credentials.

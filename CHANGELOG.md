@@ -6,6 +6,48 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
+## [1.8.10] - 2026-09-15
+
+### Fix: Sleep engine mined 0 sessions from bridged rollouts (claude-home wiring)
+
+- `launch_sleep_subprocess()` now appends `--claude-home <bridge_root>` to the
+  engine command whenever the plugin-local bridge cache differs from
+  `~/.claude`. The engine previously read the real (stale) `~/.claude` home,
+  found none of the bridged sessions and harvested 0 sessions every cycle.
+  Verified live: harvest 14 sessions -> 14 tasks -> gate -> staging.
+
+### Fix: atomic rollout writes (reader-race hardening)
+
+- `write_rollout()` now writes to a temp file and `os.replace()`s it into
+  place, so concurrent readers (judge labelling, harvest, reward scoring)
+  never observe a partially written rollout JSON.
+
+### Fix: framework shepherd prompts no longer harvested as tasks
+
+- The rollout harvester skips user messages starting with
+  `[chat_shepherd]` - framework recovery nudges, not user tasks. They
+  poisoned labels: the judge rated them failure/partial while the keyword
+  heuristic called every non-error response success (0-10% agreement).
+
+### Live gated cycle: first end-to-end run (fail-closed reject, artifact-diagnosed)
+
+- Full pipeline ran live: the direct optimizer produced a real minimax-m3
+  proposal for `security-scan-untrusted-plugin` from 7 live rollouts
+  (6 success / 1 failure), and the local replay gate REJECTED it
+  (`rejected_regression`, mean 0.4603 -> 0.4541).
+- Verdict root cause: the deterministic mock scorer computes
+  overlap = hits / len(directive_keywords); the proposal grew the keyword
+  surface 45 -> 81, halving overlap for keyword-hitting tasks and forcing a
+  spurious regression verdict. The gate behaved correctly fail-closed; the
+  scorer limitation documented in replay_harness.py is the live follow-up.
+- Judge labelling: 10/19 rollouts labelled; the judge endpoint truncates
+  responses under burst load (empty-body parse errors), so label passes
+  converge over sequential re-runs rather than one burst.
+
+- Smoke: 144/144 - the version-alignment test now derives the
+  expected version from plugin.yaml instead of pinning 1.8.9, and
+  execute.py EXPECTED_VERSION was bumped with the release.
+
 ## [1.8.9] - 2026-09-15
 
 ### Fix: zero rollouts on every live turn (harvester content extraction + attribution)
