@@ -157,6 +157,60 @@ smoke suite covers all logic testable without them.
 
 ---
 
+## v1.8.12 — DONE (2026-09-16): every model knob follows the active A0 chat model
+
+`optimizer_model` / `target_model` / `judge_model` were pinned to `minimax-m3`
+as an implicit default, so switching the model in the Agent Zero UI never
+reached the plugin — operators had to edit three config keys by hand.
+**v1.8.12 introduces the `chat` sentinel**: all three knobs now default to
+`chat`, which resolves at call time to the active Agent Zero chat model via
+the framework `_model_config` preset (live check: `glm-5.3-flash` @
+`ollama_cloud`), including its provider `api_base` and `api_key`.
+`minimax-m3` is retired as an implicit default but still honored when set
+explicitly. 150/150 smoke tests pass (4 new `t_v1812_*` cases); the health
+check passes with all four version surfaces aligned.
+
+### The resolver — helpers/chat_model.py (207 LoC)
+
+- `get_chat_connection()` returns the full connection `{ok, provider, model,
+  api_base, api_key}`: provider + model come from the `_model_config` plugin
+  (config.json `model_preset` → presets.yaml chat slot); `api_base` from the
+  preset override, else `conf/model_providers.yaml` — found by a recursive
+  provider search so layout drift across framework versions cannot break it;
+  api_key from `API_KEY_<PROVIDER>` env/dotenv.
+- 60 s TTL cache (`clear_cache()`, `force=`); `SKILLOPT_A0_ROOT` override
+  makes every test hermetic; read paths never raise.
+- `effective_model(model)`: concrete names pass through untouched
+  (`conn=None`, legacy behaviour preserved); the sentinel (or empty) resolves,
+  with an empty result meaning no active chat model.
+
+### Wiring — five consumption points
+
+| Call site | Sentinel behavior |
+|---|---|
+| `direct_optimizer._call_llm` | resolved + connection overrides api_base/api_key; unresolved → loud RuntimeError |
+| `llm_judge._judge_model` | recorded judge_model is always the concrete model used |
+| `ab_harness` HTTP judge binding | resolved at bind time; unresolved fails at bind |
+| `inner_loop` suggestion path | resolved per tick; unresolved → existing stub path |
+| `official_adapter --model` | concrete name for the external CLI |
+
+### Verification
+
+- `tests/smoke.py`: 150/150 (new cases: sentinel resolution + TTL cache,
+  concrete passthrough, unresolved-sentinel loud failure, judge-chain
+  resolution).
+- `execute.py health`: PASSED; version aligned in plugin.yaml / plugin.py /
+  hooks.py / execute.py — the v1.8.7 alignment test caught the missed
+  hooks.py bump before commit.
+- Live resolution verified against the real framework config; no
+  `.skillopt-env` model pins bypass the sentinel; the merged-config reality
+  check reads all three knobs as `chat`.
+- Process catches en route: the compile gate flagged an indentation fault in
+  the official_adapter insert before anything shipped.
+
+16 files changed, +499/−31 (commit 3d1d723, tag v1.8.12).
+
+
 ## Where we are (v1.1.0)
 
 **The closed loop runs end-to-end.** A0 chats → rollouts → background loop → Sleep engine (or direct LLM) → staged proposal → strict validation gate → adoption or rejection with a one-line reason.
