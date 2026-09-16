@@ -1056,23 +1056,36 @@ def t_v121_harness_no_rollouts() -> None:
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers import ab_harness
     ab_harness.reset_for_tests()
-    # Use a unique skill name so we never collide with real rollouts
-    # written by other tests in the same run.
-    result = ab_harness.run_paired_test(
-        skill_name="definitely_no_such_skill_v121_xyz",
-        proposed_text="# Proposed\n```\nexample\n```\nbody body body\n" * 50,
-        current_text="# Current\n```\nexample\n```\nbody body body\n" * 50,
-    )
-    assert result["samples"] == 0
-    assert result["can_run"] is False
-    assert result["passed"] is False
-    assert result["wins"] == 0
-    assert "not enough rollouts" in result["reason"].lower() or \
-           "fallback" in result["reason"].lower() or \
-           "no rollouts" in result["reason"].lower() or \
-           result["n_rollouts_loaded"] == 0, f"unexpected reason: {result['reason']!r}"
+    # v1.8.12 follow-up (test isolation): redirect the rollouts dir to an
+    # empty temp dir. Live runtime state may hold real rollouts with an
+    # empty or absent skill_used, which the documented overall-fallback in
+    # _load_recent_rollouts loads for ANY requested skill - breaking the
+    # no-rollouts premise of this test on installed copies (pre-existence
+    # proven on v1.8.11 content over the same runtime state).
+    _tmp_rd = tempfile.TemporaryDirectory()
+    _orig_rd = ab_harness._rollouts_dir
+    ab_harness._rollouts_dir = lambda: Path(_tmp_rd.name)
+    try:
+        # Use a unique skill name so we never collide with real rollouts
+        # written by other tests in the same run.
+        result = ab_harness.run_paired_test(
+            skill_name="definitely_no_such_skill_v121_xyz",
+            proposed_text="# Proposed\n```\nexample\n```\nbody body body\n" * 50,
+            current_text="# Current\n```\nexample\n```\nbody body body\n" * 50,
+        )
+        assert result["samples"] == 0
+        assert result["can_run"] is False
+        assert result["passed"] is False
+        assert result["wins"] == 0
+        assert "not enough rollouts" in result["reason"].lower() or \
+               "fallback" in result["reason"].lower() or \
+               "no rollouts" in result["reason"].lower() or \
+               result["n_rollouts_loaded"] == 0, f"unexpected reason: {result['reason']!r}"
 
 
+    finally:
+        ab_harness._rollouts_dir = _orig_rd
+        _tmp_rd.cleanup()
 @test("v1.2.0 NEW (A/B): harness fails closed when judge raises")
 def t_v121_harness_judge_unreachable() -> None:
     """When the injected judge raises on every call, the harness
@@ -1244,17 +1257,30 @@ def t_v121_gate_falls_through_when_no_data() -> None:
     from helpers import ab_harness
     from helpers.sleep_runner import validate_proposal
     ab_harness.reset_for_tests()
-    current = "# Current\n```\nex\n```\n" + ("abcdefghij\n" * 30)
-    proposed = "# Proposed v2\n```\nrefactored\n```\n" + ("xyz\n" * 600)
-    held = {"before": 0.3, "after": 0.5, "delta_pp": 20.0}
-    ok, reason = validate_proposal(
-        proposed, current, min_chars=200, min_improvement_pp=5.0,
-        max_shrink_ratio=0.5, held_out=held,
-        skill_name="definitely_no_such_skill_v121_xyz_fallthrough",
-    )
-    assert ok, f"gate should fall through with no rollouts; got reason={reason!r}"
+    # v1.8.12 follow-up (test isolation): redirect the rollouts dir to an
+    # empty temp dir. Live runtime state may hold real rollouts with an
+    # empty or absent skill_used, which the documented overall-fallback in
+    # _load_recent_rollouts loads for ANY requested skill - breaking the
+    # no-rollouts premise of this test on installed copies (pre-existence
+    # proven on v1.8.11 content over the same runtime state).
+    _tmp_rd = tempfile.TemporaryDirectory()
+    _orig_rd = ab_harness._rollouts_dir
+    ab_harness._rollouts_dir = lambda: Path(_tmp_rd.name)
+    try:
+        current = "# Current\n```\nex\n```\n" + ("abcdefghij\n" * 30)
+        proposed = "# Proposed v2\n```\nrefactored\n```\n" + ("xyz\n" * 600)
+        held = {"before": 0.3, "after": 0.5, "delta_pp": 20.0}
+        ok, reason = validate_proposal(
+            proposed, current, min_chars=200, min_improvement_pp=5.0,
+            max_shrink_ratio=0.5, held_out=held,
+            skill_name="definitely_no_such_skill_v121_xyz_fallthrough",
+        )
+        assert ok, f"gate should fall through with no rollouts; got reason={reason!r}"
 
 
+    finally:
+        ab_harness._rollouts_dir = _orig_rd
+        _tmp_rd.cleanup()
 @test("v1.2.0 NEW (A/B): gate stays backward compatible when no skill_name")
 def t_v121_gate_backward_compat() -> None:
     """Existing callers that don't pass skill_name see the v1.1.0 gate
