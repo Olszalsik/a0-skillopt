@@ -106,7 +106,7 @@ DEFAULT_N = 30
 DEFAULT_MIN_N = 6
 DEFAULT_MIN_LIFT_PP = 5.0
 DEFAULT_MIN_CONFIDENCE = 0.6
-DEFAULT_JUDGE_MODEL = "minimax-m3"
+DEFAULT_JUDGE_MODEL = "chat"  # v1.8.12: sentinel follows the active A0 chat model
 
 # ----------------------------------------------------------------------- #
 # Judge prompt (module-level so it's easy to iterate)
@@ -171,6 +171,21 @@ def set_judge_mode(mode: str) -> None:
         # Bind the model at install time so the closure is cheap to call
         cfg = _config()
         model = cfg["judge_model"]
+        # v1.8.12: resolve the chat sentinel at bind time so the closure
+        # always POSTs a concrete model name to the judge endpoint.
+        try:
+            try:
+                from usr.plugins.skillopt.helpers import chat_model as _cm  # type: ignore
+            except ImportError:
+                from helpers import chat_model as _cm  # type: ignore
+            model, _conn = _cm.effective_model(model)
+        except Exception:  # noqa: BLE001
+            model = ""
+        if not model:
+            raise RuntimeError(
+                "set_judge_mode(http): judge_model (the chat sentinel) could not "
+                "be resolved to a concrete model",
+            )
 
         def _http_judge(rollout, score_a, score_b):
             return _llm_judge_via_http(

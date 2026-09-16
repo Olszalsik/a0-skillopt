@@ -6,6 +6,24 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
+## [1.8.12] - 2026-09-16
+
+### Change: optimizer / target / judge models follow the active Agent Zero chat model
+
+- New `helpers/chat_model.py`: the `chat` sentinel (new default for
+  `optimizer_model`, `target_model`, `judge_model`) resolves at call time
+  to the framework `_model_config` active preset chat slot - provider,
+  model, api_base (preset, else `conf/model_providers.yaml`) and api_key
+  (`API_KEY_<PROVIDER>` env/dotenv). Cached 60s; `SKILLOPT_A0_ROOT`
+  override for hermetic tests; never raises.
+- `minimax-m3` retired as an implicit default everywhere; still available
+  via explicit configuration or env.
+- Sentinel resolution wired into: `direct_optimizer._call_llm` (with
+  connection override), the judge model chain, the A/B HTTP judge
+  binding, inner-loop suggestions (unresolved model falls back to the
+  stub path), and the official adapter `--model`.
+- 4 new smoke cases (`t_v1812_*`); suite: 150/150.
+
 ## [1.8.11] - 2026-09-15
 
 ### Fix: mock-scorer keyword dilution (45->81 kw reject)

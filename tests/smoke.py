@@ -4972,6 +4972,159 @@ def t_v1811_judge_throttle() -> None:
     assert gap >= 0.2, gap
     print(' t_v1811_judge_throttle: OK')
 
+_section_v1812 = 'v1.8.12 NEW: chat-model sentinel - optimizer/target/judge follow the active A0 chat model (4 cases)'
+
+def _v1812_fixture(root, *, preset='P1', model='test-model', provider='prov_x'):
+    mc = root / 'usr' / 'plugins' / '_model_config'
+    mc.mkdir(parents=True, exist_ok=True)
+    (root / 'conf').mkdir(parents=True, exist_ok=True)
+    (mc / 'config.json').write_text(json.dumps({'model_preset': preset}), encoding='utf-8')
+    (mc / 'presets.yaml').write_text(
+        '- name: ' + preset + '\n  chat:\n    name: ' + model + '\n    provider: ' + provider + '\n',
+        encoding='utf-8')
+    (root / 'conf' / 'model_providers.yaml').write_text(
+        'chat:\n  ' + provider + ':\n    kwargs:\n      api_base: https://api.example.com/v1\n',
+        encoding='utf-8')
+
+@test('v1.8.12: chat sentinel resolves the active A0 chat model (fixture root)')
+def t_v1812_sentinel_resolves() -> None:
+    purpose = 'Sentinel chat -> preset chat slot model + provider api_base (model_providers.yaml chat scope) + api_key (env); 60s cache honored; clear_cache re-resolves.'
+    import os as _os
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import chat_model as cm
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _v1812_fixture(root)
+        old_root = _os.environ.get('SKILLOPT_A0_ROOT')
+        old_key = _os.environ.get('API_KEY_PROV_X')
+        _os.environ['SKILLOPT_A0_ROOT'] = str(root)
+        _os.environ['API_KEY_PROV_X'] = 'test-key-123'
+        try:
+            cm.clear_cache()
+            r = cm.get_chat_connection(force=True)
+            assert r.get('ok') is True, r
+            assert r.get('model') == 'test-model', r
+            assert r.get('provider') == 'prov_x', r
+            assert r.get('api_base') == 'https://api.example.com/v1', r
+            assert r.get('api_key') == 'test-key-123', r
+            m, conn = cm.effective_model('chat')
+            assert m == 'test-model', (m, conn)
+            assert conn and conn.get('ok') is True, conn
+            # TTL cache: mutate fixture, non-force read still returns the cached value
+            (root / 'usr' / 'plugins' / '_model_config' / 'config.json').write_text(
+                json.dumps({'model_preset': 'P2'}), encoding='utf-8')
+            (root / 'usr' / 'plugins' / '_model_config' / 'presets.yaml').write_text(
+                '- name: P2\n  chat:\n    name: other-model\n    provider: prov_x\n', encoding='utf-8')
+            r2 = cm.get_chat_connection()
+            assert r2.get('model') == 'test-model', r2
+            r3 = cm.get_chat_connection(force=True)
+            assert r3.get('model') == 'other-model', r3
+            _ok('sentinel resolves model/provider/base/key; cache TTL + force refresh')
+        finally:
+            if old_root is None:
+                _os.environ.pop('SKILLOPT_A0_ROOT', None)
+            else:
+                _os.environ['SKILLOPT_A0_ROOT'] = old_root
+            if old_key is None:
+                _os.environ.pop('API_KEY_PROV_X', None)
+            else:
+                _os.environ['API_KEY_PROV_X'] = old_key
+            cm.clear_cache()
+    print(' t_v1812_sentinel_resolves: OK')
+
+@test('v1.8.12: concrete model names bypass chat resolution')
+def t_v1812_concrete_passthrough() -> None:
+    purpose = 'A concrete model name passes through with conn=None (legacy connection behaviour preserved); sentinel detection works.'
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import chat_model as cm
+    m, conn = cm.effective_model('minimax-m3')
+    assert m == 'minimax-m3' and conn is None, (m, conn)
+    m2, conn2 = cm.effective_model('  qwen3-coder-30b  ')
+    assert m2 == 'qwen3-coder-30b' and conn2 is None, (m2, conn2)
+    assert cm.is_sentinel('chat') is True
+    assert cm.is_sentinel('minimax-m3') is False
+    assert cm.is_sentinel(None) is False
+    _ok('passthrough + sentinel detection')
+    print(' t_v1812_concrete_passthrough: OK')
+
+@test('v1.8.12: unresolved sentinel fails loud in _call_llm')
+def t_v1812_unresolved_sentinel() -> None:
+    purpose = 'With an empty A0 root, effective_model returns (empty, None) and _call_llm raises a named RuntimeError instead of silently calling the LLM with a bogus model.'
+    import os as _os
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import chat_model as cm
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        old_root = _os.environ.get('SKILLOPT_A0_ROOT')
+        old_ollama = _os.environ.get('OLLAMA_API_KEY')
+        _os.environ['SKILLOPT_A0_ROOT'] = str(root)
+        _os.environ['OLLAMA_API_KEY'] = 'dummy-key'  # pass the pre-existing api-key check deterministically
+        try:
+            cm.clear_cache()
+            m, conn = cm.effective_model('chat')
+            assert m == '' and conn is None, (m, conn)
+            from helpers import direct_optimizer
+            raised = None
+            try:
+                direct_optimizer._call_llm('prompt', 'chat', max_tokens=10)
+            except RuntimeError as e:
+                raised = str(e)
+            except Exception as e:  # noqa: BLE001
+                raised = 'WRONG-TYPE: ' + type(e).__name__ + ': ' + str(e)
+            assert raised is not None, 'expected RuntimeError for unresolved sentinel'
+            assert 'resolved to empty' in raised or 'resolution failed' in raised, raised
+            _ok('empty root -> named RuntimeError, no LLM call')
+        finally:
+            if old_root is None:
+                _os.environ.pop('SKILLOPT_A0_ROOT', None)
+            else:
+                _os.environ['SKILLOPT_A0_ROOT'] = old_root
+            if old_ollama is None:
+                _os.environ.pop('OLLAMA_API_KEY', None)
+            else:
+                _os.environ['OLLAMA_API_KEY'] = old_ollama
+            cm.clear_cache()
+    print(' t_v1812_unresolved_sentinel: OK')
+
+@test('v1.8.12: judge chain resolves the sentinel so judge_model names the used model')
+def t_v1812_judge_concrete() -> None:
+    purpose = '_judge_model(chat) resolves to the fixture chat model (recorded judge_model is concrete); pinned names and env override still win.'
+    import os as _os
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import chat_model as cm, llm_judge, direct_optimizer
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _v1812_fixture(root, preset='PJ', model='judge-model-x')
+        old_root = _os.environ.get('SKILLOPT_A0_ROOT')
+        old_jenv = _os.environ.get('SKILLOPT_JUDGE_MODEL')
+        _os.environ['SKILLOPT_A0_ROOT'] = str(root)
+        try:
+            if old_jenv is not None:
+                _os.environ.pop('SKILLOPT_JUDGE_MODEL', None)
+            orig_default = direct_optimizer._default_model
+            direct_optimizer._default_model = lambda: 'chat'
+            try:
+                cm.clear_cache()
+                assert llm_judge._judge_model('chat') == 'judge-model-x', llm_judge._judge_model('chat')
+                assert llm_judge._judge_model(None) == 'judge-model-x'
+                assert llm_judge._judge_model('pinned-model') == 'pinned-model'
+                _os.environ['SKILLOPT_JUDGE_MODEL'] = 'env-model'
+                assert llm_judge._judge_model('chat') == 'env-model'
+                _ok('sentinel -> concrete; pinned + env override preserved')
+            finally:
+                direct_optimizer._default_model = orig_default
+        finally:
+            if old_root is None:
+                _os.environ.pop('SKILLOPT_A0_ROOT', None)
+            else:
+                _os.environ['SKILLOPT_A0_ROOT'] = old_root
+            if old_jenv is None:
+                _os.environ.pop('SKILLOPT_JUDGE_MODEL', None)
+            else:
+                _os.environ['SKILLOPT_JUDGE_MODEL'] = old_jenv
+            cm.clear_cache()
+    print(' t_v1812_judge_concrete: OK')
+
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
     print(_section_v110)
@@ -4984,4 +5137,5 @@ if __name__ == "__main__":
     print(_section_v170_c3)
     print(_section_v170_c4)
     print(_section_v180)
+    print(_section_v1812)
     sys.exit(main())

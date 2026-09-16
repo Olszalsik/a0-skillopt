@@ -2,6 +2,19 @@
 
 ---
 
+## v1.8.12 - every model knob follows the active Agent Zero chat model
+
+> `optimizer_model`, `target_model`, and `judge_model` default to the new
+> `chat` sentinel: at call time the plugin resolves the active chat model
+> of the Agent Zero UI (via the framework `_model_config` preset plugin) -
+> including its provider api_base and api key - and uses it. Model
+> switches in the Agent Zero settings now apply to SkillOpt
+> automatically. `minimax-m3` is retired as an implicit default (still
+> available via explicit configuration). Smoke suite: 150/150 (4 new
+> `t_v1812_*` cases).
+
+---
+
 ## v1.8.0 — the two offline pieces, integrated (real replay + reward training)
 
 > v1.7.0 stubbed the two expensive/offline pieces of the self-evolution loop and

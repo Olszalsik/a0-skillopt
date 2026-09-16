@@ -93,7 +93,7 @@ DEFAULT_ENABLED = True
 DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_MAX_AGE_SECONDS = 7 * 86400  # 7 days
 DEFAULT_MIN_ROLLOUT_CONFIDENCE = 0.4
-DEFAULT_LLM_MODEL = "minimax-m3"
+DEFAULT_LLM_MODEL = "chat"  # v1.8.12: sentinel follows the active A0 chat model
 # v1.8.1: per-tick parse window (0 = unlimited)
 DEFAULT_MAX_SCAN_FILES = 2000
 
@@ -549,6 +549,17 @@ def inner_loop_tick(llm_endpoint: str | None = None) -> dict[str, Any]:
         return counters
     min_conf = float(cfg["min_rollout_confidence"])
     model = cfg["llm_model"]
+    # v1.8.12: resolve the chat sentinel (the new default) to the concrete
+    # active A0 chat model before the suggestion endpoint call. An empty
+    # result falls through to the stub path via the endpoint/model check.
+    try:
+        try:
+            from usr.plugins.skillopt.helpers import chat_model as _cm  # type: ignore
+        except ImportError:
+            from helpers import chat_model as _cm  # type: ignore
+        model, _conn = _cm.effective_model(model)
+    except Exception:  # noqa: BLE001
+        model = ""
     # v1.8.1: resolve the LLM endpoint. The old `llm_endpoint` config key
     # never existed in any config file, so without the env var the tick
     # always produced stub suggestions. The new `inner_loop_llm_endpoint`
@@ -598,7 +609,7 @@ def inner_loop_tick(llm_endpoint: str | None = None) -> dict[str, Any]:
         # suggestion so the queue is non-empty in tests and offline
         # installs. The real LLM path replaces this when an endpoint
         # is configured.
-        if not endpoint:
+        if not endpoint or not model:  # v1.8.12: unresolved model -> stub path
             suggestion = (
                 f"Inner-loop stub: rollout outcome={rec.get('outcome', 'unknown')!r} "
                 f"for skill {rec.get('skill_used', 'unknown')!r}; "

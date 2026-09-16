@@ -106,15 +106,17 @@ critique_dir: "logs/runs/critiques"
 # MODEL DEFAULTS — v1.1.0 tuned to match what A0 actually runs
 # =====================================================================
 
-# Optimizer = the strong reasoning model that proposes skill edits.
-# Pick the strongest reasoning model you have wired in production.
+# Optimizer = the model that proposes skill edits. The default chat
+# sentinel (v1.8.12) follows the active Agent Zero chat model,
+# including its provider api_base/api_key. Set a concrete name to pin.
 # (Override via SKILLOPT_OPTIMIZER_MODEL env or `.skillopt-env`.)
-optimizer_model: "minimax-m3"
+optimizer_model: "chat"
 
-# Target = the cheap model A0 actually runs in production (the one
-# that uses the skill). Held-out replay is run against this model
-# to measure real-world impact.
-target_model: "minimax-m3"
+# Target = the model A0 actually runs in production (the one that
+# uses the skill). Held-out replay is run against this model to
+# measure real-world impact. The default chat sentinel (v1.8.12)
+# follows the active Agent Zero chat model.
+target_model: "chat"
 
 # =====================================================================
 # FAILURE MEMORY (v1.3.0 - Day-4 item 6)
@@ -203,7 +205,7 @@ ab_harness_min_confidence: 0.6
 # Set this true only if you want the harness as an extra advisory signal
 # (it can still reject a proposal that loses the paired test).
 ab_harness_enabled: false
-judge_model: "minimax-m3"
+judge_model: "chat"  # v1.8.12: the chat sentinel follows the active A0 chat model
 # Burst throttle (v1.8.11): env SKILLOPT_JUDGE_THROTTLE_S sets the minimum
 # seconds between consecutive judge LLM calls (default 1.5; 0 disables);
 # guards batch labelling against provider 429 bursts.

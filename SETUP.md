@@ -191,7 +191,7 @@ call_subordinate(
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | Health check says `loop stalled: ... but cycles_run=0` | The loop is on, ≥10 rollouts, but `auto_loop.log` shows the Sleep subprocess never started | Check the env file. The most common cause is a missing API key in `logs/runs/.skillopt-env`. |
-| Dry-run writes an empty proposal | The LLM is returning empty / getting rate-limited / wrong model | Check the cycle log for the model's raw response. Try a different `optimizer_model` (e.g. `minimax-m3`). |
+| Dry-run writes an empty proposal | The LLM is returning empty / getting rate-limited / wrong model | Check the cycle log for the model's raw response. Try a different `optimizer_model` (set a concrete model name, or keep the default `chat`). |
 | The gate rejects every proposal with `whitespace-equal` | The optimiser is rewriting without changing anything (LLM too small) | Bump the `optimizer_model` to a stronger model, or set `gate_max_shrink_ratio=0.0` to allow same-length edits. |
 | `OSError: [Errno 8] Exec format error` on Windows | You ran `execute.py` from WSL or Git Bash with the wrong Python | Use the full path: `& "C:\path\to\.venv\Scripts\python.exe" execute.py` |
 | The `monologue_end` hook never fires | The hook file isn't loaded by the framework | Restart A0 after copying the plugin. The hook is registered at startup, not on import. |

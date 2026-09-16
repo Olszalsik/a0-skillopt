@@ -105,7 +105,7 @@ The default `backend: auto` picks the first LLM credential it finds in `AZURE_OP
 # via the env file the plugin reads every cycle
 echo 'export AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/' >> /a0/usr/plugins/skillopt/logs/runs/.skillopt-env
 echo 'export AZURE_OPENAI_API_KEY=sk-...' >> /a0/usr/plugins/skillopt/logs/runs/.skillopt-env
-echo 'export SKILLOPT_OPTIMIZER_MODEL=minimax-m3' >> /a0/usr/plugins/skillopt/logs/runs/.skillopt-env
+echo 'export SKILLOPT_OPTIMIZER_MODEL=your-model-name' >> /a0/usr/plugins/skillopt/logs/runs/.skillopt-env
 ```
 
 ### 4. Run your first cycle
@@ -148,8 +148,8 @@ When you trust the output, set `auto_adopt: true` in the settings (or POST to `/
 | `gate_min_improvement_pp` | `5.0` | Reject if held-out improvement < 5 percentage points. Set to `0` to disable. |
 | `max_runs_retained` | `10` | Cap on historical run directories. |
 | `critique_dir` | `logs/runs/critiques` | Where per-cycle critiques land. |
-| `optimizer_model` | `minimax-m3` | Strong reasoning model. Override per environment. |
-| `target_model` | `minimax-m3` | Cheap model A0 actually runs in production. Held-out replay uses this. |
+| `optimizer_model` | `chat` | Model that proposes skill edits. The `chat` sentinel (v1.8.12) follows the active Agent Zero chat model. |
+| `target_model` | `chat` | Model A0 runs in production; held-out replay uses it. The `chat` sentinel (v1.8.12) follows the active A0 chat model. |
 
 For the full reference with comments, see `default_config.yaml`.
 

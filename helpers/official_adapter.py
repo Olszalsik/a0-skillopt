@@ -236,6 +236,19 @@ def _build_run_args(cfg: dict[str, Any], target: str | None) -> list[str]:
 
     # Single --model (no separate optimizer/target model in the real CLI).
     model = _str_cfg(cfg, "official_optimizer_model") or _str_cfg(cfg, "optimizer_model")
+    # v1.8.12: the chat sentinel must become a concrete model name for the
+    # external official CLI.
+    if model:
+        try:
+            try:
+                from usr.plugins.skillopt.helpers import chat_model as _cm  # type: ignore
+            except ImportError:
+                from helpers import chat_model as _cm  # type: ignore
+            resolved, _conn = _cm.effective_model(model)
+            if resolved:
+                model = resolved
+        except Exception:  # noqa: BLE001
+            pass
     if model:
         args += ["--model", model]
 

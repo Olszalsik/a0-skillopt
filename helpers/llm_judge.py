@@ -116,19 +116,33 @@ def _parse_judge_response(raw: str) -> dict[str, Any]:
 
 
 def _judge_model(model: str | None) -> str:
-    if model:
+    if model and model != "chat":
         return model
     env_model = os.environ.get("SKILLOPT_JUDGE_MODEL")
-    if env_model:
-        return env_model
-    _ensure_path()
-    # v1.8.1: two-path import — the bare `helpers` resolves to the
-    # framework's helpers package in the framework runtime.
-    try:
-        from usr.plugins.skillopt.helpers import direct_optimizer  # type: ignore
-    except ImportError:
-        from helpers import direct_optimizer  # type: ignore
-    return direct_optimizer._default_model()
+    raw = env_model or ""
+    if not raw:
+        _ensure_path()
+        # v1.8.1: two-path import - the bare `helpers` resolves to the
+        # framework's helpers package in the framework runtime.
+        try:
+            from usr.plugins.skillopt.helpers import direct_optimizer  # type: ignore
+        except ImportError:
+            from helpers import direct_optimizer  # type: ignore
+        raw = direct_optimizer._default_model()
+    # v1.8.12: resolve the chat sentinel (or empty) to the concrete active
+    # chat model so the recorded judge_model names the model actually used.
+    if raw:
+        try:
+            try:
+                from usr.plugins.skillopt.helpers import chat_model as _cm  # type: ignore
+            except ImportError:
+                from helpers import chat_model as _cm  # type: ignore
+            resolved, _conn = _cm.effective_model(raw)
+            if resolved:
+                return resolved
+        except Exception:  # noqa: BLE001
+            pass
+    return raw
 
 
 # v1.8.11: burst throttle - batch labelling (scripts/label_rollouts.py) fires one

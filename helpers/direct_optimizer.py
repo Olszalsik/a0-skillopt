@@ -106,7 +106,7 @@ def _default_model() -> str:
     if env_model:
         return env_model
     cfg = sleep_runner.merged_config()
-    return cfg.get("optimizer_model") or "minimax-m3"
+    return cfg.get("optimizer_model") or "chat"  # v1.8.12: sentinel - resolved at call time (helpers/chat_model.py)
 
 
 _OPTIMIZER_SYSTEM = (
@@ -129,6 +129,27 @@ def _call_llm(prompt: str, model: str, max_tokens: int = 2000, system: str | Non
     api_key = env.get("AZURE_OPENAI_API_KEY", "")
     if not api_key:
         api_key = os.environ.get("OLLAMA_API_KEY") or os.environ.get("API_KEY_OLLAMA_CLOUD") or ""
+    # v1.8.12: the chat sentinel (or an empty model) follows the active
+    # Agent Zero chat model - including its provider api_base/api_key.
+    try:
+        try:
+            from usr.plugins.skillopt.helpers import chat_model as _cm  # type: ignore
+        except ImportError:
+            from helpers import chat_model as _cm  # type: ignore
+        model, _conn = _cm.effective_model(model)
+        if _conn:
+            if _conn.get("api_base"):
+                base_url = str(_conn["api_base"])
+            if _conn.get("api_key"):
+                api_key = str(_conn["api_key"])
+    except Exception as _e:  # noqa: BLE001
+        if not model or model == "chat":
+            raise RuntimeError("chat-model resolution failed: " + str(_e)) from _e
+    if not model:
+        raise RuntimeError(
+            "optimizer model resolved to empty - the chat sentinel found "
+            "no active Agent Zero chat model (helpers/chat_model.py)"
+        )
     if not api_key:
         raise RuntimeError(
             "No LLM API key found. Set OLLAMA_API_KEY in the container env, "
