@@ -567,3 +567,38 @@ Last updated: 2026-09-15 (v1.8.9 zero-rollout fix).
   executor (replay_real_executor_enabled) so better-but-larger proposals
   are not spuriously rejected; judge endpoint burst throttling (label
   passes converge over sequential re-runs).
+
+
+### Status addendum (2026-09-17, item 10 hub watchdog shipped)
+
+- **Item 9 (hub merge of PR #512): PENDING MAINTAINER ACTION** -
+  PR #512 open with mergeable_state=clean and validate=success on head
+  b41bb85 (touches exactly plugins/skillopt/; the earlier a0-bot
+  "exactly one plugin folder" failure predates the current head and is
+  resolved). No human reviews or maintainer feedback. Release hygiene
+  closed the same day: tags v1.8.10/6f08f6e, v1.8.11/d532baf,
+  v1.8.12/3d1d723 pushed to origin (v1.8.11/12 had never been tagged
+  locally); CI green on 4fad40a (run 35239756114, all 4 Smoke jobs)
+  after the hermetic llm_model test pin.
+- **Item 10 (PR merge monitoring + post-hub indexing verification):
+  IN-PROGRESS (tooling shipped)** - NEW `scripts/check_hub_status.py`
+  (229 LoC, pure stdlib, standalone/scheduled utility; zero imports
+  from plugin.py/hooks.py/api/tools/extensions - no blocking network
+  calls in agent execution paths). Queries PR #512 state; when merged,
+  verifies indexing against the canonical generated catalog release
+  asset (`generated-index` -> index.json, shape: plugins dict keyed by
+  name plus version field; 185 plugins on 2026-09-17, skillopt absent
+  pre-merge), with https://www.agent-zero.ai/p/plugins/ probed as
+  supplemental evidence only (SPA HTML shell with no inline plugin
+  data, so a missing literal there is NOT non-indexing evidence).
+  Emits OPEN_PENDING / MERGED_INDEXED / MERGED_UNINDEXED (plus an
+  explicit ERROR on query failure - never guesses), prints status JSON
+  to stdout, atomically appends to `logs/hub_status.json` (latest plus
+  rolling history, keep-last-50). Verified: py_compile OK, --selftest
+  5/5 status-mapping cases, live acceptance run exit 0 -> OPEN_PENDING
+  (correct pre-merge state).
+- **Still open**: item 9 hub merge (PR #512 awaiting maintainer;
+  re-run scripts/check_hub_status.py after merge until MERGED_INDEXED -
+  the generated-index release regenerates asynchronously after merge);
+  replay-gate scorer fix (normalize mock overlap by keyword-set size or
+  enable replay_real_executor_enabled).
