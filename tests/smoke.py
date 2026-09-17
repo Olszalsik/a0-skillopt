@@ -1561,6 +1561,21 @@ def t_v121_inner_tick_failing_llm():
         il_mod._rollouts_dir = lambda: rollouts_dir
         il_mod.suggestions_dir = lambda: Path(tmpdir) / "suggestions"
         (Path(tmpdir) / "suggestions").mkdir(parents=True, exist_ok=True)
+        orig_cfg = il_mod._config
+        def _hermetic_cfg():
+            # v1.8.12 follow-up #2: pin a CONCRETE llm_model so this
+            # v1.2.0 test takes the real LLM path on every environment.
+            # Since v1.8.12 the default model is the chat sentinel; on
+            # a fresh CI checkout there is no A0 chat model, so
+            # effective_model() returns an empty name and the tick
+            # routes to the stub path (suggested=2, errors=0) without
+            # ever calling the monkeypatched _llm_suggest_via_http.
+            # Concrete names pass through effective_model() untouched
+            # (documented pass-through), so the pin is fully hermetic.
+            cfg = dict(orig_cfg())
+            cfg['llm_model'] = 'ci-hermetic-model'
+            return cfg
+        il_mod._config = _hermetic_cfg
         orig_llm = il_mod._llm_suggest_via_http
         def _fail(*a, **kw):
             # The contract: _llm_suggest_via_http returns {"error": ...} on
@@ -1571,6 +1586,7 @@ def t_v121_inner_tick_failing_llm():
             counters = inner_loop.inner_loop_tick(llm_endpoint="http://nope")
         finally:
             il_mod._llm_suggest_via_http = orig_llm
+            il_mod._config = orig_cfg
             il_mod._rollouts_dir = orig_rollouts_dir
             il_mod.suggestions_dir = orig_suggestions_dir
         assert counters["errors"] >= 1, f"expected errors>=1, got {counters!r}"
