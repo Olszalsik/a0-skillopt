@@ -109,9 +109,9 @@ paths in user-facing strings and staged-proposal instructions are plugin-relativ
 - `scripts/` — train_reward_model (v1.8.0 `--mode train`), calibrate_judge, replay_worker (v1.8.0),
   label_rollouts (v1.8.0)
 - `api/` — adopt, status, config, fragments (+rollback), cycles (+cycle), audit_log, loop, sleep,
-  staged, reject, rollback, governance_approve, governance_status (last 5 NEW v1.7.0)
+  staged, reject, rollback, governance_approve, governance_status (NEW v1.7.0), hub_status (NEW v1.8.13)
 - `webui/` — dashboard + config UI (Staged-proposals + Governance sections v1.7.0)
-- `tests/smoke.py` — 133 deterministic tests (no LLM/network); 11 `t_v18_*` + the renamed
+- `tests/smoke.py` — 155 deterministic tests (no LLM/network); 11 `t_v18_*` + the renamed
   `t_c2_real_executor_disabled_returns_not_enabled` cover the v1.8.0 opt-in paths with mocked
   subprocess / LLM / asyncio (no real spawn).
 
@@ -170,7 +170,7 @@ paths in user-facing strings and staged-proposal instructions are plugin-relativ
 
 ## Verification
 
-- `python tests/smoke.py` — 133 deterministic tests (no LLM/network); the 11 `t_v18_*` cases mock
+- `python tests/smoke.py` — 155 deterministic tests (no LLM/network); the 11 `t_v18_*` cases mock
   subprocess / LLM / asyncio so no real spawn or network happens in the suite.
 - `python -c "import skillopt_sleep"` in the A0 venv confirms the official package (else fallback).
 - Dry-run against the 5 synthetic rollouts with `use_official_engine: true`, `auto_adopt: false` → a

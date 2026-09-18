@@ -596,7 +596,13 @@ Last updated: 2026-09-15 (v1.8.9 zero-rollout fix).
   to stdout, atomically appends to `logs/hub_status.json` (latest plus
   rolling history, keep-last-50). Verified: py_compile OK, --selftest
   5/5 status-mapping cases, live acceptance run exit 0 -> OPEN_PENDING
-  (correct pre-merge state).
+  (correct pre-merge state). v1.8.13 adds `api/hub_status.py` - REST
+  surface GET/POST `/api/plugins/skillopt/hub_status` serving the
+  persisted payload: fresh (mtime <= 3600s) served as-is, stale/missing
+  triggers exactly one watchdog refresh under a hard 3s timeout with a
+  process-wide single-flight guard, refresh failure returns structured
+  HTTP 500; watchdog-reported ERROR is served as honest 200 data.
+  Suite 155/155 (5 new handler tests).
 - **Still open**: item 9 hub merge (PR #512 awaiting maintainer;
   re-run scripts/check_hub_status.py after merge until MERGED_INDEXED -
   the generated-index release regenerates asynchronously after merge);

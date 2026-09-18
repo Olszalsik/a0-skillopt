@@ -6,6 +6,33 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
+## [1.8.13] - 2026-09-18
+
+### Add: hub_status API endpoint (roadmap item 10 tooling)
+
+- New `api/hub_status.py`: GET/POST `/api/plugins/skillopt/hub_status`
+  serves the hub-merge / catalog-indexing payload persisted by
+  `scripts/check_hub_status.py` in `logs/hub_status.json`
+  ({latest: {...}, history: [...]}).
+- Fresh payload (file mtime <= 3600s) is returned as-is with no
+  subprocess spawn.
+- Stale or missing payload triggers exactly one watchdog refresh under
+  a hard 3s timeout (asyncio subprocess, killed on overrun; the server
+  event loop is never parked on network timeouts). Concurrent requests
+  share a single refresh via a process-wide guard; waiters poll for
+  freshness instead of spawning duplicates.
+- Refresh failure (spawn error, timeout, file still missing/stale)
+  returns HTTP 500 with a structured JSON body
+  ({status: ERROR, message: ...}); a watchdog-reported ERROR payload
+  is served as honest data with HTTP 200.
+- Auth/CSRF relaxed for this read-only, non-sensitive public status,
+  mirroring the framework's own read-only GET endpoints. Flask is
+  imported lazily; CI (no flask) gets a dict error fallback carrying
+  an explicit http_status field.
+- 5 new deterministic smoke tests (suite now 155 cases): handler
+  contract, fresh no-spawn, stale single-refresh, structured 500,
+  timeout kill.
+
 ## [1.8.12] - 2026-09-16
 
 ### Change: optimizer / target / judge models follow the active Agent Zero chat model

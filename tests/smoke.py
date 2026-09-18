@@ -5167,6 +5167,161 @@ def t_v1812_judge_concrete() -> None:
             cm.clear_cache()
     print(' t_v1812_judge_concrete: OK')
 
+# ======================================================================= #
+# ======================================================================= #
+# v1.8.13 hub_status API endpoint (item 10 tooling: REST surface for
+# scripts/check_hub_status.py status payload)
+
+@test('v1.8.13: hub_status handler contract')
+def t_hub_contract() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    _install_helpers_api_stub()
+    try:
+        from usr.plugins.skillopt.api import hub_status as hs
+    except Exception:
+        from api import hub_status as hs
+    import inspect
+    assert issubclass(hs.HubStatus, hs.ApiHandler)
+    assert hs.HubStatus.get_methods() == ['GET', 'POST']
+    assert hs.HubStatus.requires_auth() is False
+    assert hs.HubStatus.requires_csrf() is False
+    assert hs._STALENESS_S == 3600.0 and hs._REFRESH_TIMEOUT_S == 3.0
+    assert inspect.iscoroutinefunction(hs.HubStatus.process)
+    _ok('contract pinned')
+
+@test('v1.8.13: hub_status fresh payload served without spawn')
+def t_hub_fresh() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    _install_helpers_api_stub()
+    import asyncio
+    import tempfile
+    try:
+        from usr.plugins.skillopt.api import hub_status as hs
+    except Exception:
+        from api import hub_status as hs
+    old_log, old_spawn = hs._LOG_FILE, hs._spawn
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            hs._LOG_FILE = Path(td) / 'hub_status.json'
+            hs._LOG_FILE.write_text(json.dumps({'latest': {'status': 'OPEN_PENDING'}}))
+            async def no_spawn():
+                raise AssertionError('must not spawn when fresh')
+            hs._spawn = no_spawn
+            out = asyncio.run(hs.HubStatus().process({}, None))
+        assert isinstance(out, dict)
+        assert out['latest']['status'] == 'OPEN_PENDING', out
+    finally:
+        hs._LOG_FILE, hs._spawn = old_log, old_spawn
+    _ok('fresh served verbatim, zero spawns')
+
+@test('v1.8.13: hub_status stale -> one refresh then serves')
+def t_hub_stale() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    _install_helpers_api_stub()
+    import asyncio
+    import os
+    import tempfile
+    import time as _time
+    try:
+        from usr.plugins.skillopt.api import hub_status as hs
+    except Exception:
+        from api import hub_status as hs
+    old_log, old_spawn = hs._LOG_FILE, hs._spawn
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / 'hub_status.json'
+            log.write_text(json.dumps({'latest': {'status': 'OPEN_PENDING'}}))
+            past = _time.time() - 7200
+            os.utime(log, (past, past))
+            hs._LOG_FILE = log
+            refreshed = []
+            class FakeProc:
+                returncode = 0
+                async def wait(self):
+                    return 0
+            async def fake_spawn():
+                refreshed.append(1)
+                os.utime(log, None)  # refresh rewrites fresh, watchdog-style
+                return FakeProc()
+            hs._spawn = fake_spawn
+            out = asyncio.run(hs.HubStatus().process({}, None))
+        assert isinstance(out, dict)
+        assert out['latest']['status'] == 'OPEN_PENDING', out
+        assert len(refreshed) == 1, f'expected 1 refresh, got {len(refreshed)}'
+    finally:
+        hs._LOG_FILE, hs._spawn = old_log, old_spawn
+    _ok('stale -> exactly one refresh -> served')
+
+@test('v1.8.13: hub_status failed refresh -> structured ERROR 500 shape')
+def t_hub_error() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    _install_helpers_api_stub()
+    import asyncio
+    import tempfile
+    try:
+        from usr.plugins.skillopt.api import hub_status as hs
+    except Exception:
+        from api import hub_status as hs
+    old_log, old_spawn = hs._LOG_FILE, hs._spawn
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            hs._LOG_FILE = Path(td) / 'missing.json'
+            async def dead_spawn():
+                raise RuntimeError('spawn boom')
+            hs._spawn = dead_spawn
+            out = asyncio.run(hs.HubStatus().process({}, None))
+        if isinstance(out, dict):  # flask absent (CI) -> dict fallback
+            assert out['status'] == 'ERROR' and out['http_status'] == 500, out
+        else:  # flask present -> real structured 500 Response
+            from flask import Response
+            assert isinstance(out, Response) and out.status_code == 500, out
+            body = json.loads(out.get_data(as_text=True))
+            assert body['status'] == 'ERROR' and body['message'], body
+    finally:
+        hs._LOG_FILE, hs._spawn = old_log, old_spawn
+    _ok('structured ERROR payload on failed refresh')
+
+@test('v1.8.13: hub_status refresh over the 3s cap is killed -> ERROR 500')
+def t_hub_timeout() -> None:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    _install_helpers_api_stub()
+    import asyncio
+    import tempfile
+    try:
+        from usr.plugins.skillopt.api import hub_status as hs
+    except Exception:
+        from api import hub_status as hs
+    old_log = hs._LOG_FILE
+    old_spawn, old_timeout = hs._spawn, hs._REFRESH_TIMEOUT_S
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            hs._LOG_FILE = Path(td) / 'missing.json'
+            class SlowProc:
+                def __init__(self) -> None:
+                    self.killed = False
+                async def wait(self) -> int:
+                    if not self.killed:
+                        await asyncio.sleep(5)
+                    return 0
+                def kill(self) -> None:
+                    self.killed = True
+            proc = SlowProc()
+            async def slow_spawn():
+                return proc
+            hs._spawn = slow_spawn
+            hs._REFRESH_TIMEOUT_S = 0.1
+            out = asyncio.run(hs.HubStatus().process({}, None))
+        assert proc.killed is True, 'overrunning refresh must be killed'
+        if isinstance(out, dict):
+            assert out['status'] == 'ERROR' and out['http_status'] == 500, out
+        else:
+            from flask import Response
+            assert isinstance(out, Response) and out.status_code == 500, out
+    finally:
+        hs._LOG_FILE = old_log
+        hs._spawn, hs._REFRESH_TIMEOUT_S = old_spawn, old_timeout
+    _ok('timeout kill enforced; structured error returned')
+
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
     print(_section_v110)

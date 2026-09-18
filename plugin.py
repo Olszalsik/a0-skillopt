@@ -6,4 +6,4 @@ api/, webui/, and extensions/.
 """
 
 PLUGIN_NAME = "skillopt"
-PLUGIN_VERSION = "1.8.12"
+PLUGIN_VERSION = "1.8.13"
