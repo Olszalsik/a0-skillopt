@@ -4,6 +4,31 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.15] - 2026-09-18
+
+### Added: hub watchdog background job_loop extension
+
+- New extension `extensions/python/job_loop/_80_skillopt_hub_watchdog.py`
+  (class `HubWatchdogExtension`): fired by the framework scheduler's
+  `job_loop` tick, it refreshes `logs/hub_status.json` by running
+  `scripts/check_hub_status.py` as a non-blocking asyncio subprocess with a
+  strict 3s timeout (child killed on timeout), throttled by the state file
+  mtime to at most one refresh per 1800s while Hub PR #512
+  (agent0ai/a0-plugins Plugin Hub) is pending. On merge, the first stale
+  tick records MERGED_INDEXED / MERGED_UNINDEXED, and the
+  `/api/plugins/skillopt/hub_status` endpoint surfaces the transition
+  within one throttle window — no manual watchdog runs needed.
+- Safety contract: stdlib only; broad try/except so background exceptions
+  are logged and never propagate into the job loop; loop-safe single-flight
+  module flag (deliberately not asyncio.Lock, which binds to the loop that
+  first awaits it).
+- Verification: acceptance refresh + throttle skip in both directions,
+  instrumented timeout path, single-flight spawn count (1 spawn for 2
+  concurrent calls), and framework loader discovery
+  (`_get_extension_classes('job_loop')` registers the class).
+- Version strings aligned to 1.8.15 across plugin.yaml / plugin.py /
+  hooks.py / execute.py.
+
 ## [Unreleased]
 
 ### Test: multi-keyword mock-scorer parity (v1.8.13 follow-up)
