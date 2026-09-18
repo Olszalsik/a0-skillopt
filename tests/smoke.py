@@ -4979,6 +4979,52 @@ def t_v1811_scorer_size_invariant() -> None:
     assert rh._mock_score(task, '') == 0.75, 'empty-skill neutral'
     print(' t_v1811_scorer_size_invariant: OK')
 
+@test('v1.8.13 follow-up: multi-keyword mock scores are exact normalized coverage ratios')
+def t_v1813fu_multi_kw_exact_scores() -> None:
+    purpose = 'Pins the v1.8.11 task-side coverage normalization end to end: multi-keyword task token sets score as exact covered/total ratios in [0,1], monotonic across a single-to-multi keyword ladder, immune to noise-keyword inflation. Guards against any regression to raw keyword-count scoring (the pre-v1.8.11 dilution defect).'
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import replay_harness as rh
+    nl = chr(10)
+    task = {'task': 'refactor the parser for nested groups extraction', 'outcome': 'success'}
+    # 5 salient task tokens: refactor, parser, nested, groups, extraction
+    one = rh._mock_score(task, '# Refactor')
+    two = rh._mock_score(task, '# Refactor Parser')
+    four = rh._mock_score(task, '# Refactor Parser' + nl + '**nested groups**')
+    five = rh._mock_score(task, '# Refactor Parser' + nl + '**nested groups extraction**')
+    assert one == 0.6, one
+    assert two == 0.7, two
+    assert four == 0.9, four
+    assert five == 1.0, five
+    assert 0.0 <= one < two < four < five <= 1.0, (one, two, four, five)
+    noise = ' '.join('zz%d' % i for i in range(30))
+    noisy = '# Refactor Parser' + nl + '**nested groups ' + noise + '**' + nl
+    assert rh._mock_score(task, noisy) == four, 'noise keywords must not inflate coverage'
+    print(' t_v1813fu_multi_kw_exact_scores: OK')
+
+@test('v1.8.13 follow-up: multi-keyword mock gate clears the acceptance threshold; noise growth is no-lift, never regression')
+def t_v1813fu_multi_kw_gate_accepts() -> None:
+    purpose = 'End-to-end run_counterfactual(mock) over multi-keyword held-out tasks: a better-but-larger proposal clears gate_min_improvement_pp and is accepted (ok_lift), while a 45-to-81 noise-grown keyword surface with unchanged coverage is rejected_no_lift - never the spurious rejected_regression that motivated the scorer fix.'
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import replay_harness as rh
+    nl = chr(10)
+    tasks = [{'task': 'refactor the parser for nested groups extraction', 'outcome': 'success'}] * 3
+    cfg = {'replay_min_n': 3, 'gate_min_improvement_pp': 5.0}
+    narrow = '# Refactor Parser' + nl + '**nested groups**' + nl
+    fuller = '# Refactor Parser' + nl + '**nested groups extraction**' + nl
+    r = rh.run_counterfactual('s', narrow, fuller, tasks, executor='mock', config=cfg)
+    assert r['ok'] is True, r
+    assert r['hard_current'] == 0.9 and r['hard_proposed'] == 1.0, r
+    assert r['lift_pp'] >= 5.0, r
+    assert r['accepted'] is True and r['reason'].startswith('ok_lift'), r
+    assert all(pt['proposed'] > pt['current'] for pt in r['per_task']), r
+    noise = ' '.join('zz%d' % i for i in range(36))
+    grown = '# Refactor Parser' + nl + '**nested groups extraction ' + noise + '**' + nl
+    r2 = rh.run_counterfactual('s', fuller, grown, tasks, executor='mock', config=cfg)
+    assert r2['ok'] is True and r2['accepted'] is False, r2
+    assert r2['reason'] == 'rejected_no_lift', r2
+    assert r2['hard_current'] == r2['hard_proposed'] == 1.0, r2
+    print(' t_v1813fu_multi_kw_gate_accepts: OK')
+
 @test('v1.8.11: judge burst throttle spaces consecutive LLM calls')
 def t_v1811_judge_throttle() -> None:
     purpose = 'Two back-to-back judge_outcome calls are >= SKILLOPT_JUDGE_THROTTLE_S apart; env 0 disables; result shape unchanged.'

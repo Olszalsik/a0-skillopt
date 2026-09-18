@@ -562,10 +562,7 @@ Last updated: 2026-09-15 (v1.8.9 zero-rollout fix).
   replay gate rejected it fail-closed (mock-scorer keyword dilution,
   45 -> 81 keywords, 0.4603 -> 0.4541). Atomic rollout writes and the
   chat_shepherd harvest filter shipped in the same release.
-- **Still open**: item 9 hub merge (PR #512 open); replay-gate scorer
-  fix - normalize mock overlap by keyword-set size or enable the real
-  executor (replay_real_executor_enabled) so better-but-larger proposals
-  are not spuriously rejected; judge endpoint burst throttling (label
+- **Still open**: item 9 hub merge (PR #512 open); replay-gate scorer fix CLOSED in v1.8.11 (task-side coverage: covered task tokens / total task tokens, size-invariant in [0,1]; end-to-end multi-keyword gate acceptance pinned by the v1.8.13 follow-up smoke tests); judge endpoint burst throttling (label passes converge over sequential re-runs).
   passes converge over sequential re-runs).
 
 
@@ -606,5 +603,4 @@ Last updated: 2026-09-15 (v1.8.9 zero-rollout fix).
 - **Still open**: item 9 hub merge (PR #512 awaiting maintainer;
   re-run scripts/check_hub_status.py after merge until MERGED_INDEXED -
   the generated-index release regenerates asynchronously after merge);
-  replay-gate scorer fix (normalize mock overlap by keyword-set size or
-  enable replay_real_executor_enabled).
+ replay-gate scorer fix - CLOSED in v1.8.11 (task-side coverage, size-invariant in [0,1]; end-to-end multi-keyword gate acceptance pinned by the v1.8.13 follow-up tests).

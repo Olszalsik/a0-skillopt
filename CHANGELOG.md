@@ -6,6 +6,19 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ## [Unreleased]
 
+### Test: multi-keyword mock-scorer parity (v1.8.13 follow-up)
+
+- No scorer code change required: the requested normalization (ratio in
+  [0,1], consistent for single- and multi-keyword tasks) already shipped in
+  v1.8.11 (d532baf) as task-side coverage - covered task tokens divided by
+  total task tokens. Implementing the literal keyword-set-size ratio instead
+  would reintroduce the original 45->81 dilution defect.
+- 2 new smoke tests: exact coverage-ratio ladder (0.6/0.7/0.9/1.0 with noise
+  immunity) and end-to-end run_counterfactual(mock) gate acceptance on
+  multi-keyword tasks (better-but-larger accepted at +10pp; noise growth is
+  rejected_no_lift, never rejected_regression). Suite: 157/157.
+- ROADMAP: stale Still-open replay-gate scorer clauses closed out.
+
 ## [1.8.13] - 2026-09-18
 
 ### Add: hub_status API endpoint (roadmap item 10 tooling)
