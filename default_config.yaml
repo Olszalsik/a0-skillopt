@@ -87,7 +87,7 @@ replay_local_gate_enabled: true
 replay_min_n: 3
 replay_held_out_n: 8
 replay_real_executor_enabled: false
-replay_real_per_task_timeout_s: 180
+replay_real_per_task_timeout_s: 600
 replay_real_max_tasks: 4
 
 # =====================================================================

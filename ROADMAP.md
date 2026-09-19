@@ -649,3 +649,29 @@ Last updated: 2026-09-15 (v1.8.9 zero-rollout fix).
 - **Hub PR #512 status (watchdog-refreshed logs/hub_status.json)**: OPEN_PENDING as of probe 2026-09-19T14:30:32Z (mergeable_state=clean, head e0d6d328361e7efd8bc8e20c47fc64803b5d96db, history 18 entries; skillopt not yet indexed - expected pre-merge).
 - **Still open**: item 9 hub merge (PR #512 open; v1.8.15 watchdog monitors automatically); first live gated sleep cycle on a real backend (mock-only in this container; mock replay lift currently 2.08 pp vs the 5.0 pp gate threshold).
 
+
+
+### Status addendum (2026-09-19 late, v1.8.17: dockerized replay executor repaired + validated end-to-end)
+
+- **Two worker defects fixed in `scripts/replay_worker.py`** (both previously fatal):
+  1. Post-purge dockerized seed - the marker is now set after `_setup_syspath()`'s
+     `sys.modules` purge; the pre-purge seed bound the orphaned runtime module and
+     extension calls routed over the RFC bridge (50081 dial, no in-container listener).
+  2. Tools namespace - force-resolve `tools` and append the framework tools dir to
+     `__path__` before agent construction, so `get_tool`'s unknown-tool fallback
+     (`tools.unknown`) is always importable; bad tool calls now degrade gracefully
+     instead of crashing the monologue.
+- **Timeout ceiling**: `replay_real_per_task_timeout_s` 180 -> 600 (config + harness
+  fallback); validated monologues run 288-323s, so 180s fail-closed every real replay.
+- **Direct probe evidence** (SKILLOPT_REPLAY_MODE=1, PYTHONPATH=/a0, hostile
+  cwd=plugin root unless noted; scored envelopes, source=model):
+  - held[0] security-scan task: score 1.0 / success / 322.9s / rc 0
+  - held[1] different harvested fixture: score 1.0 / success / 288.0s / rc 0
+  - held[0] from benign cwd /a0: score 1.0 / success / 315.5s / rc 0 (the two earlier
+    benign-cwd timeouts at 300s/480s budgets were backend latency variance)
+- **Suite**: 163/163 PASS. The premature `replay_real_executor_enabled` default flip
+  was reverted (stays opt-in=false) after it flipped the C2 gate test onto the real
+  executor path; the C2 test premise (mock default) is intact.
+- **Still open**: item 9 hub merge (PR #512 open, watchdog-monitored); first live gated
+  sleep cycle on a real backend - now unblocked by the timeout fix (executor opt-in is
+  a config decision at that point).

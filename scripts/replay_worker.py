@@ -206,6 +206,16 @@ async def _run_monologue(
     not accumulate replay contexts.
     """
     _setup_syspath()
+    # v1.8.0 dockerized fix (post-purge): seed the marker AFTER the sys.modules
+    # purge. A seed run earlier (e.g. in main) binds the pre-clear runtime module
+    # object, which _setup_syspath() orphans; the framework then re-imports a
+    # fresh runtime whose args lack the marker, so extension calls route over
+    # the RFC bridge (rfc_url/rfc_port_http) which has no in-container listener.
+    try:
+        from helpers import runtime as _a0_runtime
+        _a0_runtime.args.setdefault("dockerized", "true")
+    except Exception:
+        pass
     from initialize import initialize_agent  # type: ignore
     from agent import AgentContext, UserMessage  # type: ignore
 
@@ -221,6 +231,23 @@ async def _run_monologue(
     os.chdir(workdir)
 
     config = initialize_agent(override_settings={"workdir_path": str(workdir)})
+
+    # v1.8.0 tools-namespace fix (v2): agent.get_tool resolves its
+    # unregistered-tool fallback via a package import that can lose to the
+    # plugin tools/ package (regular package beats the framework namespace
+    # portion). Force-resolve `tools` NOW and append the framework tools
+    # dir to its __path__ so unknown.py is always reachable while plugin
+    # tools keep their own names.
+    try:
+        import tools as _tools_mod  # noqa: F401
+        _fw_tools = str(_a0_root() / 'tools')
+        _paths = list(getattr(_tools_mod, "__path__", []))
+        if _fw_tools not in _paths:
+            _paths.append(_fw_tools)
+            _tools_mod.__path__ = _paths
+    except Exception:
+        pass
+
     ctx = AgentContext(config=config)
     try:
         agent = ctx.agent0

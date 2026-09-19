@@ -4,6 +4,45 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.17] - 2026-09-19
+
+### Fixed: dockerized replay executor - post-purge seed ordering, tools namespace, timeout ceiling
+
+- `scripts/replay_worker.py` `_run_monologue()`: the dockerized marker
+  (`helpers.runtime.args['dockerized']='true'`) is now seeded AFTER the
+  `sys.modules` purge in `_setup_syspath()`. The previous pre-purge seed bound
+  the orphaned runtime module object; the framework re-imported a fresh runtime
+  whose args lacked the marker, so extension calls routed over the RFC bridge
+  (rfc_url/rfc_port_http) which has no in-container listener and the monologue
+  died on the 50081 dial.
+- `scripts/replay_worker.py` `_run_monologue()`: force-resolve the `tools`
+  package binding and append the framework tools dir to its `__path__` before
+  agent construction. The plugin regular `tools/` package (with `__init__.py`)
+  can win the `tools` binding during framework import, after which
+  `agent.get_tool()`'s unregistered-tool fallback raised ModuleNotFoundError
+  for `tools.unknown`, crashing the monologue. With the fix the fallback module
+  is always reachable and the agent loop recovers gracefully from bad tool
+  calls (validated: successful probes exercised the fallback and ran to a
+  scored envelope).
+- `default_config.yaml` + `helpers/replay_harness.py`:
+  `replay_real_per_task_timeout_s` default 180 -> 600. Validated real-executor
+  monologues run 288-323s in this container, so the 180s ceiling guaranteed
+  TimeoutExpired -> fail-closed `real_executor_unavailable` on every real
+  replay task, leaving the opt-in executor non-functional despite a healthy
+  worker. `replay_real_executor_enabled` stays opt-in (false).
+
+### Validated (direct evidence)
+
+- Held-out replay, `security-scan-untrusted-plugin` task 1, hostile cwd
+  (plugin root), 480s budget: score 1.0, outcome success, source model,
+  322.9s, rc 0.
+- Held-out task 2 (different harvested fixture, same skill), hostile cwd:
+  score 1.0, success, 288.0s, rc 0.
+- Task 1 again from the benign cwd /a0: score 1.0, success, 315.5s, rc 0 -
+  benign-path parity proven; the two earlier benign-cwd timeouts (300s/480s
+  budgets) were backend latency variance, not a code regression.
+- Full smoke suite: 163/163 PASS.
+
 ## [1.8.16] - 2026-09-19
 
 ### Added: judge burst protection - limiter + pacing + backoff retries

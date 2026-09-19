@@ -210,7 +210,7 @@ def _real_score(
         worker = sleep_runner.plugin_root() / "scripts" / "replay_worker.py"
         if not worker.is_file():
             raise RuntimeError(f"replay worker not found: {worker}")
-        timeout = float(cfg.get("replay_real_per_task_timeout_s", 180) or 180)
+        timeout = float(cfg.get("replay_real_per_task_timeout_s", 600) or 600)
 
         fd, sf = tempfile.mkstemp(suffix=".md", prefix="skillopt_replay_skill_")
         os.write(fd, (skill_md or "").encode("utf-8"))
