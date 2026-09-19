@@ -641,3 +641,11 @@ Last updated: 2026-09-15 (v1.8.9 zero-rollout fix).
   monitors automatically); staged security-scan proposal remediation
   (example block); first live gated sleep cycle on a real backend
   (mock-only in this container); judge endpoint burst throttling (CLOSED in v1.8.16).
+
+### Status addendum (2026-09-19, structural remediation verified; full gate-pipeline evaluation)
+
+- **Staged security-scan proposal remediation: CLOSED** - balanced ```bash example block inserted (staged file 7747 chars vs live 3051; frontmatter + headings intact). Read-only structural probe returned (True, ok), clearing the previously recorded structural REJECT (no triple-backtick example block). Live skill and framework code untouched (sha-verified before/after).
+- **Full gate-pipeline evaluation (read-only)** recorded to logs/sleep_runner.log (unit full_gate_evaluation): structural PASS (ok); example block present and balanced (2 fences); size bounds pass (7747 >= 200 min_chars; growth vs 3051, shrink ceiling not triggered; note: no separate token-bound stage exists in the current gate - min_chars + max_shrink_ratio are the implemented equivalent); policy scope pass (opt_out global default, no scope keys); counterfactual mock executor over 7 held-out rollouts -> hard_current 0.4694, hard_proposed 0.4902, lift 2.08 pp, accepted=False (rejected_insufficient_lift:2.08<5.0); A/B harness -> config-disabled advisory skip (ab_harness_enabled: false), can_run=False, completed without error. Integrated gate verdict: REJECT (replay_gate_rejected: rejected_insufficient_lift:2.08<5.0) - fail-closed mechanics preserved; no adoption performed.
+- **Hub PR #512 status (watchdog-refreshed logs/hub_status.json)**: OPEN_PENDING as of probe 2026-09-19T14:30:32Z (mergeable_state=clean, head e0d6d328361e7efd8bc8e20c47fc64803b5d96db, history 18 entries; skillopt not yet indexed - expected pre-merge).
+- **Still open**: item 9 hub merge (PR #512 open; v1.8.15 watchdog monitors automatically); first live gated sleep cycle on a real backend (mock-only in this container; mock replay lift currently 2.08 pp vs the 5.0 pp gate threshold).
+
