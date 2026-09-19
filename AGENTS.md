@@ -111,9 +111,9 @@ paths in user-facing strings and staged-proposal instructions are plugin-relativ
 - `api/` — adopt, status, config, fragments (+rollback), cycles (+cycle), audit_log, loop, sleep,
   staged, reject, rollback, governance_approve, governance_status (NEW v1.7.0), hub_status (NEW v1.8.13)
 - `webui/` — dashboard + config UI (Staged-proposals + Governance sections v1.7.0)
-- `tests/smoke.py` — 157 deterministic tests (no LLM/network); 11 `t_v18_*` + the renamed
-  `t_c2_real_executor_disabled_returns_not_enabled` cover the v1.8.0 opt-in paths with mocked
-  subprocess / LLM / asyncio (no real spawn).
+- `tests/smoke.py` — 163 deterministic tests (no LLM/network); the v1.8.0 opt-in paths are covered
+  by mocked subprocess / LLM / asyncio cases (no real spawn), and the v1.8.13–v1.8.16 additions
+  (5 hub_status + 2 multi-keyword scorer + 6 judge burst-protection cases) are fully mocked as well.
 
 ## Local Contracts
 
@@ -170,8 +170,11 @@ paths in user-facing strings and staged-proposal instructions are plugin-relativ
 
 ## Verification
 
-- `python tests/smoke.py` — 157 deterministic tests (no LLM/network); the 11 `t_v18_*` cases mock
-  subprocess / LLM / asyncio so no real spawn or network happens in the suite.
+- `python tests/smoke.py` — 163 deterministic tests (no LLM/network); the v1.8.13–v1.8.16 additions
+  (5 hub_status + 2 multi-keyword scorer + 6 judge burst-protection cases) mock subprocess / LLM /
+  asyncio so no real spawn or network happens in the suite. The v1.8.15 watchdog is covered by
+  acceptance checks (refresh / throttle skip / timeout / single-flight / loader discovery), not
+  smoke cases.
 - `python -c "import skillopt_sleep"` in the A0 venv confirms the official package (else fallback).
 - Dry-run against the 5 synthetic rollouts with `use_official_engine: true`, `auto_adopt: false` → a
   proposal lands in `staging/` with a gate reason recorded in `cycle_history.jsonl`.
@@ -222,12 +225,53 @@ Remaining live follow-up: install `skillopt`/`skillopt_sleep` into the A0 venv a
 `run` end-to-end (with a configured backend) to confirm the bridge works against the installed
 version, not just the source tree.
 
+## HUB STATUS + WATCHDOG + JUDGE BURST (v1.8.13–v1.8.16, source-verified)
+
+- **REST endpoint** — `api/hub_status.py`: `GET|POST /api/plugins/skillopt/hub_status` serves the
+  `{latest, history}` payload persisted by `scripts/check_hub_status.py` to `logs/hub_status.json`
+  (latest.status in OPEN_PENDING / MERGED_INDEXED / MERGED_UNINDEXED, or a probe-reported ERROR
+  served as honest data with HTTP 200). Execution cache: a fresh payload (file mtime age <= 3600 s)
+  is returned as-is with no spawn. Stale/missing triggers exactly one refresh: `sys.executable
+  scripts/check_hub_status.py` as an asyncio subprocess under a hard 3 s timeout (killed on
+  overrun; the server loop never parks on network timeouts). Concurrent requests share a single
+  refresh via a process-wide `threading.Lock` guard (losers poll file freshness). Refresh failure
+  returns HTTP 500 `{status: ERROR, message}` (no tracebacks). Auth/CSRF relaxed (read-only public
+  status); Flask imported lazily (CI dict fallback carries `http_status`).
+- **Background watchdog** — `extensions/python/job_loop/_80_skillopt_hub_watchdog.py`
+  (`HubWatchdogExtension`, v1.8.15): fired from the framework scheduler's job_loop tick
+  (`scheduler_tick()` → `call_extensions_async("job_loop")`), never the main chat thread. Mtime
+  throttle `THROTTLE_S = 1800.0`: the probe runs only when `logs/hub_status.json` is older than
+  1800 s (or missing); subprocess hard cap `SUBPROCESS_TIMEOUT_S = 3.0` (child killed on overrun);
+  single-flight module flag (deliberately not `asyncio.Lock`, which binds to the first awaiting
+  loop); broad try/except so background errors are logged and never propagate into the job loop;
+  stdlib only. On merge, the first tick past the throttle window records MERGED_INDEXED /
+  MERGED_UNINDEXED and the endpoint surfaces the transition within one throttle window.
+- **Judge burst protection** — `helpers/llm_judge.py` (v1.8.16), judge calls only
+  (direct_optimizer untouched; `judge_outcome` never-raises contract preserved): (1) in-flight
+  limiter `threading.BoundedSemaphore`; (2) reservation pacing — `_throttle_wait()` reserves slot
+  starts under a lock so consecutive HTTP attempts stay >= `SKILLOPT_JUDGE_THROTTLE_S` apart
+  (replaces the racy read-sleep-write stamp); (3) backoff retries for 429 / rate limit, 5xx,
+  timeouts, connection errors with half-to-full jitter + `Retry-After` honor; non-retryable fail
+  fast; exhaustion re-raises into the wrapper → `{label: None, error}`. Env knobs (env-only, not
+  config keys): `SKILLOPT_JUDGE_MAX_CONCURRENCY` (default 1), `SKILLOPT_JUDGE_THROTTLE_S` (1.5,
+  0 disables; knob since v1.8.11), `SKILLOPT_JUDGE_RETRY_MAX` (3), `SKILLOPT_JUDGE_RETRY_BASE_S`
+  (0.5), `SKILLOPT_JUDGE_RETRY_MAX_S` (8.0). Telemetry: `llm_judge._retry_stats`;
+  `_reset_burst_state()` for test isolation.
+- **Suite counts** — 163 deterministic tests: 150 (v1.8.12) → 155 (v1.8.13, +5 hub_status) →
+  157 (v1.8.14, +2 multi-keyword scorer) → 163 (v1.8.16, +6 burst). All v1.8.13–v1.8.16 smoke
+  additions are mocked (no real spawn/network). The v1.8.15 watchdog is verified by acceptance
+  checks (refresh + throttle skip both directions, instrumented timeout, single-flight spawn
+  count, loader discovery), not by smoke cases.
+
 ## See also
 
 - `plugin.yaml` — manifest (name, version, settings_sections, per_project_config, per_agent_config)
 - `default_config.yaml` — defaults incl. the OFFICIAL ENGINE BRIDGE (v1.6.0) section
 - `helpers/official_adapter.py` — the Solution B bridge (probe + run_official_sleep_cycle)
 - `helpers/direct_optimizer.py` — the fallback optimizer (v1.6.0 FALLBACK ROLE)
+- `api/hub_status.py` — hub merge/indexing status endpoint (v1.8.13; 3600 s execution cache, 3 s refresh cap)
+- `extensions/python/job_loop/_80_skillopt_hub_watchdog.py` — background job_loop watchdog (v1.8.15; 1800 s mtime throttle)
+- `scripts/check_hub_status.py` — hub PR #512 probe persisting `logs/hub_status.json`
 - `README.md` — user-facing docs
 - Framework references: `helpers/plugins.py` (lifecycle), `helpers/api.py` (API dispatch),
   `helpers/ui_server.py` (asset serving)
@@ -259,3 +303,23 @@ version, not just the source tree.
   `score_rollout` config wiring (`_config_prefer_above`: `calibration.json` > `reward_model_prefer_above`
   > 0.6; `reward_model_path` config now read, env wins). `direct_optimizer._call_llm` gained an optional
   `system` param so the judge reuses it. 133/133 smoke tests. Live checks L1–L4 pending A0 venv + LLM.
+- 1.8.1–1.8.12 — see `CHANGELOG.md` (env-file indirection + setup-env sanitization, governance
+  pause, scorer size-invariance + judge throttle, chat-model sentinel, hermetic test isolation;
+  suite grew 133 → 150).
+- 1.8.13 — hub_status REST endpoint (`api/hub_status.py`): GET|POST
+  `/api/plugins/skillopt/hub_status` serving `logs/hub_status.json` with a 3600 s mtime execution
+  cache, single-flight 3 s watchdog refresh, structured HTTP 500 on refresh failure; +5 smoke
+  tests (suite 155).
+- 1.8.14 — multi-keyword replay scorer parity tests (+2, suite 157): task-side coverage ratio
+  (shipped in v1.8.11) pinned by an exact-score ladder + end-to-end gate acceptance on
+  multi-keyword tasks; no scorer change (a literal keyword-set-size ratio would reintroduce the
+  45→81 dilution defect).
+- 1.8.15 — hub watchdog background job_loop extension
+  (`extensions/python/job_loop/_80_skillopt_hub_watchdog.py`): 1800 s mtime throttle, non-blocking
+  asyncio refresh of `logs/hub_status.json`, 3 s subprocess cap, single-flight, never raises into
+  the job loop.
+- 1.8.16 — judge burst protection in `helpers/llm_judge.py`: in-flight limiter + reservation
+  pacing + 429/5xx backoff retries (`SKILLOPT_JUDGE_MAX_CONCURRENCY`, `SKILLOPT_JUDGE_THROTTLE_S`,
+  `SKILLOPT_JUDGE_RETRY_MAX`, `SKILLOPT_JUDGE_RETRY_BASE_S`, `SKILLOPT_JUDGE_RETRY_MAX_S`); +6
+  smoke tests (suite 163). Tag `v1.8.16` (d679385); hub PR #512 manifest references this release
+  line in its head commit (e0d6d32).

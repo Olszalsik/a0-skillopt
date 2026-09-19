@@ -15,7 +15,7 @@
 - **Real A0-agent-loop replay executor** (`replay_real_executor_enabled: true`): the local replay gate re-runs each held-out task through a real Agent Zero monologue under the current vs proposed skill (subprocess-isolated: temp cwd, own event loop, recursion-guarded) instead of the mock keyword heuristic. Cost is bounded by `replay_real_max_tasks` (default 4) and `replay_real_per_task_timeout_s` (default 180).
 - **DistilBERT reward-model training**: an LLM-judge labelling pass (`scripts/label_rollouts.py`) writes outcome labels into your rollouts, then `scripts/train_reward_model.py --mode train` trains a 3-class classifier on them, a calibration pass picks the `prefer_model_above` threshold, and `score_rollout` uses the trained + calibrated model instead of the heuristic. The previously-dead `reward_model_path` / `reward_model_prefer_above` config keys are now wired.
 
-Live verification of the opt-in paths (real A0 runtime + LLM credentials) is still pending; the 122/122 deterministic smoke suite covers all logic testable without them.
+Live verification of the opt-in paths (real A0 runtime + LLM credentials) is still pending; the 163/163 deterministic smoke suite covers all logic testable without them.
 
 ---
 
@@ -152,6 +152,65 @@ When you trust the output, set `auto_adopt: true` in the settings (or POST to `/
 | `target_model` | `chat` | Model A0 runs in production; held-out replay uses it. The `chat` sentinel (v1.8.12) follows the active A0 chat model. |
 
 For the full reference with comments, see `default_config.yaml`.
+## Judge burst protection (v1.8.16)
+
+`helpers/llm_judge.py` wraps every judge LLM call in a three-layer burst guard:
+
+1. **In-flight limiter** — a `threading.BoundedSemaphore` caps concurrent judge calls
+   (`SKILLOPT_JUDGE_MAX_CONCURRENCY`, default `1` = strict serialization; raise it for bounded
+   parallelism).
+2. **Reservation pacing** — each call reserves its slot start under a lock, so consecutive
+   HTTP attempts stay at least `SKILLOPT_JUDGE_THROTTLE_S` apart (default `1.5`, `0` disables; knob
+   since v1.8.11) even when many callers race.
+3. **Backoff retries** — retryable failures (HTTP 429 / rate limit, 5xx, timeouts, connection
+   errors) retry with exponential backoff and half-to-full jitter, honoring `Retry-After` when the
+   SDK exposes it. Non-retryable errors fail fast; retry exhaustion re-raises into the never-raises
+   wrapper, so a judge failure degrades to `{label: None, error}` instead of crashing a cycle.
+
+The knobs are environment variables (not config keys):
+
+| Env var | Default | What it controls |
+|---|---|---|
+| `SKILLOPT_JUDGE_MAX_CONCURRENCY` | `1` | Max concurrent judge calls (strict serialization at 1). |
+| `SKILLOPT_JUDGE_THROTTLE_S` | `1.5` | Minimum seconds between consecutive judge HTTP attempts (0 disables). |
+| `SKILLOPT_JUDGE_RETRY_MAX` | `3` | Retry attempts for retryable judge failures. |
+| `SKILLOPT_JUDGE_RETRY_BASE_S` | `0.5` | Exponential backoff base delay (half-to-full jitter). |
+| `SKILLOPT_JUDGE_RETRY_MAX_S` | `8.0` | Upper cap on a single backoff delay. |
+
+Retry telemetry lives in `helpers.llm_judge._retry_stats` (attempts / retries / exhausted);
+`_reset_burst_state()` resets limiter / pacing / retry state (test isolation). Non-judge LLM
+callers (the direct optimizer) are untouched by the burst guard.
+
+---
+
+## Hub submission status (v1.8.13+)
+
+SkillOpt's Plugin Hub submission (agent0ai/a0-plugins PR #512) is monitored by
+`scripts/check_hub_status.py`, which persists `{latest, history}` to `logs/hub_status.json`
+(`latest.status`: OPEN_PENDING / MERGED_INDEXED / MERGED_UNINDEXED, or ERROR when a probe itself
+failed).
+
+**Endpoint:** `GET` / `POST` `/api/plugins/skillopt/hub_status` (`api/hub_status.py`). Read-only,
+public, non-sensitive — auth/CSRF are relaxed. Semantics:
+
+- **Execution cache:** a fresh payload (file mtime age <= 3600 s / 1 hour) is returned as-is with
+  HTTP 200 — no subprocess is spawned.
+- **Refresh:** a stale or missing payload triggers exactly one refresh: `scripts/check_hub_status.py`
+  runs as an asyncio subprocess under a hard **3 s** timeout (killed on overrun; the server event
+  loop is never parked on a network timeout). Concurrent requests share a single refresh via a
+  process-wide guard; waiters poll file freshness instead of spawning duplicates.
+- **Failure:** a failed refresh (spawn error, timeout, file still missing/stale) returns HTTP 500
+  with a structured `{status: ERROR, message: ...}` body. A probe that itself reports `ERROR` is
+  served as honest data with HTTP 200.
+
+**Background watchdog (v1.8.15):** the job_loop extension
+`extensions/python/job_loop/_80_skillopt_hub_watchdog.py` (`HubWatchdogExtension`) is fired by
+Agent Zero's background scheduler tick and keeps the same state file fresh with a **1,800 s mtime
+throttle** — the probe runs only when `logs/hub_status.json` is older than 30 minutes (or
+missing), each run capped at 3 s, single-flight (overlapping ticks never double-spawn), and
+background errors are logged and never propagate into the job loop. Once the Hub PR merges, the
+first tick past the throttle window records MERGED_INDEXED / MERGED_UNINDEXED, and the endpoint
+surfaces the transition within one throttle window — no manual watchdog runs needed.
 
 ---
 
@@ -182,14 +241,17 @@ If a proposal is rejected, the reason is logged to `logs/runs/adoptions.log` and
 | `execute.py` | Self-check script |
 | `tools/` | Agent-callable tools |
 | `api/` | HTTP API handlers |
+| `api/hub_status.py` | `GET/POST /api/plugins/skillopt/hub_status` — hub merge/indexing status (v1.8.13) |
 | `webui/` | Settings page + dashboard |
 | `helpers/` | Sleep runner, auto-loop, bridge, direct optimiser |
 | `extensions/python/` | Lifecycle hooks (monologue_end, agent_init, hooks, banners) |
+| `extensions/python/job_loop/_80_skillopt_hub_watchdog.py` | Background watchdog refreshing `logs/hub_status.json` (v1.8.15; 1800 s mtime throttle) |
 | `extensions/webui/` | Head + sidebar HTML injectors |
 | `agents/skillopt_trainer/` | Subordinate profile |
 | `staging/` | Where proposals land before promotion |
 | `logs/rollouts/` | Where the harvester writes per-task records |
 | `logs/runs/` | Cycle logs, state files, audit logs, env file, critiques |
+| `logs/hub_status.json` | Hub watchdog state: `{latest, history}` from `scripts/check_hub_status.py` |
 
 ---
 
