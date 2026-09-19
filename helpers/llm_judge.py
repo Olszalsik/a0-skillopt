@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -145,13 +147,38 @@ def _judge_model(model: str | None) -> str:
     return raw
 
 
-# v1.8.11: burst throttle - batch labelling (scripts/label_rollouts.py) fires one
-# judge LLM call per rollout back-to-back, which trips provider rate limits (429)
-# and wastes retries. A module-level monotonic gate spaces consecutive judge calls
-# at least SKILLOPT_JUDGE_THROTTLE_S seconds apart (env override, default 1.5;
-# 0 disables). judge_outcome keeps its never-raises contract.
+# v1.8.16: judge burst protection - concurrency limiter + inter-request pacing
+# + exponential backoff retries on HTTP 429 / transient transport errors.
+#
+# Batch labelling (scripts/label_rollouts.py) fires one judge LLM call per
+# rollout back-to-back, which trips provider rate limits (429). Three layers,
+# all standard-library (threading/time/random - the judge surface is fully
+# synchronous, so a threading semaphore is the correct limiter here; an
+# asyncio semaphore cannot gate cross-thread sync callers):
+#   1. Pacing  - _throttle_wait() spaces consecutive HTTP attempts at least
+#                SKILLOPT_JUDGE_THROTTLE_S apart (env, default 1.5; 0
+#                disables). The slot start is RESERVED under a lock, so N
+#                concurrent callers get N consecutive spaced slots (the old
+#                racy read-sleep-write could collapse spacing).
+#   2. Limiter - _get_limiter() caps in-flight judge calls at
+#                SKILLOPT_JUDGE_MAX_CONCURRENCY (default 1 = strict
+#                serialization; BoundedSemaphore released in finally).
+#   3. Retries - _judge_llm_call() retries retryable failures (429 / rate
+#                limit, 5xx, timeouts, connection errors) with exponential
+#                backoff + jitter, honoring Retry-After when the SDK exposes
+#                it. Knobs: SKILLOPT_JUDGE_RETRY_MAX (default 3),
+#                SKILLOPT_JUDGE_RETRY_BASE_S (0.5), SKILLOPT_JUDGE_RETRY_MAX_S
+#                (8.0).
+# judge_outcome keeps its never-raises contract: non-retryable errors and
+# retry exhaustion propagate to its wrapper and become {label: None, error}.
+# Non-judge LLM callers are untouched - direct_optimizer is never modified.
 _JUDGE_THROTTLE_DEFAULT_S = 1.5
 _throttle_state = {'last': None}
+_throttle_lock = threading.Lock()
+_limiter_lock = threading.Lock()
+_limiter = None
+_limiter_n = None
+_retry_stats = {'attempts': 0, 'retries': 0, 'exhausted': 0}
 
 
 def _judge_throttle_seconds() -> float:
@@ -165,23 +192,170 @@ def _judge_throttle_seconds() -> float:
     return max(0.0, val)
 
 
-def _throttle_wait() -> float:
-    '''Sleep so consecutive judge LLM calls are spaced >= interval apart.
+def _sleep(seconds: float) -> None:
+    'Seam for tests: all judge sleeps (pacing + backoff) route here.'
+    time.sleep(seconds)
 
-    Returns the waited seconds (0 on the first call or when disabled). The
-    last-call stamp updates on every pass so the next call gates correctly.
+
+def _throttle_wait() -> float:
+    '''Reserve + sleep so consecutive judge HTTP attempts stay >= interval apart.
+
+    v1.8.16: the stamp is the RESERVED slot start (not the wake time),
+    computed under _throttle_lock, so spacing holds under concurrency.
+    Returns the waited seconds (0 on the first call or when disabled).
     '''
     interval = _judge_throttle_seconds()
     now = time.monotonic()
-    last = _throttle_state['last']
-    if interval <= 0.0 or last is None:
-        _throttle_state['last'] = now
-        return 0.0
-    wait = max(0.0, interval - (now - last))
+    with _throttle_lock:
+        last = _throttle_state['last']
+        if interval <= 0.0 or last is None:
+            _throttle_state['last'] = now
+            slot = now
+        else:
+            slot = max(now, last + interval)
+            _throttle_state['last'] = slot
+    wait = max(0.0, slot - now)
     if wait > 0.0:
-        time.sleep(wait)
-    _throttle_state['last'] = time.monotonic()
+        _sleep(wait)
     return wait
+
+
+def _judge_max_concurrency() -> int:
+    raw = os.environ.get('SKILLOPT_JUDGE_MAX_CONCURRENCY')
+    if not raw:
+        return 1
+    try:
+        val = int(raw)
+    except ValueError:
+        return 1
+    return max(1, val)
+
+
+def _get_limiter() -> threading.BoundedSemaphore:
+    'In-flight cap for judge LLM calls (lazily built from env, locked).'
+    global _limiter, _limiter_n
+    n = _judge_max_concurrency()
+    with _limiter_lock:
+        if _limiter is None or _limiter_n != n:
+            _limiter = threading.BoundedSemaphore(n)
+            _limiter_n = n
+        return _limiter
+
+
+def _reset_burst_state() -> None:
+    'Reset pacer stamp + limiter + retry stats (test isolation helper).'
+    global _limiter, _limiter_n
+    with _limiter_lock:
+        _limiter = None
+        _limiter_n = None
+    _throttle_state['last'] = None
+    _retry_stats.update(attempts=0, retries=0, exhausted=0)
+
+
+def _retry_max() -> int:
+    raw = os.environ.get('SKILLOPT_JUDGE_RETRY_MAX')
+    if not raw:
+        return 3
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 3
+
+
+def _retry_base_s() -> float:
+    raw = os.environ.get('SKILLOPT_JUDGE_RETRY_BASE_S')
+    if not raw:
+        return 0.5
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.5
+
+
+def _retry_max_s() -> float:
+    raw = os.environ.get('SKILLOPT_JUDGE_RETRY_MAX_S')
+    if not raw:
+        return 8.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 8.0
+
+
+_RETRYABLE_HINTS = (
+    '429', 'rate limit', 'ratelimit', 'too many requests',
+    'timeout', 'timed out', 'connection', 'temporarily unavailable',
+    'overloaded', '502', '503', '504', 'bad gateway', 'service unavailable',
+)
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    'True for HTTP 429 / 5xx / transient transport errors (attrs + text).'
+    sc = getattr(exc, 'status_code', None)
+    if isinstance(sc, int) and (sc == 429 or 500 <= sc <= 599):
+        return True
+    text = str(exc).lower()
+    return any(h in text for h in _RETRYABLE_HINTS)
+
+
+def _backoff_seconds(attempt: int, exc: BaseException | None = None) -> float:
+    '''Exponential backoff with jitter; honors Retry-After when exposed.
+
+    delay = min(SKILLOPT_JUDGE_RETRY_MAX_S, base_s * 2**attempt), then
+    halved-to-full jitter (x uniform(0.5, 1.0)). A numeric Retry-After
+    (exception attr or response header, seconds) is used verbatim, capped
+    at MAX_S.
+    '''
+    cap = _retry_max_s()
+    raw_ra = None
+    if exc is not None:
+        raw_ra = getattr(exc, 'retry_after', None)
+        if raw_ra is None:
+            try:
+                hdrs = getattr(getattr(exc, 'response', None), 'headers', None)
+                if hdrs:
+                    raw_ra = hdrs.get('retry-after') or hdrs.get('Retry-After')
+            except Exception:  # noqa: BLE001
+                raw_ra = None
+    if raw_ra is not None:
+        try:
+            return min(cap, max(0.0, float(raw_ra)))
+        except (TypeError, ValueError):
+            pass
+    base = _retry_base_s()
+    delay = min(cap, base * (2 ** attempt))
+    return delay * random.uniform(0.5, 1.0)
+
+
+def _judge_llm_call(direct_optimizer: Any, prompt: str, model: str) -> str:
+    '''One judge LLM call with limiter + pacing + backoff retries.
+
+    Per attempt: acquire the in-flight slot, pace (reserve a throttle slot),
+    call. Retryable failures release the slot, back off, and retry up to
+    SKILLOPT_JUDGE_RETRY_MAX times. Non-retryable failures re-raise
+    immediately; exhaustion re-raises the last error - both land in
+    judge_outcome never-raises wrapper as {label: None, error}.
+    '''
+    attempts_allowed = _retry_max() + 1
+    last_exc: BaseException | None = None
+    for attempt in range(attempts_allowed):
+        _retry_stats['attempts'] += 1
+        with _get_limiter():
+            _throttle_wait()
+            try:
+                return direct_optimizer._call_llm(
+                    prompt, model, max_tokens=300, system=JUDGE_SYSTEM,
+                )
+            except Exception as e:  # noqa: BLE001
+                last_exc = e
+                if not _is_retryable(e):
+                    raise
+        if attempt + 1 < attempts_allowed:
+            _retry_stats['retries'] += 1
+            _sleep(_backoff_seconds(attempt, last_exc))
+    _retry_stats['exhausted'] += 1
+    assert last_exc is not None
+    raise last_exc
 
 
 def judge_outcome(rollout: dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
@@ -200,11 +374,8 @@ def judge_outcome(rollout: dict[str, Any], *, model: str | None = None) -> dict[
             from usr.plugins.skillopt.helpers import direct_optimizer  # type: ignore
         except ImportError:
             from helpers import direct_optimizer  # type: ignore
-        _throttle_wait()
         prompt = _build_judge_prompt(rollout)
-        raw = direct_optimizer._call_llm(
-            prompt, resolved_model, max_tokens=300, system=JUDGE_SYSTEM,
-        )
+        raw = _judge_llm_call(direct_optimizer, prompt, resolved_model)
         parsed = _parse_judge_response(raw)
         if parsed.get("label") is None:
             return parsed  # already an {label: None, error} shape

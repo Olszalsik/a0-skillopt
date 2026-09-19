@@ -562,7 +562,7 @@ Last updated: 2026-09-15 (v1.8.9 zero-rollout fix).
   replay gate rejected it fail-closed (mock-scorer keyword dilution,
   45 -> 81 keywords, 0.4603 -> 0.4541). Atomic rollout writes and the
   chat_shepherd harvest filter shipped in the same release.
-- **Still open**: item 9 hub merge (PR #512 open); replay-gate scorer fix CLOSED in v1.8.11 (task-side coverage: covered task tokens / total task tokens, size-invariant in [0,1]; end-to-end multi-keyword gate acceptance pinned by the v1.8.13 follow-up smoke tests); judge endpoint burst throttling (label passes converge over sequential re-runs).
+- **Still open**: item 9 hub merge (PR #512 open); replay-gate scorer fix CLOSED in v1.8.11 (task-side coverage: covered task tokens / total task tokens, size-invariant in [0,1]; end-to-end multi-keyword gate acceptance pinned by the v1.8.13 follow-up smoke tests); judge endpoint burst throttling CLOSED in v1.8.16 (in-flight limiter + reservation pacing + 429/5xx/transport backoff retries; 6 smoke cases).
   passes converge over sequential re-runs).
 
 
@@ -604,3 +604,40 @@ Last updated: 2026-09-15 (v1.8.9 zero-rollout fix).
   re-run scripts/check_hub_status.py after merge until MERGED_INDEXED -
   the generated-index release regenerates asynchronously after merge);
  replay-gate scorer fix - CLOSED in v1.8.11 (task-side coverage, size-invariant in [0,1]; end-to-end multi-keyword gate acceptance pinned by the v1.8.13 follow-up tests).
+
+### Status addendum (2026-09-18, hub watchdog shipped as v1.8.15; hub check + sleep-runner dry-run verification)
+
+- **v1.8.15 released (commit 1808ddf, tag v1.8.15, CI green)**: new
+  background `job_loop` extension
+  `extensions/python/job_loop/_80_skillopt_hub_watchdog.py` refreshes
+  `logs/hub_status.json` at most every 1800s while PR #512 is pending
+  (3s subprocess cap, non-blocking, loop-safe single-flight). Smoke
+  157/157.
+- **Hub status check (manual run 2026-09-18T21:13:45Z)**:
+  `scripts/check_hub_status.py` exit 0, valid JSON on stdout; PR #512
+  still OPEN_PENDING (mergeable_state=clean), generated index live with
+  185 plugins, `skillopt` not yet indexed (expected pre-merge);
+  `logs/hub_status.json` fresh, history now 9 entries.
+- **Sleep-runner dry-run verified** (first official
+  `python -m skillopt_sleep dry-run --json` pass through the v1.8.10
+  bridge wiring; `sleep_runner.py` itself is the shared library, the
+  CLI is the package entrypoint): 79 rollouts bridged, 74 sessions
+  harvested, 40 tasks mined, replay+gate executed in <1s (mock backend,
+  rc=0, JSON stdout). Gate action `reject`, baseline 0.071 = candidate
+  0.071, `staging_dir` empty — fail-closed exactly as designed.
+- **Non-destructiveness proven by before/after SHA snapshots**:
+  `staging/`, `/a0/usr/skills`, `~/.claude`, `~/.codex` and
+  `~/.skillopt-sleep` byte-identical after the dry-run; engine
+  `state.save()` and staging writes confirmed hard-gated behind
+  `if not dry_run:` in cycle.py. Only the in-plugin bridge cache index
+  moved.
+- **Validation-gate readiness**: read-only `validate_proposal()` probe
+  on the real staged proposal (`security-scan-untrusted-plugin.md`,
+  6911 chars vs live 3051) executes all gate stages and returns a
+  structural REJECT — no triple-backtick example block. Gate machinery
+  healthy; the staged proposal needs an example block before it could
+  ever pass adoption.
+- **Still open**: item 9 hub merge (PR #512 open; v1.8.15 watchdog now
+  monitors automatically); staged security-scan proposal remediation
+  (example block); first live gated sleep cycle on a real backend
+  (mock-only in this container); judge endpoint burst throttling (CLOSED in v1.8.16).

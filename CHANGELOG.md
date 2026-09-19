@@ -4,6 +4,39 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.16] - 2026-09-19
+
+### Added: judge burst protection - limiter + pacing + backoff retries
+
+- `helpers/llm_judge.py`: three-layer standard-library burst protection for
+  judge LLM calls, keeping `judge_outcome`'s never-raises contract and
+  leaving all non-judge LLM callers (direct_optimizer users) untouched:
+  1. **In-flight limiter** - `threading.BoundedSemaphore` caps concurrent
+     judge calls at `SKILLOPT_JUDGE_MAX_CONCURRENCY` (default 1 = strict
+     serialization; raise to allow bounded parallelism). The judge surface
+     is synchronous, so a thread semaphore is the correct stdlib limiter;
+     an asyncio semaphore cannot gate cross-thread sync callers.
+  2. **Reservation pacing** - `_throttle_wait()` now reserves each call's
+     slot start at `last + interval` under a lock (replacing the racy
+     read-sleep-write stamp), so consecutive HTTP attempts stay >=
+     `SKILLOPT_JUDGE_THROTTLE_S` apart (default 1.5; 0 disables) even when
+     N callers race; the `SKILLOPT_JUDGE_THROTTLE_S` env contract and the
+     `_throttle_state['last']` shape are unchanged.
+  3. **Backoff retries** - `_judge_llm_call()` retries retryable failures
+     (HTTP 429 / rate limit, 5xx, timeouts, connection errors) with
+     exponential backoff + half-to-full jitter, honoring `Retry-After`
+     when the SDK exposes it. Knobs: `SKILLOPT_JUDGE_RETRY_MAX` (default
+     3), `SKILLOPT_JUDGE_RETRY_BASE_S` (0.5), `SKILLOPT_JUDGE_RETRY_MAX_S`
+     (8.0). Non-retryable errors fail fast; retry exhaustion re-raises the
+     last error into the never-raises wrapper -> `{label: None, error}`.
+  Retry telemetry is exposed via `llm_judge._retry_stats`
+  (attempts / retries / exhausted) and `_reset_burst_state()` provides
+  test isolation.
+- `tests/smoke.py`: 6 new v1.8.16 cases - limiter serialization under 6
+  threads, reservation pacing + bounded parallelism at concurrency 4, 429
+  retry with jittered backoff, exhaustion containment, fail-fast + default
+  knobs, Retry-After honor. Suite: 163 cases.
+
 ## [1.8.15] - 2026-09-18
 
 ### Added: hub watchdog background job_loop extension

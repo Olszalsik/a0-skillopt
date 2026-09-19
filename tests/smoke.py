@@ -5368,6 +5368,337 @@ def t_hub_timeout() -> None:
         hs._spawn, hs._REFRESH_TIMEOUT_S = old_spawn, old_timeout
     _ok('timeout kill enforced; structured error returned')
 
+# ======================================================================= #
+# v1.8.16 NEW: judge burst protection - in-flight concurrency limiter,
+# reservation pacing, exponential backoff retries on HTTP 429 / transient
+# transport errors (6 cases)
+# ======================================================================= #
+
+_section_v1816 = 'v1.8.16 NEW: judge burst protection - limiter + pacing + 429 backoff retries (6 cases)'
+
+
+def _v1816_judge_targets(direct_optimizer):
+    '''Every direct_optimizer module object the judge may import: the
+    plugin-root fallback and, when /a0 is importable, the namespace-path
+    variant - stubbing only one can miss the judge call target.'''
+    mods = [direct_optimizer]
+    try:
+        import usr.plugins.skillopt.helpers.direct_optimizer as _ns
+        if _ns is not direct_optimizer:
+            mods.append(_ns)
+    except ImportError:
+        pass
+    return mods
+
+
+@test('v1.8.16: judge limiter serializes in-flight LLM calls (max_concurrency=1)')
+def t_v1816_limiter_serializes() -> None:
+    purpose = '6 threads call judge_outcome against a 20ms fake LLM: zero in-flight overlap (limiter=1) and starts spaced >= interval apart.'
+    import os as _os
+    import threading as _th
+    import time as _tm
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import direct_optimizer, llm_judge
+    mods = _v1816_judge_targets(direct_optimizer)
+    guard = _th.Lock()
+    spans = []
+
+    def fake(prompt, model, max_tokens=300, system=None):
+        t0 = _tm.monotonic()
+        _tm.sleep(0.02)
+        t1 = _tm.monotonic()
+        with guard:
+            spans.append((t0, t1))
+        return json.dumps({'label': 'success', 'confidence': 0.9, 'reason': 'ok'})
+
+    saved = [(m, m._call_llm) for m in mods]
+    for m in mods:
+        m._call_llm = fake
+    env_keys = ('SKILLOPT_JUDGE_THROTTLE_S', 'SKILLOPT_JUDGE_MAX_CONCURRENCY')
+    env_saved = {k: _os.environ.get(k) for k in env_keys}
+    _os.environ['SKILLOPT_JUDGE_THROTTLE_S'] = '0.02'
+    _os.environ['SKILLOPT_JUDGE_MAX_CONCURRENCY'] = '1'
+    llm_judge._reset_burst_state()
+    try:
+        threads = [_th.Thread(target=llm_judge.judge_outcome, args=({'task': 't', 'last_response': 'r'},)) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        for m, orig in saved:
+            m._call_llm = orig
+        for k, v in env_saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+        llm_judge._reset_burst_state()
+    assert len(spans) == 6, 'expected 6 judge calls, got %d: %r' % (len(spans), spans)
+    spans.sort()
+    overlaps = sum(1 for a, b in zip(spans, spans[1:]) if b[0] < a[1] - 1e-6)
+    assert overlaps == 0, 'in-flight overlap with max_concurrency=1: %r' % (spans,)
+    gaps = [b[0] - a[0] for a, b in zip(spans, spans[1:])]
+    assert min(gaps) >= 0.015, 'start gaps below throttle interval: %r' % (gaps,)
+    print('   serialized 6/6 calls, min start gap %.3fs' % min(gaps))
+    _ok('limiter serializes; spacing preserved under concurrency')
+
+
+@test('v1.8.16: reservation pacing spaces concurrent starts; concurrency 4 permits overlap')
+def t_v1816_pacing_parallel() -> None:
+    purpose = '4 threads, 120ms fake call, interval 20ms, max_concurrency=4: reserved slots keep starts >= ~20ms apart while >=1 overlap proves parallel in-flight calls.'
+    import os as _os
+    import threading as _th
+    import time as _tm
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import direct_optimizer, llm_judge
+    mods = _v1816_judge_targets(direct_optimizer)
+    guard = _th.Lock()
+    spans = []
+
+    def fake(prompt, model, max_tokens=300, system=None):
+        t0 = _tm.monotonic()
+        _tm.sleep(0.12)
+        t1 = _tm.monotonic()
+        with guard:
+            spans.append((t0, t1))
+        return json.dumps({'label': 'partial', 'confidence': 0.5, 'reason': 'ok'})
+
+    saved = [(m, m._call_llm) for m in mods]
+    for m in mods:
+        m._call_llm = fake
+    env_keys = ('SKILLOPT_JUDGE_THROTTLE_S', 'SKILLOPT_JUDGE_MAX_CONCURRENCY')
+    env_saved = {k: _os.environ.get(k) for k in env_keys}
+    _os.environ['SKILLOPT_JUDGE_THROTTLE_S'] = '0.02'
+    _os.environ['SKILLOPT_JUDGE_MAX_CONCURRENCY'] = '4'
+    llm_judge._reset_burst_state()
+    try:
+        threads = [_th.Thread(target=llm_judge.judge_outcome, args=({'task': 't', 'last_response': 'r'},)) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        for m, orig in saved:
+            m._call_llm = orig
+        for k, v in env_saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+        llm_judge._reset_burst_state()
+    assert len(spans) == 4, 'expected 4 judge calls, got %d: %r' % (len(spans), spans)
+    spans.sort()
+    overlaps = sum(1 for a, b in zip(spans, spans[1:]) if b[0] < a[1] - 1e-6)
+    assert overlaps >= 1, 'concurrency 4 must allow parallel in-flight calls: %r' % (spans,)
+    gaps = [b[0] - a[0] for a, b in zip(spans, spans[1:])]
+    assert min(gaps) >= 0.015, 'reservation slots collapsed: %r' % (gaps,)
+    print('   parallel allowed: %d overlapping pair(s), min gap %.3fs' % (overlaps, min(gaps)))
+    _ok('reservation pacing + bounded parallelism verified')
+
+
+@test('v1.8.16: HTTP 429 judge failure retried with exponential backoff')
+def t_v1816_retry_429() -> None:
+    purpose = 'First attempt raises 429, second succeeds: exactly one backoff sleep within [0.5x, 1.0x] of base*2^0, success returned, retry stats incremented.'
+    import os as _os
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import direct_optimizer, llm_judge
+    mods = _v1816_judge_targets(direct_optimizer)
+    calls = []
+    sleeps = []
+
+    def fake(prompt, model, max_tokens=300, system=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError('HTTP 429: rate limit exceeded')
+        return json.dumps({'label': 'success', 'confidence': 0.9, 'reason': 'ok'})
+
+    saved = [(m, m._call_llm) for m in mods]
+    for m in mods:
+        m._call_llm = fake
+    orig_sleep = llm_judge._sleep
+    llm_judge._sleep = sleeps.append
+    env_keys = ('SKILLOPT_JUDGE_THROTTLE_S', 'SKILLOPT_JUDGE_RETRY_BASE_S', 'SKILLOPT_JUDGE_RETRY_MAX')
+    env_saved = {k: _os.environ.get(k) for k in env_keys}
+    _os.environ['SKILLOPT_JUDGE_THROTTLE_S'] = '0'
+    _os.environ['SKILLOPT_JUDGE_RETRY_BASE_S'] = '0.01'
+    _os.environ['SKILLOPT_JUDGE_RETRY_MAX'] = '3'
+    llm_judge._reset_burst_state()
+    try:
+        r = llm_judge.judge_outcome({'task': 't', 'last_response': 'r'})
+        stats = dict(llm_judge._retry_stats)
+    finally:
+        llm_judge._sleep = orig_sleep
+        for m, orig in saved:
+            m._call_llm = orig
+        for k, v in env_saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+        llm_judge._reset_burst_state()
+    assert r.get('label') == 'success', r
+    assert len(calls) == 2, calls
+    assert len(sleeps) == 1, sleeps
+    assert 0.005 <= sleeps[0] <= 0.01, 'backoff outside jitter band: %r' % (sleeps,)
+    assert stats['retries'] == 1 and stats['attempts'] == 2, stats
+    print('   429 -> backoff %.4fs -> success on attempt 2' % sleeps[0])
+    _ok('429 retried with jittered exponential backoff')
+
+
+@test('v1.8.16: retry exhaustion yields structured error, never raises')
+def t_v1816_retry_exhausted() -> None:
+    purpose = 'Judge LLM always returns 429 with retry_max=1: exactly 2 attempts + 1 backoff sleep, result is {label: None, error} naming 429, exhausted counter bumped.'
+    import os as _os
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import direct_optimizer, llm_judge
+    mods = _v1816_judge_targets(direct_optimizer)
+    calls = []
+    sleeps = []
+
+    def fake(prompt, model, max_tokens=300, system=None):
+        calls.append(1)
+        raise RuntimeError('429 too many requests')
+
+    saved = [(m, m._call_llm) for m in mods]
+    for m in mods:
+        m._call_llm = fake
+    orig_sleep = llm_judge._sleep
+    llm_judge._sleep = sleeps.append
+    env_keys = ('SKILLOPT_JUDGE_THROTTLE_S', 'SKILLOPT_JUDGE_RETRY_BASE_S', 'SKILLOPT_JUDGE_RETRY_MAX')
+    env_saved = {k: _os.environ.get(k) for k in env_keys}
+    _os.environ['SKILLOPT_JUDGE_THROTTLE_S'] = '0'
+    _os.environ['SKILLOPT_JUDGE_RETRY_BASE_S'] = '0.01'
+    _os.environ['SKILLOPT_JUDGE_RETRY_MAX'] = '1'
+    llm_judge._reset_burst_state()
+    try:
+        r = llm_judge.judge_outcome({'task': 't', 'last_response': 'r'})
+        stats = dict(llm_judge._retry_stats)
+    finally:
+        llm_judge._sleep = orig_sleep
+        for m, orig in saved:
+            m._call_llm = orig
+        for k, v in env_saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+        llm_judge._reset_burst_state()
+    assert r.get('label') is None and 'error' in r, r
+    assert '429' in str(r.get('error')), r
+    assert len(calls) == 2 and len(sleeps) == 1, (calls, sleeps)
+    assert stats['exhausted'] == 1 and stats['attempts'] == 2, stats
+    print('   exhaustion contained: %r' % r)
+    _ok('exhaustion contained by never-raises contract')
+
+
+@test('v1.8.16: non-retryable judge error fails fast; default knobs verified')
+def t_v1816_fail_fast() -> None:
+    purpose = 'ValueError from the judge backend is not retried (1 call, 0 sleeps, immediate error); defaults read 1.5s throttle / 3 retries / 0.5-8.0s backoff / concurrency 1.'
+    import os as _os
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import direct_optimizer, llm_judge
+    mods = _v1816_judge_targets(direct_optimizer)
+    calls = []
+    sleeps = []
+
+    def fake(prompt, model, max_tokens=300, system=None):
+        calls.append(1)
+        raise ValueError('invalid judge response shape')
+
+    saved = [(m, m._call_llm) for m in mods]
+    for m in mods:
+        m._call_llm = fake
+    orig_sleep = llm_judge._sleep
+    llm_judge._sleep = sleeps.append
+    env_keys = ('SKILLOPT_JUDGE_THROTTLE_S', 'SKILLOPT_JUDGE_RETRY_BASE_S', 'SKILLOPT_JUDGE_RETRY_MAX')
+    env_saved = {k: _os.environ.get(k) for k in env_keys}
+    _os.environ['SKILLOPT_JUDGE_THROTTLE_S'] = '0'
+    _os.environ['SKILLOPT_JUDGE_RETRY_BASE_S'] = '0.01'
+    _os.environ['SKILLOPT_JUDGE_RETRY_MAX'] = '3'
+    llm_judge._reset_burst_state()
+    try:
+        r = llm_judge.judge_outcome({'task': 't', 'last_response': 'r'})
+    finally:
+        llm_judge._sleep = orig_sleep
+        for m, orig in saved:
+            m._call_llm = orig
+        for k, v in env_saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+        llm_judge._reset_burst_state()
+    assert len(calls) == 1, calls
+    assert len(sleeps) == 0, sleeps
+    assert r.get('label') is None and 'ValueError' in str(r.get('error')), r
+    knob_keys = ('SKILLOPT_JUDGE_THROTTLE_S', 'SKILLOPT_JUDGE_MAX_CONCURRENCY', 'SKILLOPT_JUDGE_RETRY_MAX', 'SKILLOPT_JUDGE_RETRY_BASE_S', 'SKILLOPT_JUDGE_RETRY_MAX_S')
+    knob_saved = {k: _os.environ.get(k) for k in knob_keys}
+    for k in knob_keys:
+        _os.environ.pop(k, None)
+    try:
+        assert llm_judge._judge_throttle_seconds() == 1.5
+        assert llm_judge._retry_max() == 3
+        assert llm_judge._retry_base_s() == 0.5
+        assert llm_judge._retry_max_s() == 8.0
+        assert llm_judge._judge_max_concurrency() == 1
+    finally:
+        for k, v in knob_saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+    _ok('fail-fast verified; default knobs 1.5s / 3 / 0.5-8.0s / 1')
+
+
+@test('v1.8.16: Retry-After honored verbatim over exponential backoff')
+def t_v1816_retry_after() -> None:
+    purpose = 'A 429-style exception exposing retry_after=0.07 produces exactly one 0.07s backoff sleep (no jitter) before the successful retry.'
+    import os as _os
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import direct_optimizer, llm_judge
+    mods = _v1816_judge_targets(direct_optimizer)
+    calls = []
+    sleeps = []
+
+    class RateLimited(RuntimeError):
+        retry_after = 0.07
+
+    def fake(prompt, model, max_tokens=300, system=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RateLimited('HTTP 429: too many requests')
+        return json.dumps({'label': 'success', 'confidence': 0.9, 'reason': 'ok'})
+
+    saved = [(m, m._call_llm) for m in mods]
+    for m in mods:
+        m._call_llm = fake
+    orig_sleep = llm_judge._sleep
+    llm_judge._sleep = sleeps.append
+    env_keys = ('SKILLOPT_JUDGE_THROTTLE_S', 'SKILLOPT_JUDGE_RETRY_BASE_S', 'SKILLOPT_JUDGE_RETRY_MAX_S')
+    env_saved = {k: _os.environ.get(k) for k in env_keys}
+    _os.environ['SKILLOPT_JUDGE_THROTTLE_S'] = '0'
+    _os.environ['SKILLOPT_JUDGE_RETRY_BASE_S'] = '0.01'
+    _os.environ['SKILLOPT_JUDGE_RETRY_MAX_S'] = '1.0'
+    llm_judge._reset_burst_state()
+    try:
+        r = llm_judge.judge_outcome({'task': 't', 'last_response': 'r'})
+    finally:
+        llm_judge._sleep = orig_sleep
+        for m, orig in saved:
+            m._call_llm = orig
+        for k, v in env_saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+        llm_judge._reset_burst_state()
+    assert r.get('label') == 'success', r
+    assert len(calls) == 2 and len(sleeps) == 1, (calls, sleeps)
+    assert abs(sleeps[0] - 0.07) < 1e-6, sleeps
+    _ok('Retry-After honored verbatim (0.07s, no jitter)')
+
+
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
     print(_section_v110)
@@ -5381,4 +5712,5 @@ if __name__ == "__main__":
     print(_section_v170_c4)
     print(_section_v180)
     print(_section_v1812)
+    print(_section_v1816)
     sys.exit(main())
