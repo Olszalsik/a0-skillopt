@@ -787,3 +787,46 @@ Last updated: 2026-09-15 (v1.8.9 zero-rollout fix).
   tonight's data shows the precondition itself is currently un-meetable
   during backend contention windows; no plugin-side lever exists within the
   mandated 600s ceiling.
+
+### Status addendum 4 (2026-09-21 10:05 CEST: dual-probe stability check
+retried per approved unit - FAILED again, no full cycle)
+
+- **Mandate**: superior-approved retry of the two-probe stability
+  precondition before any live gated cycle (post `ad0fd8d` CI-green
+  state; 360s per-probe ceiling, 300s pass bar, fail-closed AND-gate).
+- **Two-probe stability precondition executed** (records #10/#11
+  `single_monologue_latency_probe` probe_index 1/2, stability record #12
+  `dual_probe_stability_check`; console evidence
+  `logs/runs/dual_probe_console_20260921T094641.txt`):
+  - Probe 1: held[0] (`fc6e9284...`) vs staged proposal, 360s ceiling ->
+    **timeout 360.1s**.
+  - Probe 2: held[1] (`fa875ba6...`) vs staged proposal, 360s ceiling ->
+    **timeout 360.1s**.
+  - AND-gate: stability_pass=False, decision `no_full_cycle`, exit 0 -
+    full cycle NOT launched, fail-closed state preserved (flag enabled
+    in-memory for the driver process only, `default_config.yaml`
+    untouched, no adoption attempted, staged proposal stays staged).
+- **Interpretation**: sixth consecutive backend-slow window across ~35h
+  (22:38 >900s, 23:11 and 23:34 first-monologue timeouts at 600s, 16:21
+  dual-probe 2x timeout at 360s, 09:46 dual-probe 2x timeout at 360s).
+  Identical fixtures, backend (`ollama_cloud`/`glm-5.3-flash`, preset
+  `2 Agent`), and probe mechanics as the 09-20 attempt produced matching
+  outcomes (360.1s both) - the contention regime is unchanged overnight
+  and through the morning; last sub-300s monologue remains the 201.1s
+  score-1.0 fixture ~35h ago.
+- **Observed pattern**: unchanged - workers stay active (high CPU) until
+  the ceiling kill (slow-completion regime, never a hang); both fixtures
+  independently exceeded 360s, so probe-stage ceilings keep failing
+  monologues that would pass at 600s, and even 600s was insufficient in
+  both full-cycle attempts.
+- **Cleanup**: driver exited 0 after the stability record; no worker
+  children; /tmp probe skill/task/out temps auto-removed; pid + progress
+  log cleaned (driver retained at `/tmp/skillopt_dual_probe_driver.py`
+  per the Sep-19 driver precedent); repo diff ROADMAP-only (logs
+  gitignored).
+- **Still open**: item 9 hub merge (PR #512 open, watchdog-monitored);
+  live gated-cycle retry under the two-probe stability precondition -
+  now 3 probe sessions / 6 timeouts with no sub-300s monologue since the
+  201.1s comparator; ad-hoc retries are burning probe budget during
+  contention, so the next attempt should be scheduled for an off-peak
+  window rather than polled.
