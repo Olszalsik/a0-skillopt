@@ -830,3 +830,39 @@ retried per approved unit - FAILED again, no full cycle)
   201.1s comparator; ad-hoc retries are burning probe budget during
   contention, so the next attempt should be scheduled for an off-peak
   window rather than polled.
+
+### Status addendum 5 (2026-09-21 14:20 CEST: single readiness probe -
+contention persists, live-cycle retries parked)
+
+- **Mandate**: single-monologue latency probe against the staged proposal
+  to test whether `ollama_cloud` contention cleared (<300s) before
+  spending a full two-probe stability pass (post `e255f2a` CI-green
+  state; 360s ceiling, 300s pass bar, read-only).
+- **Probe #13 executed** (record #13 `single_monologue_latency_probe`
+  probe_index 1; console evidence
+  `logs/runs/single_probe_console_20260921T134345.txt`):
+  - held[0] (`fc6e9284...`) vs staged proposal, 360s ceiling ->
+    **timeout 360.1s** (13:43:46 -> 13:49:46).
+  - Verdict: ok=False, pass bar 300s NOT met; decision
+    `contention_persists` -> two-probe stability check NOT signaled.
+- **Protocol refinement**: a single sentinel probe (1x360s worst case)
+  now precedes the dual-probe pass (2x360s) so contention polling no
+  longer burns two-probe budget; the dual pass runs only when the
+  sentinel completes under the 300s bar.
+- **Interpretation**: seventh probe timeout since the 201.1s comparator
+  (~41h ago), across 4 sessions (2x600s first-monologue 09-19, 2x360.1s
+  dual-probe 09-20, 2x360.1s dual-probe 09-21 morning, 1x360.1s sentinel
+  09-21 13:43). The contention regime is unchanged through the
+  afternoon; even the cheap sentinel did not complete.
+- **Decision**: live gated-cycle retries remain **parked pending an
+  off-peak backend window**; ad-hoc polling is unproductive (the
+  sentinel probe itself was the poll and it timed out). Staged proposal
+  stays staged; adoption gate unchanged.
+- **Integrity**: staging sha16 `4495a3010f0417a1` unchanged
+  before/after; driver enabled the real-executor flag in-memory only
+  (`default_config.yaml` untouched); exit 0; no orphaned processes;
+  probe temp files auto-removed; no commits made during the probe (log
+  append only, gitignored).
+- **Still open**: item 9 hub merge (PR #512 open, watchdog-monitored);
+  two-probe stability pass -> live gated-cycle retry, parked for an
+  off-peak window per this addendum.
