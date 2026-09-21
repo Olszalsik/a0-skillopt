@@ -675,3 +675,115 @@ Last updated: 2026-09-15 (v1.8.9 zero-rollout fix).
 - **Still open**: item 9 hub merge (PR #512 open, watchdog-monitored); first live gated
   sleep cycle on a real backend - now unblocked by the timeout fix (executor opt-in is
   a config decision at that point).
+
+
+### Status addendum (2026-09-19 23:15 CEST: first live gated sleep cycle executed — fail-closed on backend latency)
+
+- **Official live gated cycle executed end-to-end** (unit `real_executor_live_cycle`,
+  record #4 in `logs/sleep_runner.log`; evidence sidecar
+  `logs/runs/live_cycle_verdict_20260919T2311.json`):
+  - v1.8.17 worker fixes validated in the production gate path: the 18:42
+    ImportError did NOT recur; the worker spawned under the exact gate env
+    (`SKILLOPT_A0_ROOT`/`PYTHONPATH` unset in both parent and gate env; the
+    `.skillopt-env` overlay is a no-op — comment-only lines), ran a real
+    monologue actively (~30% CPU, cwd in its own temp dir), and temp files
+    were cleaned by the `finally` block.
+  - Executor opted in in-memory (`replay_real_executor_enabled=True` in the
+    passed runtime config); `default_config.yaml` untouched (empty git diff;
+    framework registry unreachable in standalone drivers, so merged_config is
+    YAML-only) — the shipped default stays opt-in=false.
+  - Mandated bounds kept: `replay_real_per_task_timeout_s=600`,
+    `replay_real_max_tasks=4`, 7 held-out rollouts available, gate bar
+    `gate_min_improvement_pp=5.0` / `replay_min_n=3`.
+  - Verdict: `ok=False`, reason `real_executor_unavailable:RuntimeError:replay
+    worker timed out after 600.0s` (elapsed 600.1s) →
+    `adoption=gate_not_run_fail_closed`, `exit_code=0`. No adoption performed;
+    staged proposal remains staged; structural + mock stages remain the active
+    gate path (fail-closed, loud-not-crash, no fake score).
+- **Cause of the fail-close: backend latency regression, not a hang**:
+  - 21:05 direct probes: single monologues completed 288–323s (active preset
+    era `2 Agent`).
+  - 22:38 diagnostic (diag-only 900s budget, setsid-detached): same task and
+    skill exceeded 900s while the worker stayed active (~13.6% CPU) and trivial
+    backend calls remained ~1.3s → slow-completion regime, not stuck.
+  - Prime suspect (unverified): framework Active Preset flipped `2 Agent` →
+    `3 Agent` between 22:17 and 22:58, changing chat-model chain depth for
+    every fresh worker monologue. The plugin-side resolver still reports
+    `2 Agent` (record backend block), so the effective flip lives in the
+    framework settings/env layer — outside plugin authority to change.
+- **Cleanup**: driver + worker processes stopped; /tmp replay artifacts,
+  diag drivers and logs removed; no leftover processes. Only logs and
+  ROADMAP changed in the repo (logs gitignored).
+- **Still open**: item 9 hub merge (PR #512 open, watchdog-monitored); retry
+  of the live gated cycle once backend latency normalizes — precondition:
+  one direct probe monologue completing < ~300s (and/or the framework back on
+  the known-fast `2 Agent` routing); the mandated 600s ceiling stays unchanged.
+
+
+### Status addendum 2 (2026-09-19 23:40 CEST: latency precondition met; live cycle re-run fail-closed again on first monologue)
+
+- **Latency precondition probe (unit `single_monologue_latency_probe`, record #5)**:
+  held[0] (`fc6e928419cd4e8186a891b6f4736c18`) against the staged proposal under a
+  360s ceiling -> **score 1.0, elapsed 201.1s** (< 300s pass bar; comparators:
+  322.9s at 21:05, >900s at 22:38). Chained setsid driver auto-proceeded to the
+  full cycle on pass, per the documented go/no-go.
+- **Full live gated cycle re-run (record #6, evidence
+  `logs/runs/live_cycle_verdict_20260919T2334.json`)**: fail-closed AGAIN at the
+  FIRST monologue - task[0] under the CURRENT skill exceeded the mandated 600s
+  ceiling (elapsed 600.1s, `real_executor_unavailable:RuntimeError:replay worker
+  timed out after 600.0s`); adoption `gate_not_run_fail_closed`, exit 0; probe
+  context embedded in the record; no adoption performed; staged proposal stays
+  staged.
+- **Cause refinement - preset-flip hypothesis REFUTED**: the 23:21 probe ran
+  fast (201.1s) under the now-active `3 Agent` preset, while the `2 Agent` era
+  already produced a >900s window at 22:38 under the same staged skill ->
+  monologue latency is dominated by **minute-scale backend throughput variance**
+  (ollama_cloud), not preset routing and not skill text (skill-length effect
+  cannot be fully excluded as a secondary factor: current-skill monologues still
+  have no completed-timing datapoint - both live-cycle first monologues hit the
+  ceiling).
+- **Gate-design implication**: a single fast probe does not guarantee ~8
+  consecutive fast monologues; at tonight's variance the mandated 600s ceiling
+  fails closed on the first slow monologue (observed twice tonight, 23:11 and
+  23:34, both fail-closed with clean records).
+- **Refined retry precondition**: two consecutive probe monologues < 300s within
+  one ~10 min window (ideally at low-contention hours). Raising
+  `replay_real_per_task_timeout_s` beyond 600 would be an operator-level config
+  decision, out of plugin scope; default stays 600.
+- **Cleanup**: driver exited cleanly, worker child gone, /tmp replay artifacts
+  removed, no orphaned processes. Repo diff: ROADMAP only (logs gitignored).
+- **Still open**: item 9 hub merge (PR #512 open, watchdog-monitored); live
+  gated-cycle retry under the refined two-probe stability precondition.
+
+
+### Status addendum 3 (2026-09-20 16:40 CEST: dual-probe stability check FAILED - no full cycle)
+
+- **Two-probe stability precondition executed** (records #7/#8
+  `single_monologue_latency_probe` probe_index 1/2, stability record #9
+  `dual_probe_stability_check`; console evidence
+  `logs/runs/dualprobe_console_20260920T1634.txt`):
+  - Probe 1: held[0] (`fc6e9284...`) vs staged proposal, 360s ceiling ->
+    **timeout 360.1s** (comparator: 201.1s score 1.0 at 23:21 last night).
+  - Probe 2: held[1] (`fa875ba6...`) vs staged proposal, 360s ceiling ->
+    **timeout 360.1s**.
+  - AND-gate: stability_pass=False, decision `no_full_cycle`, exit 0 -
+    full cycle NOT launched, fail-closed state preserved (flag never set,
+    no adoption attempted, staged proposal stays staged).
+- **Interpretation**: fifth consecutive backend-slow window across ~17h
+  (22:38 >900s, 23:11 and 23:34 first-monologue timeouts at 600s, 16:21
+  dual-probe 2x timeout at 360s). The same fixture completed in 201.1s under
+  the same backend/preset 17h ago, so this is **sustained backend contention**
+  (ollama_cloud/glm-5.3-flash), confirmed by the chained driver probing both
+  fixtures back-to-back with identical timeouts.
+- **Observed pattern**: worker processes stay active (high CPU) until the
+  ceiling kill - slow-completion regime, never a hang; probe-stage ceilings
+  (360s) fail ~40% of monologues that would pass at 600s, but tonight even
+  600s was insufficient.
+- **Cleanup**: driver exited cleanly after the stability record; no worker
+  children; /tmp replay artifacts removed; repo diff ROADMAP-only
+  (logs gitignored).
+- **Still open**: item 9 hub merge (PR #512 open, watchdog-monitored); live
+  gated-cycle retry under the refined two-probe stability precondition -
+  tonight's data shows the precondition itself is currently un-meetable
+  during backend contention windows; no plugin-side lever exists within the
+  mandated 600s ceiling.
