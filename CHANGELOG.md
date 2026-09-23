@@ -4,6 +4,108 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.20] - 2026-09-23
+
+### Fix: gated cycle runner completes its first fully healthy lifecycle
+
+- New `helpers/judge_client.py` + `scripts/run_sleep_cycle.py`: gated
+ sleep-cycle runner (ingestion -> judge -> official gate -> summary,
+ fail-closed, no ungated fallback). The judge phase samples rollouts
+ through the configured judge endpoint and escalates max_tokens on
+ JSON parse failures.
+- v1.8.20 (P5) zombie-aware liveness: `sleep_runner.is_running` treats
+ `/proc/<pid>/stat` state Z as not-running (Linux). An exited-but-
+ unreaped detached engine child answers `os.kill(pid, 0)` and spun the
+ official-gate poll loop until the full timeout even though
+ report.json was already written. Verified live: poll broke 2.1s after
+ engine exit instead of 900s.
+- v1.8.20 (P6) no-proposal classification: `official_adapter` maps a
+ gate-verdict night that staged no proposal (edits=[] under the mock
+ backend) to `gate_rejected` (exit 3) instead of INFRA_FAILED.
+ Fail-closed: nothing adopted, live SKILL.md untouched, official
+ staging preserved.
+- Folded in deployed-but-uncommitted hardening: `bridge.py` dual-layout
+ import (framework layout with plugin-root fallback); `sleep_runner`
+ v1.8.19 P3/RC4 (`validate_proposal` honours caller-resolved
+ `ab_harness_enabled`; mock replay gate gets its own bar
+ `replay_mock_gate_min_improvement_pp` default 1.0, regressions still
+ reject) and P4 (a raising registry config read falls back to the YAML
+ defaults); `tests/smoke.py` v1.8.12 follow-up #2 (hermetic `llm_model`
+ pin in `t_v121_inner_tick_failing_llm`).
+- Live-cycle proof (10:52): judge 3/3 valid labels; engine header shows
+ the plugin-local `--claude-home` redirect with 120 sessions / 40 tasks
+ harvested; summary `GATE_REJECTED` exit 3.
+- Smoke: 1 new case `t_v1820_zombie_aware_is_running`; suite 167/167.
+- `execute.py` EXPECTED_VERSION aligned to 1.8.20 (version parity with
+ plugin.yaml, v1.8.11 convention).
+
+## [1.8.19] - 2026-09-22
+
+### P3 — real gates (autonomy remediation, all landed)
+
+- Mock replay executor gets its own bar `replay_mock_gate_min_improvement_pp`
+  default 1.0 (the 5pp real-data bar rejected every honest proposal at 2.08pp
+  noise); mock counterfactual gate (stage 0 A/B harness) is advisory-only by
+  default, `SKILLOPT_AB_HARNESS_ENABLED` opts a caller in;
+  `validate_proposal` gains `ab_harness_enabled` (the auto-loop previously
+  passed a dead guard); `ab_harness._config()` failure-fallback corrected.
+- Inner loop: `inner_loop_min_rollout_confidence` 0.4 -> 0.25;
+  `inner_loop_skip_retire_after: 3` retires an eternally-skipped rollout with
+  a no-op suggestion; consecutive-skip counters persisted to
+  `logs/runs/.inner_loop_skips.json`.
+- Real replay executor: pairwise per-task failure handling (failed task
+  dropped with an error envelope, gate proceeds on usable pairs, hard-reject
+  below `replay_min_n`); budget = 2 x max_tasks x per_task_timeout_s,
+  documented in `default_config.yaml`.
+- Live verification post-restart: `cycles_run` 0 -> 12+, inner loop drained
+  the eternal backlog (scanned=50 skipped=50 -> suggested=50 -> scanned=0).
+- Live bugs fixed: (a) `cfg.get("budget", {})` returns a STRING - the nested
+  `budget:` YAML section is mangled by merged_config()'s flat light-parse -
+  which silently DISABLED the daily budget cap and never recorded spend
+  (dict accepted only now); (b) a raising framework-registry config read
+  bubbled out of `merged_config()` into the bare `config.json` parity
+  fallback ({} on a wiped config.json - the silent-spin input); failed
+  registry reads now fall back to the YAML defaults.
+
+### P4 — hygiene (all landed)
+
+- Three test-isolation leaks from production state fixed (inner-loop log +
+  skip counters to a tmp sandbox; fake rollouts to a sandbox with
+  `ab_harness._rollouts_dir` + `sleep_runner.list_rollouts` patched;
+  budget-tracker state to a sandboxed `state_dir`).
+- Regression guard tests (run last): `t_p4_empty_config_yields_defaults`
+  (wiped config.json must still yield full YAML defaults),
+  `t_p4_no_fixture_pollution` (fails on fixture-named files in production
+  run state).
+- Pollution purged: 45 fixture suggestion files, budget test state, 59
+  "simulated LLM outage" inner_loop.log rows; debug artifacts archived to
+  `logs/runs/_debug_archive_20260922/`.
+- Smoke: 166/166.
+
+## [1.8.18] - 2026-09-22
+
+### P0 + P1 + P2.1 — autonomy remediation code-complete (163/163 smoke)
+
+- P0.1-P0.5 config integrity: `webui/config.html` `refresh()` reads via GET;
+  `api/config.py` POST guards empty bodies + whitelists known keys; WebUI
+  surfaces loop liveness/config state; `agent_init._get_config()` merges
+  `default_config.yaml` + `config.json` (+ framework overlay) so empty
+  config can never silence the loop; operator intent (`auto_adopt: true`)
+  persisted to `config.json`; loop-tick telemetry (`last_tick_at`,
+  `cfg_empty_since`).
+- P2.1 adoption autonomy: `governance.check_skill_eligible(skill, *,
+  auto_adopt=False)` - the pending-approval block is overridden by an
+  explicit `auto_adopt: true` (per-skill opt-out / immutable / pause still
+  win).
+- P1 trigger: per-skill "new rollouts since the persisted
+  `last_rollout_count_at_cycle`" instead of the in-memory per-tick delta;
+  `_maybe_auto_optin` runs on EVERY tick with new rollouts.
+- P1 hotfix during verification: a trailing comma after
+  `governance.check_skill_eligible(...)` wrapped the 2-tuple in a 1-tuple
+  and broke every `_auto_adopt` unpack (caught by
+  `t_v150_governance_auto_loop_skip`; `py_compile` cannot catch
+  tuple-wrapping commas - run the smoke suite after every code edit).
+
 ## [1.8.17] - 2026-09-19
 
 ### Fixed: dockerized replay executor - post-purge seed ordering, tools namespace, timeout ceiling

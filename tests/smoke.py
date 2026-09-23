@@ -1015,13 +1015,36 @@ def t_v121_harness_uses_fragments() -> None:
 _section_v121 = "v1.2.0 NEW - A/B harness (10 cases)"
 
 
+_FAKE_ROLLOUT_SANDBOX: tuple | None = None
+
+
 def _write_fake_rollouts(skill_name: str, n: int = 6) -> list[Path]:
-    """Drop N synthetic rollouts into the real rollouts/ dir so the
-    harness can load them. Returns the list of paths written so the
-    caller can clean up afterwards."""
+    """Drop N synthetic rollouts into a SANDBOX dir (never production) and
+    point ab_harness at it. Returns the list of paths written so the
+    caller can clean up afterwards via _cleanup_rollouts().
+
+    v1.8.19 (P4, audit RC7): the old version wrote into the PRODUCTION
+    logs/rollouts/ dir via write_rollout(). That directory is shared with
+    the live A0 server process over the 9p mount - once the P3 confidence
+    fix made the live inner-loop tick functional, it started scanning the
+    fixtures mid-suite and enqueuing real suggestion files for them
+    (proven 2026-09-22: 8x v121_skill_gate_loser_test_fixture_*.md). The
+    sandbox removes the shared-state race entirely."""
+    global _FAKE_ROLLOUT_SANDBOX
     sys.path.insert(0, str(PLUGIN_ROOT))
-    from helpers.sleep_runner import write_rollout
+    from helpers import ab_harness
+    from helpers import sleep_runner
     import time as _t
+    _tmp = tempfile.TemporaryDirectory()
+    sandbox = Path(_tmp.name)
+    _saved_rd = ab_harness._rollouts_dir
+    ab_harness._rollouts_dir = lambda: sandbox
+    # Stage 0.7 (local replay gate) loads its held-out set via
+    # sleep_runner.list_rollouts(), NOT ab_harness - patch that too or the
+    # C2 rejection test silently evaluates an empty held-out set.
+    _saved_lr = sleep_runner.list_rollouts
+    sleep_runner.list_rollouts = lambda: sorted(sandbox.glob("*.json"))
+    _FAKE_ROLLOUT_SANDBOX = (_tmp, _saved_rd, _saved_lr)
     written: list[Path] = []
     # Make half successes, half failures so the stratified split has work to do
     outcomes = ("success", "success", "partial", "failure", "failure", "success")
@@ -1034,17 +1057,37 @@ def _write_fake_rollouts(skill_name: str, n: int = 6) -> list[Path]:
             "ts": _t.time() + i,  # ensure mtime ordering
             "id": f"test_fixture_{skill_name}_{i}",
         }
-        p = write_rollout(rec)
+        p = sandbox / f"{rec['id']}.json"
+        p.write_text(json.dumps(rec), encoding="utf-8")
         written.append(p)
     return written
 
 
 def _cleanup_rollouts(paths: list[Path]) -> None:
+    global _FAKE_ROLLOUT_SANDBOX
     for p in paths:
         try:
             p.unlink()
         except FileNotFoundError:
             pass
+    # v1.8.19 (P4): restore ab_harness/sleep_runner dirs and dispose the sandbox.
+    if _FAKE_ROLLOUT_SANDBOX is not None:
+        _tmp, _saved_rd, _saved_lr = _FAKE_ROLLOUT_SANDBOX
+        try:
+            from helpers import ab_harness
+            ab_harness._rollouts_dir = _saved_rd
+        except Exception:
+            pass
+        try:
+            from helpers import sleep_runner
+            sleep_runner.list_rollouts = _saved_lr
+        except Exception:
+            pass
+        try:
+            _tmp.cleanup()
+        except Exception:
+            pass
+        _FAKE_ROLLOUT_SANDBOX = None
 
 
 @test("v1.2.0 NEW (A/B): harness falls back when no rollouts exist")
@@ -1226,6 +1269,12 @@ def t_v121_gate_rejects_loser() -> None:
     from helpers import ab_harness
     from helpers.sleep_runner import validate_proposal
     ab_harness.reset_for_tests()
+    # v1.8.19 (P3): the harness is advisory-only by default (ab_harness_enabled
+    # false - and the _config() failure-fallback now honours that too). This
+    # test exercises the gate MACHINERY, so it opts in explicitly via the
+    # documented env override, like the C2 tests do.
+    old_ab = os.environ.get("SKILLOPT_AB_HARNESS_ENABLED")
+    os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = "1"
     def always_lose(rollout, score_a, score_b):
         return {"verdict": "lose", "confidence": 0.9, "reason": "forced loss"}
     ab_harness.set_judge_fn(always_lose)
@@ -1246,6 +1295,10 @@ def t_v121_gate_rejects_loser() -> None:
             _cleanup_rollouts(rollouts)
     finally:
         ab_harness.set_judge_fn(None)
+        if old_ab is None:
+            os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
+        else:
+            os.environ["SKILLOPT_AB_HARNESS_ENABLED"] = old_ab
 
 
 @test("v1.2.0 NEW (A/B): gate falls through when harness can_run=False")
@@ -1531,8 +1584,17 @@ def t_v121_inner_tick_no_llm():
     """inner_loop_tick with no LLM configured returns counters and never raises."""
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers import inner_loop
+    import helpers.inner_loop as il_mod
     inner_loop.reset_for_tests()
-    counters = inner_loop.inner_loop_tick(llm_endpoint=None)
+    # v1.8.19 (P4, audit RC7): the tick ends in _append_tick_log - keep the
+    # row out of the production logs/runs/inner_loop.log.
+    orig_state_dir = il_mod.state_dir
+    with tempfile.TemporaryDirectory() as tmpdir:
+        il_mod.state_dir = Path(tmpdir)
+        try:
+            counters = inner_loop.inner_loop_tick(llm_endpoint=None)
+        finally:
+            il_mod.state_dir = orig_state_dir
     for key in ("scanned", "suggested", "skipped", "errors", "last_error"):
         assert key in counters, f"missing key {key} in {counters!r}"
     assert isinstance(counters["scanned"], int)
@@ -1558,9 +1620,16 @@ def t_v121_inner_tick_failing_llm():
         import helpers.inner_loop as il_mod
         orig_rollouts_dir = il_mod._rollouts_dir
         orig_suggestions_dir = il_mod.suggestions_dir
+        # v1.8.19 (P4, audit RC7): redirect ALL state files (inner_loop.log,
+        # .inner_loop_skips.json) to the tmp sandbox. Without this the tick's
+        # _append_tick_log wrote a "simulated LLM outage" row into the
+        # production logs/runs/inner_loop.log on every suite run.
+        orig_state_dir = il_mod.state_dir
+        il_mod.state_dir = Path(tmpdir) / "state"
         il_mod._rollouts_dir = lambda: rollouts_dir
         il_mod.suggestions_dir = lambda: Path(tmpdir) / "suggestions"
         (Path(tmpdir) / "suggestions").mkdir(parents=True, exist_ok=True)
+        (Path(tmpdir) / "state").mkdir(parents=True, exist_ok=True)
         orig_cfg = il_mod._config
         def _hermetic_cfg():
             # v1.8.12 follow-up #2: pin a CONCRETE llm_model so this
@@ -1589,6 +1658,7 @@ def t_v121_inner_tick_failing_llm():
             il_mod._config = orig_cfg
             il_mod._rollouts_dir = orig_rollouts_dir
             il_mod.suggestions_dir = orig_suggestions_dir
+            il_mod.state_dir = orig_state_dir
         assert counters["errors"] >= 1, f"expected errors>=1, got {counters!r}"
         assert counters["last_error"], f"expected non-empty last_error, got {counters['last_error']!r}"
 
@@ -1676,11 +1746,26 @@ def t_v122_cadence_load_save_state() -> bool:
     return True
 
 
+_BUDGET_TEST_STATE_DIR: Path | None = None
+
+
+def _budget_test_state_dir() -> Path:
+    """Shared sandbox dir for BudgetTracker state files in this suite
+    (v1.8.19 P4, audit RC7: the budget_over test has no cleanup, so its
+    budget__test_skill_v122_budget_over.json landed in the PRODUCTION
+    state dir on every suite run)."""
+    global _BUDGET_TEST_STATE_DIR
+    if _BUDGET_TEST_STATE_DIR is None:
+        _BUDGET_TEST_STATE_DIR = Path(tempfile.mkdtemp(prefix="skillopt_budget_test_"))
+    return _BUDGET_TEST_STATE_DIR
+
+
 @test("v1.3.0 NEW (Day-4 item 5): budget.BudgetTracker.can_spend allows under cap")
 def t_v122_budget_can_spend_under_cap() -> bool:
     """BudgetTracker.can_spend returns True when under the daily cap."""
     from helpers import budget  # type: ignore
-    bt = budget.BudgetTracker(skill_name="_test_skill_v122_budget_under")
+    bt = budget.BudgetTracker(skill_name="_test_skill_v122_budget_under",
+                              state_dir=_budget_test_state_dir())
     bt.reset_for_tests()  # clean slate
     ok, reason = bt.can_spend(50)
     assert ok, f"should allow 50c under 100c cap, got reason={reason!r}"
@@ -1692,7 +1777,8 @@ def t_v122_budget_can_spend_under_cap() -> bool:
 def t_v122_budget_can_spend_over_cap() -> bool:
     """BudgetTracker.can_spend returns False when the cap would be exceeded."""
     from helpers import budget  # type: ignore
-    bt = budget.BudgetTracker(skill_name="_test_skill_v122_budget_over")
+    bt = budget.BudgetTracker(skill_name="_test_skill_v122_budget_over",
+                              state_dir=_budget_test_state_dir())
     bt.reset_for_tests()  # clean slate
     bt.record_spend(80)  # 80c of 100c used
     ok, reason = bt.can_spend(50)  # 80+50=130 > 100
@@ -1706,7 +1792,8 @@ def t_v122_budget_can_spend_over_cap() -> bool:
 def t_v122_budget_day_rollover() -> bool:
     """BudgetTracker resets the daily total on a new day."""
     from helpers import budget  # type: ignore
-    bt = budget.BudgetTracker(skill_name="_test_skill_v122_budget_rollover")
+    bt = budget.BudgetTracker(skill_name="_test_skill_v122_budget_rollover",
+                              state_dir=_budget_test_state_dir())
     bt.reset_for_tests()
     # Spend 80c today
     res1 = bt.record_spend(80)
@@ -1722,7 +1809,8 @@ def t_v122_budget_day_rollover() -> bool:
     state["daily_total_cents"] = 80  # preserved across rollover
     state_path.write_text(_j.dumps(state), encoding="utf-8")
     # Re-instantiate to pick up the new state
-    bt2 = budget.BudgetTracker(skill_name="_test_skill_v122_budget_rollover")
+    bt2 = budget.BudgetTracker(skill_name="_test_skill_v122_budget_rollover",
+                               state_dir=_budget_test_state_dir())
     res2 = bt2.record_spend(10)
     assert res2["new_total"] == 10, f"after rollover, total should be 10 (just the new spend), got {res2}"
     # Clean up
@@ -1819,7 +1907,8 @@ def t_v122_budget_can_spend() -> None:
         from usr.plugins.skillopt.helpers import budget  # type: ignore
     except Exception:
         from helpers import budget  # type: ignore
-    bt = budget.BudgetTracker(skill_name="__smoke_budget__", daily_cap_cents=10, reset_hour_utc=0)
+    bt = budget.BudgetTracker(skill_name="__smoke_budget__", daily_cap_cents=10, reset_hour_utc=0,
+                              state_dir=_budget_test_state_dir())
     # Reset by recording negative-ish: just check under cap
     ok, reason = bt.can_spend(5)
     assert ok is True, f"under cap should be allowed: {reason}"
@@ -1840,7 +1929,8 @@ def t_v122_budget_day_rollover() -> None:
         from usr.plugins.skillopt.helpers import budget  # type: ignore
     except Exception:
         from helpers import budget  # type: ignore
-    bt = budget.BudgetTracker(skill_name="__smoke_rollover__", daily_cap_cents=100, reset_hour_utc=0)
+    bt = budget.BudgetTracker(skill_name="__smoke_rollover__", daily_cap_cents=100, reset_hour_utc=0,
+                              state_dir=_budget_test_state_dir())
     # Record 80 cents on day 1
     res1 = bt.record_spend(80, ts=100000.0)
     assert res1["new_total"] == 80, f"day 1 total: {res1}"
@@ -3711,8 +3801,11 @@ def t_c2_real_executor_disabled_returns_not_enabled() -> None:
         )
     finally:
         _subp.run = _orig_run
+    # v1.8.19 (P3): a failing worker no longer voids the gate globally -
+    # each task drops pairwise, and with zero usable pairs the gate reports
+    # not-run loudly (never a fake score).
     assert r2["ok"] is False, r2
-    assert r2["reason"].startswith("real_executor_unavailable"), r2
+    assert r2["reason"].startswith("insufficient_usable_pairs"), r2
     # unknown executor -> ok=False
     r3 = replay_harness.run_counterfactual(
         "s", "cur", "prop", tasks, executor="quantum", config={"replay_min_n": 3},
@@ -4347,8 +4440,10 @@ def t_v18_real_score_builds_worker_command() -> None:
 @test("v1.8.0 P2: a worker error envelope -> _real_score raises -> real_executor_unavailable")
 def t_v18_real_score_worker_error_envelope() -> None:
     """When the worker writes {score: null, error: ...} (it ran but failed),
-    _real_score raises RuntimeError and run_counterfactual turns that into
-    real_executor_unavailable:RuntimeError:... (loud-not-crash)."""
+    _real_score raises RuntimeError. v1.8.19 (P3): a per-task failure drops
+    that task from BOTH arms (pairwise, no directional bias); when NO pair
+    remains usable the gate reports not-run loudly (loud-not-crash) with
+    'insufficient_usable_pairs'."""
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers import replay_harness
     import subprocess as _subp
@@ -4376,7 +4471,62 @@ def t_v18_real_score_worker_error_envelope() -> None:
     finally:
         _subp.run = _orig
     assert r["ok"] is False, r
-    assert r["reason"].startswith("real_executor_unavailable:RuntimeError"), r
+    assert r["reason"].startswith("insufficient_usable_pairs"), r
+    assert "3 task failures" in r["reason"], r
+
+
+@test("v1.8.19 P3: one failing replay task drops pairwise, verdict still forms")
+def t_v18_real_score_pairwise_drop() -> None:
+    """v1.8.19 (P3, audit RC4): a single timed-out/failed monologue must NOT
+    void the whole counterfactual. 2 tasks score fine, 1 task's worker
+    errors -> the failed task drops from both arms, n=2 (>= min_n=2) and
+    the gate produces a verdict over the usable pairs."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import replay_harness
+    import subprocess as _subp
+
+    calls = {"n": 0}
+
+    class _FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd, **kw):
+        calls["n"] += 1
+        out_path = cmd[cmd.index("--out") + 1]
+        # 3 tasks x 2 monologues each. Fail the LAST task's second
+        # monologue (the proposed arm of task 3).
+        if calls["n"] == 6:
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump({"score": None, "error": "timeout-ish"}, fh)
+        else:
+            with open(out_path, "w", encoding="utf-8") as fh:
+                # First 3 calls = current arm (score 0.4); next 2 =
+                # proposed arm of tasks 1-2 (score 0.8).
+                json.dump({"score": 0.4 if calls["n"] <= 3 else 0.8}, fh)
+        return _FakeProc()
+
+    _orig = _subp.run
+    _subp.run = _fake_run
+    try:
+        r = replay_harness.run_counterfactual(
+            "s", "cur", "prop",
+            [{"task": f"t{i}", "outcome": "success"} for i in range(3)],
+            executor="real",
+            config={"replay_min_n": 2, "replay_real_executor_enabled": True,
+                    "replay_real_per_task_timeout_s": 5},
+        )
+    finally:
+        _subp.run = _orig
+    assert r["ok"] is True, r
+    assert r["n"] == 2, r
+    assert "insufficient" not in r["reason"], r
+    # Call order: t1-current, t1-proposed, t2-current, t2-proposed,
+    # t3-current, t3-proposed(fail). My fake scores 0.4 for the first
+    # three calls, 0.8 after -> usable pairs (0.4, 0.4) and (0.4, 0.8).
+    assert r["hard_current"] == 0.4 and r["hard_proposed"] == 0.6, r
+    assert r["accepted"] is True, r
 
 
 @test("v1.8.0 P1: replay_worker.main parses args + writes the score JSON (A0 imports lazy)")
@@ -5697,6 +5847,149 @@ def t_v1816_retry_after() -> None:
     assert len(calls) == 2 and len(sleeps) == 1, (calls, sleeps)
     assert abs(sleeps[0] - 0.07) < 1e-6, sleeps
     _ok('Retry-After honored verbatim (0.07s, no jitter)')
+
+
+# ------------------------------------------------------------------------- #
+# v1.8.19 (P4, audit RC1/RC2 + RC7) - integration + hygiene
+# ------------------------------------------------------------------------- #
+
+@test("v1.8.19 P4: empty config (wiped config.json / empty registry) still yields full defaults")
+def t_p4_empty_config_yields_defaults():
+    """Regression for the v1.8.17 silent-spin class: when config.json is {}
+    (the old WebUI refresh() bug wiped it on every page open), the loop's
+    config resolution MUST still return the shipped YAML defaults - the
+    auto-loop thread must never see an empty config again (it spun forever
+    on `if not cfg` with zero logs, 2026-09-16 to 2026-09-22)."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import sleep_runner
+
+    _REQUIRED = (
+        "auto_loop_enabled", "auto_loop_interval_sec",
+        "auto_loop_min_rollouts", "auto_adopt",
+    )
+    saved_registry = sleep_runner._framework_registry_config
+    try:
+        # 1. Registry empty (== wiped config.json): YAML defaults survive.
+        sleep_runner._framework_registry_config = lambda: {}
+        cfg = sleep_runner.merged_config()
+        assert cfg, "merged_config() returned empty dict with empty registry"
+        for key in _REQUIRED:
+            assert key in cfg, f"missing YAML default {key!r} with empty registry"
+        assert cfg["auto_loop_enabled"] is True
+
+        # 2. Registry raising (framework unavailable): defaults still win.
+        def _boom():
+            raise RuntimeError("registry unavailable")
+        sleep_runner._framework_registry_config = _boom
+        cfg2 = sleep_runner.merged_config()
+        assert cfg2, "merged_config() returned empty dict when registry raised"
+        for key in _REQUIRED:
+            assert key in cfg2, f"missing YAML default {key!r} when registry raised"
+
+        # 3. The agent_init extension resolves through the same merge: load
+        #    the extension file directly (it is normally loaded as a
+        #    synthetic module by the framework) and call _get_config().
+        ext_file = PLUGIN_ROOT / "extensions" / "python" / "agent_init" / "_50_skillopt_auto_loop.py"
+        assert ext_file.is_file(), f"extension file missing: {ext_file}"
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_p4_agent_init_probe", ext_file)
+        mod = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(mod)
+        got = mod._get_config()
+        assert got, "_get_config() returned empty dict (the v1.8.17 silent-spin bug)"
+        for key in _REQUIRED:
+            assert key in got, f"_get_config() missing {key!r}"
+    finally:
+        sleep_runner._framework_registry_config = saved_registry
+    _ok("empty config still yields full YAML defaults (silent-spin regression)")
+
+
+@test("v1.8.20 P5: zombie-aware is_running treats state Z as not-running")
+def t_v1820_zombie_aware_is_running() -> None:
+    """P5 regression: an exited-but-unreaped child still answers
+    os.kill(pid, 0), so the official-gate poll loop spun to the full
+    timeout even after the engine had written report.json. The Linux
+    probe must read /proc/<pid>/stat and treat state 'Z' as not
+    running; other platforms keep delegating to the original probe."""
+    import helpers.sleep_runner as sr
+    assert sr.is_running is sr._is_running_zombie_aware, (
+        "sleep_runner.is_running is not the zombie-aware probe"
+    )
+    assert not sr.is_running(0), "pid 0 must read as not running"
+    assert not sr.is_running(-1), "negative pid must read as not running"
+
+    if not sys.platform.startswith("linux"):
+        # Non-Linux delegates to the original probe; a live pid still
+        # has to read as running.
+        assert sr.is_running(os.getpid()), "own pid must read as running"
+        _ok("zombie-aware is_running (non-Linux delegation path)")
+        return
+
+    # A live child reads as running.
+    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
+    try:
+        assert sr.is_running(live.pid), "live child must read as running"
+    finally:
+        live.kill()
+        live.wait()
+
+    # An exited-but-unreaped child (zombie) reads as not running.
+    pid = os.fork()
+    if pid == 0:  # child: exit immediately, stay unreaped until asserted
+        os._exit(0)
+    try:
+        state = ""
+        for _ in range(100):  # bounded wait for the kernel to mark it Z
+            try:
+                with open("/proc/%d/stat" % pid, "rb") as fh:
+                    data = fh.read().decode("utf-8", "replace")
+                rest = data[data.rfind(")") + 2:] if ")" in data else data
+                state = rest.split(" ", 1)[0] if rest else ""
+            except OSError:
+                pass
+            if state == "Z":
+                break
+            time.sleep(0.02)
+        assert state == "Z", "child did not become a zombie within 2s (state=%r)" % state
+        assert sr.is_running(pid) is False, "zombie child must read as not running"
+    finally:
+        os.waitpid(pid, 0)
+    _ok("zombie-aware is_running treats state Z as not-running")
+
+
+@test("v1.8.19 P4: no test-fixture pollution in production run state (runs LAST)")
+def t_p4_no_fixture_pollution():
+    """Guard against the RC7 leak class: the suite must never leave
+    fixture-named files in the plugin's production logs/ tree. Runs last
+    so it observes everything the suite did."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    runs = PLUGIN_ROOT / "logs" / "runs"
+    offenders: list[str] = []
+    if runs.is_dir():
+        for p in runs.rglob("*"):
+            if not p.is_file():
+                continue
+            # Historical archives hold purged pollution on purpose.
+            if p.parent.name.startswith(("_pre_fix_archive", "_debug_archive")):
+                continue
+            name = p.name
+            bad = (
+                "test_fixture" in name
+                or name.startswith("v121_")
+                or name.startswith("v122_")
+                or name.startswith("v18_callsite")
+                or name.startswith("c2_replay")
+                or name.startswith("budget__test_skill")
+            )
+            if bad:
+                offenders.append(str(p.relative_to(runs)))
+    assert not offenders, (
+        "test fixtures leaked into production run state: "
+        + ", ".join(offenders[:10])
+        + " (delete them; every state-writing test must sandbox its paths)"
+    )
+    _ok("no fixture pollution in logs/runs (clean)")
 
 
 if __name__ == "__main__":

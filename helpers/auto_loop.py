@@ -119,7 +119,10 @@ class AutoLoopThread(threading.Thread):
         super().__init__(name="skillopt-auto-loop", daemon=True)
         self.get_config = get_config
         self._stop_event = stop_event or threading.Event()
-        self._last_rollout_count: int = len(sleep_runner.list_rollouts())
+        # v1.8.18 (P1, audit RC2): the in-memory `self._last_rollout_count`
+        # per-tick delta is gone - the trigger baseline is now the PERSISTED
+        # state key `last_rollout_count_at_cycle` (survives restarts, only
+        # advances when a cycle actually runs). See _tick().
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -131,11 +134,29 @@ class AutoLoopThread(threading.Thread):
         _save_state(state)
         try:
             while not self._stop_event.is_set():
+                # v1.8.18 (P0, audit RC8): timestamp every tick attempt so
+                # the dashboard can tell "alive and ticking" apart from a
+                # thread that silently died (last_tick_at goes stale).
+                state["last_tick_at"] = time.time()
                 cfg = self._safe_config()
                 if not cfg:
-                    # No config yet - wait and try again
+                    # No config yet - wait and try again. v1.8.18: surface
+                    # this on the state file (previously a SILENT spin with
+                    # zero logs when config.json resolved empty - the outer
+                    # loop never ticked again, audit 2026-09-22).
+                    if not state.get("cfg_empty_since"):
+                        state["cfg_empty_since"] = time.time()
+                        self._log(
+                            "auto-loop: config resolved empty - idling until "
+                            "a non-empty config is saved (defaults merge "
+                            "should prevent this; see audit RC1)"
+                        )
+                    _save_state(state)
                     self._sleep(30)
                     continue
+                if state.get("cfg_empty_since"):
+                    state["cfg_empty_since"] = None
+                    _save_state(state)
                 if not cfg.get("auto_loop_enabled", True):
                     # Master kill switch
                     self._sleep(60)
@@ -167,9 +188,32 @@ class AutoLoopThread(threading.Thread):
         """One iteration: maybe launch a Sleep cycle, maybe auto-adopt."""
         # 1. Count rollouts
         rollout_count = len(sleep_runner.list_rollouts())
-        new_rollouts = rollout_count - self._last_rollout_count
-        self._last_rollout_count = rollout_count
+        # v1.8.18 (P1, audit RC2): count rollouts accumulated SINCE THE LAST
+        # CYCLE (persisted in state), not since the previous tick. The old
+        # per-tick window (default >=10 new rollouts inside one 30-min tick)
+        # almost never fired at real harvest rates (~25 rollouts/day); the
+        # audit log showed `new_rollouts=3 < threshold=10` as its last line
+        # for days. A persisted base also makes a fresh boot treat the
+        # accumulated backlog as eligible (first cycle fires immediately).
+        base = int(state.get("last_rollout_count_at_cycle", 0) or 0)
+        new_rollouts = max(0, rollout_count - base)
         min_new = int(cfg.get("auto_loop_min_rollouts", 10))
+
+        # v1.8.18 (P1, audit RC3): auto-opt-in MUST NOT live only inside the
+        # (historically never-firing) cycle branch. A skill seen in rollouts
+        # gets its optin marker on the very next tick, not "whenever a cycle
+        # eventually fires". Scan only when new rollouts exist (cheap tick).
+        if new_rollouts > 0:
+            try:
+                for skill in self._candidate_skills(
+                    (cfg.get("auto_loop_skill_target") or "").strip() or None,
+                    records=self._load_rollout_records(),
+                ):
+                    self._maybe_auto_optin(skill, cfg)
+            except Exception as e:
+                # Defensive: a marker bug can never stall the tick.
+                self._log(f"auto-loop: early auto-optin failed: {e}")
+                _record_error(e, "early_optin")
 
         # 2. Maybe launch a Sleep cycle
         if new_rollouts >= min_new:
@@ -439,7 +483,12 @@ class AutoLoopThread(threading.Thread):
             governance = None  # type: ignore[assignment]
         if governance is not None:
             try:
-                eligible, reason = governance.check_skill_eligible(skill)
+                # v1.8.18 (P2.1): the loop's own auto_adopt flag is the
+                # operator's autonomy opt-in - it overrides the per-skill
+                # pending-approval block (governance.py step 7). Optout /
+                # immutable / pause markers still win.
+                eligible, reason = governance.check_skill_eligible(
+                    skill, auto_adopt=bool(cfg.get("auto_adopt", False)))
                 try:
                     governance.mark_decision(skill, eligible, reason)
                 except Exception:
@@ -463,9 +512,21 @@ class AutoLoopThread(threading.Thread):
         # Budget: can we spend one more LLM call on this skill today?
         if budget is not None:
             try:
-                soft_pct = int(cfg.get("budget", {}).get("soft_warn_pct", 80) or 0)
+                # v1.8.19 (live fix, 2026-09-22): `cfg.get("budget", {})`
+                # returns a STRING when the nested `budget:` YAML section is
+                # mangled by merged_config()'s flat light-parse (the parser
+                # stores the bare `budget:` key as ""), so `.get(...)` raised
+                # "'str' object has no attribute 'get'" on every cycle. In
+                # _should_run_skill that silently DISABLED the daily budget
+                # cap (except -> "fall through" = always eligible); in
+                # _mark_skill_cycle it meant spend was never recorded. Accept
+                # dict only; anything else falls back to module defaults.
+                _b = cfg.get("budget")
+                if not isinstance(_b, dict):
+                    _b = {}
+                soft_pct = int(_b.get("soft_warn_pct", 80) or 0)
                 bt = budget.BudgetTracker(skill_name=skill, soft_warn_pct=soft_pct)
-                cost = int(cfg.get("budget", {}).get("cost_per_call_cents", 1) or 1)
+                cost = int(_b.get("cost_per_call_cents", 1) or 1)
                 ok, reason = bt.can_spend(cost)
                 if not ok:
                     return False, f"budget: {reason}"
@@ -486,9 +547,21 @@ class AutoLoopThread(threading.Thread):
                 self._log(f"cadence state save failed for {skill!r}: {e}")
         if budget is not None:
             try:
-                soft_pct = int(cfg.get("budget", {}).get("soft_warn_pct", 80) or 0)
+                # v1.8.19 (live fix, 2026-09-22): `cfg.get("budget", {})`
+                # returns a STRING when the nested `budget:` YAML section is
+                # mangled by merged_config()'s flat light-parse (the parser
+                # stores the bare `budget:` key as ""), so `.get(...)` raised
+                # "'str' object has no attribute 'get'" on every cycle. In
+                # _should_run_skill that silently DISABLED the daily budget
+                # cap (except -> "fall through" = always eligible); in
+                # _mark_skill_cycle it meant spend was never recorded. Accept
+                # dict only; anything else falls back to module defaults.
+                _b = cfg.get("budget")
+                if not isinstance(_b, dict):
+                    _b = {}
+                soft_pct = int(_b.get("soft_warn_pct", 80) or 0)
                 bt = budget.BudgetTracker(skill_name=skill, soft_warn_pct=soft_pct)
-                cost = int(cfg.get("budget", {}).get("cost_per_call_cents", 1) or 1)
+                cost = int(_b.get("cost_per_call_cents", 1) or 1)
                 _res = bt.record_spend(cost)
                 if _res.get("soft_warning"):
                     self._log(
@@ -670,7 +743,17 @@ class AutoLoopThread(threading.Thread):
         except Exception:
             from helpers import governance  # type: ignore  # noqa: F401
         try:
-            eligible, gov_reason = governance.check_skill_eligible(skill_name)
+            # v1.8.18 (P2.1): auto_adopt=true is the operator's autonomy
+            # opt-in - it overrides the per-skill pending-approval block.
+            eligible, gov_reason = governance.check_skill_eligible(
+                # v1.8.18 (P1 fix, 2026-09-22): NO trailing comma here - the
+                # first version of the P2.1 edit ended the call in a comma,
+                # wrapping the 2-tuple result in a 1-tuple, and the unpack
+                # raised "not enough values to unpack (expected 2, got 1)"
+                # on EVERY _auto_adopt call - silently swallowed by the
+                # except below, so governance logged no decisions and the
+                # gate always fell through (the v1.5.0 smoke test caught it).
+                skill_name, auto_adopt=bool(cfg.get("auto_adopt", False)))
             try:
                 governance.mark_decision(skill_name, eligible, gov_reason)
             except Exception:
@@ -713,6 +796,10 @@ class AutoLoopThread(threading.Thread):
             held_out=held_out,
             skill_name=skill_name,
             official_gated=official_gated,
+            # v1.8.19 (P3): the ab_enabled flag computed above was dead -
+            # the harness ran anyway with the stub judge. Pass the caller
+            # resolution through so a disabled harness really is skipped.
+            ab_harness_enabled=ab_enabled,
         )
         entry = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),

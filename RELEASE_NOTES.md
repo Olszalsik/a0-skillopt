@@ -2,6 +2,20 @@
 
 ---
 
+## v1.8.20 - the gated cycle runner completes its first fully healthy lifecycle
+
+> Ingestion -> judge (3/3 valid labels) -> official gate -> summary now
+> runs end-to-end: the gate poll breaks 2.1s after engine exit
+> (zombie-aware liveness) instead of spinning to the timeout, and a
+> no-proposal reject night is recorded as `GATE_REJECTED` (exit 3)
+> instead of INFRA_FAILED - fail-closed, nothing adopted, live skill
+> untouched. Folds in the deployed-but-uncommitted hardening:
+> dual-layout imports, harness-flag resolution + mock replay gate bar,
+> registry-read fallback, hermetic smoke pin. New files:
+> `helpers/judge_client.py`, `scripts/run_sleep_cycle.py`.
+>
+> Note: deployed-only releases 1.8.13-1.8.19 are documented on the deployed instance; their code port into this repo is tracked in ROADMAP.
+
 ## v1.8.12 - every model knob follows the active Agent Zero chat model
 
 > `optimizer_model`, `target_model`, and `judge_model` default to the new

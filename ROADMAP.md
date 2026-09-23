@@ -866,3 +866,24 @@ contention persists, live-cycle retries parked)
 - **Still open**: item 9 hub merge (PR #512 open, watchdog-monitored);
   two-probe stability pass -> live gated-cycle retry, parked for an
   off-peak window per this addendum.
+
+### Status addendum (2026-09-23, v1.8.20 gated-cycle runner)
+
+- **First fully healthy gated cycle** (10:52): 167 rollouts ingested ->
+ judge 3/3 valid labels -> official engine (mock backend) with the
+ plugin-local `--claude-home` redirect harvested 120 sessions / 40
+ tasks -> gate reject (0.2 -> 0.2, edits=[]) -> runner summary
+ `GATE_REJECTED` exit 3. No ungated fallback; live SKILL.md untouched.
+- **v1.8.20 (P5)**: zombie-aware `is_running` - the gate poll loop now
+ breaks 2.1s after engine exit instead of spinning to the 900s deadline
+ (exited-but-unreaped children answer `os.kill(pid, 0)`).
+- **v1.8.20 (P6)**: no-proposal gate nights classify as
+ `gate_rejected` (exit 3), not INFRA_FAILED.
+- **Still open**: judge labels do not persist across cycles (the same
+ rollouts are re-evaluated with `labeled_before=false` every run;
+ labeled count constant at 10) - locate the label store the judge
+ phase writes vs the one ingestion reads; engine backend is still the
+ default mock (real executor not configured), so nights render verdicts
+ but no real proposals; staging-dir attribution on no-task nights uses
+ the newest-dir heuristic (the reported verdict is the newest prior
+ night); item 9 hub merge (PR #512 open).

@@ -234,7 +234,13 @@ def _config() -> dict[str, Any]:
         "min_lift_pp": float(cfg.get("ab_harness_min_lift_pp", DEFAULT_MIN_LIFT_PP)),
         "min_confidence": float(cfg.get("ab_harness_min_confidence", DEFAULT_MIN_CONFIDENCE)),
         "judge_model": str(cfg.get("judge_model", cfg.get("target_model", DEFAULT_JUDGE_MODEL))),
-        "enabled": bool(cfg.get("ab_harness_enabled", True)),
+        # v1.8.19 (P3, audit RC4): fallback default False. When the merged
+        # config can't be read at all (cfg={}), this fallback previously
+        # resolved to True - silently INVERTING the v1.6.0 advisory-only
+        # contract and letting the deterministic stub judge (confidence
+        # ~0.37 < 0.6) reject real proposals as authoritative. Opt-in via
+        # config key or SKILLOPT_AB_HARNESS_ENABLED env stays intact.
+        "enabled": bool(cfg.get("ab_harness_enabled", False)),
     }
     # Env overrides
     if os.environ.get("SKILLOPT_JUDGE_MODEL"):

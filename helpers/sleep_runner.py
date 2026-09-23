@@ -185,7 +185,15 @@ def merged_config(framework_config: dict | None = None) -> dict[str, Any]:
       3. the explicit ``framework_config`` argument (highest priority)
     """
     merged = default_config()
-    reg = _framework_registry_config()
+    # v1.8.19 (P4): a RAISING registry read must not bubble up - in
+    # agent_init._get_config an exception here falls through to the bare
+    # config.json parity fallback, which is exactly {} when the config
+    # page wiped it (the v1.8.17 silent-spin scenario). Treat a failed
+    # registry read as empty; the YAML defaults always survive.
+    try:
+        reg = _framework_registry_config()
+    except Exception:
+        reg = {}
     if reg:
         merged.update(reg)
     if isinstance(framework_config, dict):
@@ -356,8 +364,16 @@ def validate_proposal(
     skill_name: str | None = None,
     skill_path: str | os.PathLike | None = None,
     official_gated: bool = False,
+    ab_harness_enabled: bool | None = None,
 ) -> tuple[bool, str]:
     """Shared validation gate used by auto-loop, adopt API, post-adopt hook, tool.
+
+    v1.8.19 (P3, audit RC4): `ab_harness_enabled` lets the caller pass its
+    already-resolved harness flag (auto-loop computes it from the merged
+    config). None keeps the legacy behaviour (stage 0 consults the harness's
+    own config); False skips stage 0 entirely — this closes the dead-guard
+    gap where auto-loop computed `ab_enabled` but the harness ran anyway
+    with the deterministic stub judge and rejected real proposals.
 
     Reject conditions (in order):
     0. v1.2.0 A/B harness (only when `skill_name` is passed AND the
@@ -409,7 +425,10 @@ def validate_proposal(
     # harness bug can never crash the gate. The harness returns
     # can_run=False (not an exception) when it has no data or no
     # judge; in that case we fall through to the structural stages.
-    if skill_name:
+    # v1.8.19: the caller may pass ab_harness_enabled=False to skip
+    # stage 0 entirely (the harness's own config already keeps it
+    # advisory-only by default; this honours the caller's resolution).
+    if skill_name and ab_harness_enabled is not False:
         try:
             try:
                 from usr.plugins.skillopt.helpers import ab_harness  # type: ignore  # noqa: E402
@@ -467,14 +486,28 @@ def validate_proposal(
                     from usr.plugins.skillopt.helpers import replay_harness  # type: ignore  # noqa: E402
                 except ImportError:
                     from helpers import replay_harness  # type: ignore  # noqa: E402
+                # v1.8.19 (P3, audit RC4): executor-aware bar. The mock
+                # executor scores real proposals as keyword-relevance noise
+                # (Sep-19 real proposal: 2.08pp, rejected at the 5.0pp bar
+                # meant for REAL replay scores). The mock gets its own low
+                # bar (replay_mock_gate_min_improvement_pp, default 1.0):
+                # real improvements pass, outright regressions (lift < 0)
+                # still reject. The real executor keeps the full
+                # gate_min_improvement_pp bar.
+                _is_mock = not bool(_cfg.get("replay_real_executor_enabled", False))
+                _rc_cfg = dict(_cfg)
+                if _is_mock:
+                    _rc_cfg["gate_min_improvement_pp"] = float(
+                        _cfg.get("replay_mock_gate_min_improvement_pp", 1.0)
+                    )
                 _held = _load_held_out(skill_name)
                 _replay = replay_harness.run_counterfactual(
                     skill_name=skill_name,
                     current_skill_md=current or "",
                     proposed_skill_md=proposed or "",
                     held_out_tasks=_held,
-                    executor=("real" if bool(_cfg.get("replay_real_executor_enabled", False)) else "mock"),
-                    config=_cfg,
+                    executor=("real" if not _is_mock else "mock"),
+                    config=_rc_cfg,
                 )
                 if _replay.get("ok"):
                     if not _replay.get("accepted"):
@@ -783,7 +816,10 @@ def launch_sleep_subprocess(
     # way to feed the engine from A0 today - `transcript_source`
     # in the engine config is hardcoded to "claude" / "codex" / "auto".
     try:
-        from usr.plugins.skillopt.helpers.bridge import bridge_rollouts_to_claude_history
+        try:
+            from usr.plugins.skillopt.helpers.bridge import bridge_rollouts_to_claude_history  # framework layout: /a0 on sys.path
+        except ImportError:  # plugin-root layout: runner/wrapper context imports helpers directly
+            from helpers.bridge import bridge_rollouts_to_claude_history  # type: ignore
         bridge_result = bridge_rollouts_to_claude_history()
     except Exception as _bridge_err:
         bridge_result = {"rollouts_written": 0, "error": str(_bridge_err)}
@@ -1319,3 +1355,38 @@ def get_status_snapshot() -> dict[str, Any]:
     if last_err:
         snap["last_auto_loop_error"] = last_err
     return snap
+
+
+# v1.8.20 (P5): POSIX zombie-aware liveness for the detached engine child.
+# The official gate poll loop waits on is_running(pid); the exited-but-
+# unreaped engine (zombie, direct child not yet waited on) still answers
+# os.kill(pid, 0), which spun the loop until the full timeout even though
+# the engine had already written report.json. Treat /proc state Z as not
+# running (Linux only); other platforms delegate to the original probe.
+_is_running_original = is_running
+
+
+def _is_running_zombie_aware(pid: int) -> bool:
+    if not pid or int(pid) <= 0:
+        return False
+    if sys.platform.startswith("linux"):
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        try:
+            with open("/proc/%d/stat" % int(pid), "rb") as fh:
+                data = fh.read().decode("utf-8", "replace")
+            rest = data[data.rfind(")") + 2:] if ")" in data else data
+            state = rest.split(" ", 1)[0] if rest else ""
+            if state == "Z":
+                return False
+        except Exception:
+            pass
+        return True
+    return _is_running_original(pid)
+
+
+is_running = _is_running_zombie_aware

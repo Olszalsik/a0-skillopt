@@ -380,14 +380,45 @@ def run_counterfactual(
             if max_tasks and len(held_out_tasks) > max_tasks:
                 held_out_tasks = held_out_tasks[:max_tasks]
                 n = len(held_out_tasks)
+            # v1.8.19 (P3, audit RC4): pairwise failure handling. One slow
+            # monologue (the Sep-19 gate: a single task timed out at 600s)
+            # used to raise and void the ENTIRE counterfactual. A failed
+            # task now drops from BOTH arms (no directional bias) and the
+            # verdict still forms over the usable pairs when at least
+            # replay_min_n remain; below that the gate reports not-run.
+            _failed_tasks = 0
             for t in held_out_tasks:
-                sc = _real_score(t, current_skill_md, cfg, skill_name)
-                sp = _real_score(t, proposed_skill_md, cfg, skill_name)
+                try:
+                    sc = _real_score(t, current_skill_md, cfg, skill_name)
+                    sp = _real_score(t, proposed_skill_md, cfg, skill_name)
+                except Exception as _te:  # noqa: BLE001 - per-task, not gate-level
+                    log.warning(
+                        "[skillopt] replay task failed (dropped from both arms): %s",
+                        str(_te)[:200],
+                    )
+                    per_task.append({
+                        "id": (t.get("id") if isinstance(t, dict) else None),
+                        "error": str(_te)[:200],
+                    })
+                    continue
                 per_task.append({
                     "id": (t.get("id") if isinstance(t, dict) else None),
                     "current": round(sc, 4),
                     "proposed": round(sp, 4),
                 })
+            usable = [p for p in per_task if "error" not in p]
+            n = len(usable)
+            if n < int(cfg.get("replay_min_n", 3) or 0):
+                return {
+                    "ok": False,
+                    "reason": (
+                        f"insufficient_usable_pairs:{n} usable "
+                        f"({len(per_task) - n} task failures)"
+                    ),
+                    "executor": executor,
+                    "n": n,
+                }
+            per_task = usable
         else:
             return {
                 "ok": False,

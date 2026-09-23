@@ -78,7 +78,16 @@ gate_min_improvement_pp: 5.0
 #                               by default (mock is byte-identical to v1.7.0).
 # replay_real_per_task_timeout_s: per-task subprocess timeout (real executor).
 #                               The worker runs a FULL A0 monologue per task,
-#                               so give it room. Default 180s.
+#                               so give it room. Default 600s. The TOTAL gate
+#                               budget is therefore bounded by
+#                               2 x replay_real_max_tasks x this value.
+#                               v1.8.19 (P3, audit RC4): a task that fails or
+#                               times out drops from BOTH arms pairwise (no
+#                               directional bias) and no longer voids the
+#                               whole counterfactual — the verdict forms
+#                               over the usable pairs when >= replay_min_n
+#                               remain (the Sep-19 gate died on ONE 600s
+#                               monologue timeout).
 # replay_real_max_tasks       : cap on held-out tasks the real executor scores
 #                               (it runs 2xN full monologues — current + proposed
 #                               x N — per gate call, so N must stay small).
@@ -89,6 +98,14 @@ replay_held_out_n: 8
 replay_real_executor_enabled: false
 replay_real_per_task_timeout_s: 600
 replay_real_max_tasks: 4
+# v1.8.19 (P3, audit RC4): the MOCK executor is a deterministic keyword
+# relevance heuristic, not a real replay - its numeric lift on real
+# proposals is noise (the Sep-19 real proposal scored 2.08pp and was
+# rejected at the shared 5.0pp bar that exists for REAL scores). The mock
+# gets its own, much lower bar: pass real improvements, still reject
+# outright regressions (lift < 0). The REAL executor keeps the full
+# gate_min_improvement_pp bar (5.0).
+replay_mock_gate_min_improvement_pp: 1.0
 
 # =====================================================================
 # STORAGE
@@ -298,13 +315,26 @@ fragment_per_fragment_gate: true
 # inner_loop_max_suggestion_age_seconds : drain threshold (default 7 days)
 # inner_loop_min_rollout_confidence   : only suggest on rollouts the
 #                                       reward model is somewhat
-#                                       confident about (>= this)
+#                                       confident about (>= this).
+#                                       v1.8.19 (P3, audit RC5): 0.4 -> 0.25.
+#                                       The trained DistilBERT emits CLASS
+#                                       confidence (~0.36 typical) - a 0.4
+#                                       bar skipped essentially every
+#                                       rollout forever.
+# inner_loop_skip_retire_after        : v1.8.19 (P3, audit RC5): after this
+#                                       many consecutive confidence-skips a
+#                                       rollout is retired with a no-op
+#                                       suggestion so the tick stops
+#                                       re-scanning it forever (they were
+#                                       consuming the per-tick cap and
+#                                       starving newer rollouts).
 # inner_loop_llm_model                : model used for the tiny LLM call
 #                                       (defaults to target_model)
 inner_loop_enabled: true
 inner_loop_interval_seconds: 60
 inner_loop_max_suggestion_age_seconds: 604800
-inner_loop_min_rollout_confidence: 0.4
+inner_loop_min_rollout_confidence: 0.25
+inner_loop_skip_retire_after: 3
 inner_loop_llm_model: ""
 # v1.8.1: the inner-loop LLM endpoint. Previously the tick read a
 # nonexistent `llm_endpoint` key, so without the SKILLOPT_SUGGEST_ENDPOINT

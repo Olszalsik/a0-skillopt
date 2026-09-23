@@ -35,7 +35,10 @@ import time
 import uuid
 from pathlib import Path
 
-from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
+try:
+    from usr.plugins.skillopt.helpers import sleep_runner  # framework layout: /a0 on sys.path
+except ImportError:  # plugin-root layout: runner/wrapper context imports helpers directly
+    from helpers import sleep_runner  # type: ignore
 
 
 def _bridge_root() -> Path:

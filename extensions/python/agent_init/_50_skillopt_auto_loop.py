@@ -34,19 +34,39 @@ _watchdog_thread = None
 
 
 def _get_config() -> dict:
-    """Read the SkillOpt plugin config from the framework, with a fallback to
-    the deployed plugin's on-disk config.json.
+    """Config resolution (v1.8.18, P0 / audit RC1+RC2): always merge the
+    shipped `default_config.yaml` underneath the framework's plugin-config
+    registry (`helpers.plugins.get_plugin_config`, which reads the user's
+    `config.json` but does NOT apply YAML defaults — an empty/partial
+    `config.json` therefore previously resolved to an empty dict).
 
-    The framework's plugin config registry may return empty in some lifecycle
-    contexts (e.g. when the agent_init hook runs before the per-project config
-    has been hydrated, or if the user has not yet opened the plugin's WebUI
-    config page). When that happens, the auto-loop thread spins forever on
-    `_sleep(30)` and never fires a cycle. To keep the loop honest, we always
-    fall back to reading the deployed config.json when the framework lookup
-    returns nothing usable.
+    v1.8.17 bug: the old fallback read ONLY `config.json` off disk, so when
+    `config.json` was `{}` (the WebUI config page's refresh() used to POST
+    an empty body, which saved `{}` on every page open), this returned `{}`.
+    The auto-loop thread then spun forever on `if not cfg: _sleep(30)` with
+    zero logs - the outer loop never ticked again (silent since 2026-09-16,
+    audit 2026-09-22). `sleep_runner.merged_config()` always yields the
+    YAML defaults, so the loop can never be config-blind again. Framework
+    registry / disk values still win over the YAML (later-wins merge).
     """
+    try:
+        try:
+            from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
+        except Exception:
+            from helpers import sleep_runner  # type: ignore  # noqa: F401
+    except Exception as e:
+        log.warning("[skillopt] sleep_runner import failed: %s", e)
+        return {}
+    try:
+        merged = sleep_runner.merged_config()
+        if merged:
+            return merged
+    except Exception as e:
+        log.warning("[skillopt] merged_config read failed: %s", e)
+    # Last resort (merged_config failing means even the shipped YAML could
+    # not be parsed): fall back to the raw framework registry, then the
+    # bare on-disk config.json - the v1.8.17 behaviour, kept for parity.
     cfg: dict = {}
-    # 1. Try the framework's plugin config registry first.
     try:
         from helpers import plugins as plugins_helper  # type: ignore
         cfg = plugins_helper.get_plugin_config("skillopt") or {}
@@ -54,12 +74,9 @@ def _get_config() -> dict:
         log.debug("[skillopt] framework config read failed: %s", e)
     if cfg:
         return cfg
-    # 2. Fallback: read the deployed plugin's config.json directly.
     try:
         import json
         from pathlib import Path
-        # /a0/usr/plugins/skillopt/extensions/python/agent_init/_50_...py
-        # walk 4 .parent() calls up to the plugin root
         plugin_root = Path(__file__).resolve().parent.parent.parent.parent
         cfg_path = plugin_root / "config.json"
         if cfg_path.is_file():

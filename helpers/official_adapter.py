@@ -442,6 +442,25 @@ def run_official_sleep_cycle(
     verdict = _read_gate_verdict(staging_dir)
     proposed = staging_dir / "proposed_SKILL.md"
     if not proposed.is_file():
+        # v1.8.20 (P6): a gate-verdict night that staged no proposal is a
+        # normal reject outcome (e.g. no edits generated), NOT an
+        # infra failure. Report gate_rejected so the cycle records a
+        # reject instead of INFRA_FAILED.
+        if verdict and not verdict.get("accepted"):
+            return {
+                "ok": False,
+                "gate_rejected": True,
+                "engine": "official",
+                "reason": (
+                    f"official gate rejected (gate_action={verdict.get('gate_action')!r}, "
+                    f"baseline={verdict.get('baseline_score')} -> "
+                    f"candidate={verdict.get('candidate_score')}); no proposal staged"
+                ),
+                "pid": pid,
+                "log_path": log_path,
+                "official_staging_dir": str(staging_dir),
+                "gate": verdict,
+            }
         # A multi-skill night may stage per-skill rows instead of the
         # single proposed_SKILL.md; without a single proposal we have
         # nothing to feed the existing adopt path -> fall back this tick.

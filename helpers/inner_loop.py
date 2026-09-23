@@ -92,10 +92,67 @@ conservative with confidence."""
 DEFAULT_ENABLED = True
 DEFAULT_INTERVAL_SECONDS = 60
 DEFAULT_MAX_AGE_SECONDS = 7 * 86400  # 7 days
-DEFAULT_MIN_ROLLOUT_CONFIDENCE = 0.4
+# v1.8.19 (P3, audit RC5): lowered from 0.4. The trained DistilBERT reward
+# model emits CLASS confidence (~0.36 on typical rollouts) - comparing it
+# against a 0.4 "quality" bar skipped essentially every rollout forever.
+# 0.25 keeps genuinely broken (near-0.0) rollouts out of the LLM path
+# while letting the normal ~0.36 band through.
+DEFAULT_MIN_ROLLOUT_CONFIDENCE = 0.25
+# v1.8.19 (P3, audit RC5): consecutive confidence-skips before a rollout
+# is retired with a no-op suggestion (stops the eternal rescan).
+DEFAULT_SKIP_RETIRE_AFTER = 3
 DEFAULT_LLM_MODEL = "chat"  # v1.8.12: sentinel follows the active A0 chat model
 # v1.8.1: per-tick parse window (0 = unlimited)
 DEFAULT_MAX_SCAN_FILES = 2000
+
+# v1.8.19: consecutive-skip counters, persisted so they survive restarts.
+_skip_counts: dict[str, int] = {}
+_skip_retire_after: int = DEFAULT_SKIP_RETIRE_AFTER
+
+# v1.8.19 (P4, audit RC7): test-isolation hook. When set (by the smoke
+# suite), every state file this module writes (inner_loop.log,
+# .inner_loop_skips.json) lands under this directory instead of the
+# plugin's production logs/runs/. Live code never sets it.
+state_dir: Path | None = None
+
+
+def _state_dir() -> Path:
+    """State directory for run files: test override or production default."""
+    d = state_dir
+    return d if d is not None else (_plugin_root() / "logs" / "runs")
+
+
+def _skip_counts_path() -> Path:
+    """logs/runs/.inner_loop_skips.json next to the other run-state files."""
+    return _state_dir() / ".inner_loop_skips.json"
+
+
+def _load_skip_counts() -> None:
+    """Populate _skip_counts from disk. Best-effort; corrupt = empty."""
+    global _skip_counts
+    try:
+        p = _skip_counts_path()
+        if p.is_file():
+            data = json.loads(p.read_text(encoding="utf-8") or "{}")
+            if isinstance(data, dict):
+                _skip_counts = {
+                    str(k): int(v) for k, v in data.items()
+                    if isinstance(v, (int, float))
+                }
+    except Exception:
+        pass
+
+
+def _save_skip_counts() -> None:
+    """Persist _skip_counts atomically-ish (tmp + rename). Best-effort."""
+    try:
+        p = _skip_counts_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(_skip_counts), encoding="utf-8")
+        tmp.replace(p)
+    except Exception:
+        pass
 
 
 def _config() -> dict[str, Any]:
@@ -115,6 +172,9 @@ def _config() -> dict[str, Any]:
         "interval_seconds": int(cfg.get("inner_loop_interval_seconds", DEFAULT_INTERVAL_SECONDS)),
         "max_age_seconds": int(cfg.get("inner_loop_max_suggestion_age_seconds", DEFAULT_MAX_AGE_SECONDS)),
         "min_rollout_confidence": float(cfg.get("inner_loop_min_rollout_confidence", DEFAULT_MIN_ROLLOUT_CONFIDENCE)),
+        # v1.8.19 (P3, audit RC5): consecutive confidence-skips before a
+        # rollout is retired with a no-op suggestion (stops the rescan).
+        "skip_retire_after": int(cfg.get("inner_loop_skip_retire_after", DEFAULT_SKIP_RETIRE_AFTER)),
         "llm_model": str(cfg.get("inner_loop_llm_model", cfg.get("target_model", DEFAULT_LLM_MODEL))),
         # v1.8.1: the LLM endpoint was previously only reachable via the
         # (nonexistent) `llm_endpoint` config key or the env var, so the
@@ -150,7 +210,7 @@ def suggestions_dir() -> Path:
 
 
 def inner_log_path() -> Path:
-    p = _plugin_root() / "logs" / "runs" / "inner_loop.log"
+    p = _state_dir() / "inner_loop.log"
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -529,9 +589,17 @@ def inner_loop_tick(llm_endpoint: str | None = None) -> dict[str, Any]:
       last_error - str | None, the most recent error (for the snapshot)
     """
     global _last_tick_at, _total_ticks, _total_suggestions, _last_error
+    global _skip_retire_after
     _total_ticks += 1
     counters = {"scanned": 0, "suggested": 0, "skipped": 0, "errors": 0, "last_error": None}
     cfg = _config()
+    # v1.8.19 (P3, audit RC5): refresh the consecutive-skip state each tick
+    # (lazy load keeps module import free of filesystem work, and the
+    # retire threshold follows the merged config).
+    _skip_retire_after = max(
+        1, int(cfg.get("skip_retire_after", DEFAULT_SKIP_RETIRE_AFTER) or 1)
+    )
+    _load_skip_counts()
     if not cfg["enabled"]:
         counters["last_error"] = "inner_loop_disabled"
         _last_tick_at = time.time()
@@ -603,6 +671,24 @@ def inner_loop_tick(llm_endpoint: str | None = None) -> dict[str, Any]:
         # Heuristic-only rollouts (no `reward` field) get a pass so we
         # still learn before the reward model is trained.
         if rec.get("reward") and conf < min_conf:
+            # v1.8.19 (P3, audit RC5): a confidence-skip used to leave the
+            # rollout "needy" forever - the same files were re-skipped on
+            # EVERY tick, consumed the 50-cap, and starved all newer
+            # rollouts behind them (live log: scanned=50 skipped=50 for
+            # weeks). Count consecutive skips per rollout; after
+            # inner_loop_skip_retire_after (default 3), retire it with a
+            # no-op suggestion so _rollout_needs_suggestion() goes False
+            # permanently. The outer loop treats an empty suggestion as a
+            # skip, so retiring has no adoption effect.
+            rid_key = str(rec.get("id") or f.name)
+            skips = _skip_counts.get(rid_key, 0) + 1
+            if skips >= _skip_retire_after:
+                enqueue_suggestion(rec, "", skill_name=rec.get("skill_used"))
+                _skip_counts.pop(rid_key, None)
+                _save_skip_counts()
+            else:
+                _skip_counts[rid_key] = skips
+                _save_skip_counts()
             counters["skipped"] += 1
             continue
         # No endpoint -> deterministically enqueue a keyword-stub
@@ -714,7 +800,19 @@ def get_inner_status() -> dict[str, Any]:
 def reset_for_tests() -> None:
     """Drop all module-level state. Used by the smoke tests."""
     global _last_tick_at, _total_ticks, _total_suggestions, _last_error
+    global _skip_counts
     _last_tick_at = 0.0
     _total_ticks = 0
     _total_suggestions = 0
     _last_error = None
+    # v1.8.19: drop consecutive-skip counters (and the persisted file) so
+    # test isolation holds. v1.8.19 P4 hardening: only unlink when a test
+    # state_dir override is active - without it this unlinked the PRODUCTION
+    # .inner_loop_skips.json on every suite run, wiping in-flight skip
+    # counters for the live loop (audit RC7).
+    _skip_counts = {}
+    if state_dir is not None:
+        try:
+            _skip_counts_path().unlink(missing_ok=True)
+        except Exception:
+            pass

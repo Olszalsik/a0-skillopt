@@ -323,3 +323,220 @@ version, not just the source tree.
   `SKILLOPT_JUDGE_RETRY_MAX`, `SKILLOPT_JUDGE_RETRY_BASE_S`, `SKILLOPT_JUDGE_RETRY_MAX_S`); +6
   smoke tests (suite 163). Tag `v1.8.16` (d679385); hub PR #512 manifest references this release
   line in its head commit (e0d6d32).
+
+## 1.8.17 Autonomy Failure Audit + Remediation Roadmap (2026-09-22)
+
+Live audit found the plugin **never ran one autonomous cycle** in production
+(`logs/runs/.auto_loop_state.json`: `cycles_run=0`, `proposals_adopted=0`). Harvesting works
+(158 rollouts); everything downstream is dead. Full evidence + report:
+`<a0>/tmp/skillopt-autonomy-analysis-2026-09-22.md` (mirrored in the repo-root `CLAUDE.md`).
+Eight root causes:
+
+1. **Config wipe (RC1):** `webui/config.html` `refresh()` calls `api('/config')`, whose default
+   method is POST, with no body → `api/config.py` treats any POST as a save and writes `{}` to
+   `config.json` on every page open (verified mtime 2026-09-22T17:24). With `config.json={}`,
+   `get_plugin_config` returns `{}` (the framework does NOT merge `default_config.yaml`) and the
+   `agent_init` `_get_config` fallback reads only `config.json` → the auto-loop thread receives
+   empty config and spins forever on `if not cfg: _sleep(30)` with zero logs (outer loop silent
+   since 2026-09-16).
+2. **Trigger (RC2):** a cycle requires ≥10 NEW rollouts per 30-min tick; harvest yields ~25/day →
+   never fires (`new_rollouts=3 < threshold=10`, last tick 2026-09-16).
+3. **Governance chicken-and-egg + approval deadlock (RC3):** auto-optin only runs inside the
+   (never-firing) cycle branch; `require_human_approval: true` (default + stamped into every
+   auto-optin policy) blocks per-skill until a dashboard Approve; `auto_adopt: true` does not
+   bypass it — no configuration yields full autonomy.
+4. **Gates (RC4):** the mock counterfactual gate rejected the one real staged proposal (lift
+   2.08pp < `gate_min_improvement_pp` 5.0); the real replay executor times out (one A0 monologue
+   201–360s vs 2×N tasks inside 600s, plus live-server contention); the official engine runs with
+   `--backend` defaulting to mock → `held-out 0.000 -> 0.000 => reject` every run.
+5. **Inner loop (RC5):** reward class-confidence ~0.36 < `inner_loop_min_rollout_confidence` 0.4
+   skips every rollout, and skipped rollouts are never marked processed → eternal churn
+   (`scanned=50 skipped=50` every 60s); `InnerLoopThread.run` passes the nonexistent
+   `cfg["llm_endpoint"]` key instead of `inner_loop_llm_endpoint` → stub suggestions only.
+6. **Official-engine bridge (RC6):** `--backend` omitted ⇒ engine default mock; rollout bridge
+   logged `bridge: 0 rollouts` on the 2026-09-15 run. The direct optimizer remains the only path
+   that ever staged a real proposal (2026-09-19).
+7. **Test pollution + false-done signal (RC7):** smoke fixtures leak into production state
+   (`skillA/skillB` governance entries, `v121_*` ab_harness spam, `c2_replay_skill_5_test_fixture_*`
+   suggestions); 163 green tests cover components only — no integration test runs the live loop
+   end-to-end, which is how "done / waiting for merge" (hub PR #512, still OPEN_PENDING) happened.
+8. **Silent-failure UX (RC8):** spinning on empty config produces no log line and no dashboard
+   signal; `state["running"]` is `true` from thread start regardless of tick success.
+
+### Remediation roadmap (approved 2026-09-22; execution order P0→P4)
+
+- **P0 Config integrity:** `webui/config.html` `refresh()` reads via GET; `api/config.py` POST
+  guards empty bodies + whitelists known keys; `agent_init._get_config()` merges
+  `default_config.yaml` + `config.json` (+ framework overlay) so empty/missing config can never
+  silence the loop; persist operator intent (`auto_adopt: true`); dashboard surfaces loop
+  liveness + config-read state.
+- **P1 Trigger:** per-skill "new rollouts since last cycle" (persisted) instead of per-tick
+  threshold; `_maybe_auto_optin` runs every tick (out of the cycle branch); one-time seeding of
+  optin markers for existing skills; every tick logs + `last_tick_at` persisted in state.
+- **P2 Adoption autonomy:** `auto_adopt: true` overrides `require_human_approval` (operator's
+  explicit autonomy opt-in; per-skill optout/immutable/pause still win; adopt burst cap reusing
+  the budget tracker).
+- **P3 Real gates:** mock counterfactual gate demoted to advisory (or `gate_min_improvement_pp`
+  ~1 for the mock executor); real replay executor gets `2×max_tasks×per_task_timeout` cycle
+  budgets + async staging→gating; official engine only stays primary if a real `--backend`
+  produces one accepted run, else direct optimizer is primary; inner loop routes suggestions
+  through the A0 chat-model sentinel and fixes the endpoint key + confidence semantics.
+- **P4 Hygiene:** integration smoke test running the live loop end-to-end with `config.json={}`
+  present (regression for the silent-spin class); all test fixtures redirected off production
+  state; fixture pollution purged; docs/hub framing corrected re PR #512.
+
+**Definition of done:** with `auto_adopt: on` and zero human input, within 24h of normal usage:
+≥1 tick per eligible skill → ≥1 cycle → ≥1 staged proposal from real rollouts → passes a real
+gate → adopted into `usr/skills/<name>/SKILL.md`, every step visible on the dashboard, surviving
+container restart without losing settings.
+
+## 1.8.18 Implementation status — P0 + P1 + P2.1 code-complete (2026-09-22, 163/163 smoke)
+
+Applied after the §1.8.17 audit, in this order (P-number = roadmap entry):
+
+- **P0.1–P0.5** (previous session): GET config + empty-POST read-guard +
+  whitelist (`api/config.py`), WebUI GET refresh + status surfacing
+  (`webui/config.html`), `_get_config()` → `sleep_runner.merged_config()`
+  (extension), operator-intent `config.json` persisted, loop-tick
+  telemetry (`last_tick_at`, `cfg_empty_since`).
+- **P2.1**: `governance.check_skill_eligible(skill, *, auto_adopt=False)`
+  - step 7 pending-approval block is overridden by an explicit
+    `auto_adopt: true` (per-skill opt-out / immutable / pause still win).
+- **P1**: `_tick` trigger = rollouts since the PERSISTED
+  `state["last_rollout_count_at_cycle"]` (only advances when a cycle
+  actually runs) instead of the in-memory per-tick delta; `_maybe_auto_optin`
+  runs on EVERY tick with new rollouts, not only inside the cycle branch;
+  stale `AutoLoopThread._last_rollout_count` removed.
+- **P1 hotfix during verification**: the first P2.1 caller edit ended
+  `governance.check_skill_eligible(...)` in a trailing comma, wrapping the
+  2-tuple result in a 1-tuple; the `eligible, gov_reason =` unpack then
+  raised "not enough values to unpack (expected 2, got 1)" on every
+  `_auto_adopt` call - swallowed by the governance try/except, so no
+  decision rows were ever logged and the gate fell through (caught by
+  `t_v150_governance_auto_loop_skip`; fixed + comment left at the site).
+  Lesson: `py_compile` cannot catch a tuple-wrapping comma - run the smoke
+  suite after EVERY code edit, not just after compile checks.
+
+Remaining: **P3** (mock-gate demotion, inner-loop confidence/`llm_endpoint`
+fixes, replay-executor budgets) and **P4** (live-loop integration test,
+log pollution purge, PR #512 framing). `config.json` currently carries two
+deliberate deviations to re-visit: `auto_loop_min_rollouts: 3` (backlog
+eager-fire; with P1 persisted semantics this ≈ one cycle per ~3 rollouts)
+and `use_official_engine: false` (mock backend always rejects; direct
+## 1.8.19 Implementation status — P3 + P4 complete (2026-09-22, 166/166 smoke)
+
+### P3 — real gates (all landed)
+- **Mock-gate demotion**: with `replay_real_executor_enabled` false, stage
+  0.7 runs the mock executor against a dedicated
+  `replay_mock_gate_min_improvement_pp: 1.0` bar (the 5pp real-data bar
+  rejected every honest proposal at 2.08pp noise). Mock counterfactual
+  gate (stage 0 A/B harness) is advisory-only by default;
+  `SKILLOPT_AB_HARNESS_ENABLED` opts a caller in; `validate_proposal`
+  gains `ab_harness_enabled` kwarg and the auto-loop passes it (was a
+  dead guard). `ab_harness._config()` failure-fallback fixed (was
+  inverted-True on config-read failure).
+- **Inner loop (RC5)**: `inner_loop_min_rollout_confidence` 0.4 -> 0.25
+  (class confidence ~0.36 skipped everything forever);
+  `inner_loop_skip_retire_after: 3` — a rollout skipped 3x on confidence
+  is retired with a no-op suggestion (kills the eternal 50-scan rescan);
+  consecutive-skip counters persisted in logs/runs/.inner_loop_skips.json.
+- **Real replay executor (RC4)**: pairwise per-task failure handling —
+  a failed task is dropped with an error envelope, gate proceeds on
+  usable pairs, hard-rejects below `replay_min_n` (3). Budget documented
+  in default_config.yaml: 2 x replay_real_max_tasks x
+  replay_real_per_task_timeout_s.
+- **Live verification post-restart**: cycles_run 0 -> 12+, inner loop
+  drained the eternal backlog (scanned=50 skipped=50 -> suggested=50 ->
+  scanned=0), governance logging real decision rows.
+
+### Live bugs found + fixed after restart
+- **Budget config bug** (auto_loop.py, both `_should_run_skill` and
+  `_mark_skill_cycle`): `cfg.get("budget", {})` returns a STRING — the
+  nested `budget:` YAML section is mangled by merged_config()'s flat
+  light-parse (bare key stored as "") — so `.get()` raised AttributeError
+  on every cycle. In _should_run_skill the except "falls through", which
+  silently DISABLED the daily budget cap; in _mark_skill_cycle spend was
+  never recorded. Fix: accept dict only.
+- **Registry-raise gap** (sleep_runner.merged_config): a RAISING
+  framework-registry read bubbled out of merged_config() into the bare
+  config.json parity fallback, which is {} on a wiped config.json — the
+  exact v1.8.17 silent-spin input. Now guarded (failed registry read
+  treated as empty; YAML defaults always win).
+
+### P4 — hygiene (all landed)
+- **Test isolation from production state (RC7, three live leaks found)**:
+  1. `inner_loop.state_dir` module hook — inner_loop.log and
+     .inner_loop_skips.json land in a tmp sandbox under tests; the suite
+     was writing one "simulated LLM outage" row into the production
+     inner_loop.log on EVERY run, and `reset_for_tests()` unlinked the
+     PRODUCTION skip-counters file (now unlinks only under an active
+     override).
+  2. `_write_fake_rollouts` wrote fixtures into the PRODUCTION
+     logs/rollouts/ via write_rollout() — shared with the live server
+     process over 9p; after the P3 fix made the live tick functional it
+     started scanning fixtures mid-suite and enqueuing real suggestions
+     for them (8x v121_skill_gate_loser_test_fixture_*.md, proven
+     2026-09-22). Now writes to a sandbox + patches ab_harness._rollouts_dir
+     AND sleep_runner.list_rollouts (the stage-0.7 held-out loader reads
+     the latter — missing that patch broke the C2 rejection test).
+  3. Budget tests wrote production budget__test_skill_*.json state
+     (budget_over has no cleanup) — all 7 BudgetTracker constructions now
+     pass a sandboxed state_dir.
+- **Regression guard tests (run last)**:
+  `t_p4_empty_config_yields_defaults` — with an empty registry (== wiped
+  config.json) merged_config() AND the agent_init extension's
+  _get_config() must still return the full YAML defaults (the v1.8.17
+  silent-spin class). `t_p4_no_fixture_pollution` — fails if
+  fixture-named files appear in production run state (archives exempt).
+- **Pollution purged**: 45 fixture suggestion files (v121_*/v122_*/
+  v18_callsite/c2_replay), budget__test_skill_v122_budget_over.json,
+  59 "simulated LLM outage" rows filtered from inner_loop.log; debug
+  consoles + live_cycle_verdict JSONs moved to
+  logs/runs/_debug_archive_20260922/.
+
+### Open items
+- PR #512 framing: description must be rewritten honestly (v1.8.17
+  shipped "component-tests pass" with zero live autonomous cycles; now
+  167/167 incl. integration + pollution guards, live loop cycling).
+- config.json deviations to re-visit: `auto_loop_min_rollouts: 3`,
+  `use_official_engine: false`.
+
+## 1.8.20 Implementation status — gated sleep-cycle runner live (2026-09-23, 167/167 smoke)
+
+- **Gated cycle runner:** new `helpers/judge_client.py` +
+  `scripts/run_sleep_cycle.py` — ingestion -> judge (samples rollouts
+  through the configured judge endpoint, escalates max_tokens on JSON
+  parse failures) -> official gate -> summary. Fail-closed, no ungated
+  fallback.
+- **P5 zombie-aware liveness:** `sleep_runner.is_running` treats
+  `/proc/<pid>/stat` state Z as not-running (Linux). An
+  exited-but-unreaped detached engine child answers `os.kill(pid, 0)`
+  and spun the official-gate poll loop until the full timeout even
+  though report.json was already written. Verified live: poll broke 2.1s
+  after engine exit instead of 900s. Regression test
+  `t_v1820_zombie_aware_is_running` (real fork-produced zombie; the
+  changelog's promised case had NOT landed before the 2026-09-23
+  freeze — added post-freeze).
+- **P6 no-proposal classification:** `official_adapter` maps a
+  gate-verdict night that staged no proposal (edits=[] under the mock
+  backend) to `gate_rejected` (exit 3) instead of INFRA_FAILED.
+  Fail-closed: nothing adopted, live SKILL.md untouched, official
+  staging preserved.
+- **Folded in deployed-but-uncommitted hardening:** `bridge.py`
+  dual-layout import (framework layout with plugin-root fallback);
+  `sleep_runner` v1.8.19 P3/RC4 (`validate_proposal` honours
+  caller-resolved `ab_harness_enabled`; mock replay gate gets its own
+  bar) and P4 (a raising registry config read falls back to the YAML
+  defaults); `tests/smoke.py` hermetic `llm_model` pin in the v1.8.12
+  failing-LLM case.
+- **Live-cycle proof (10:52):** judge 3/3 valid labels; engine header
+  shows the plugin-local `--claude-home` redirect with 120 sessions /
+  40 tasks harvested; summary `GATE_REJECTED` exit 3.
+- **Post-freeze load state (2026-09-23):** v1.8.20 verified loaded live
+  in the container (`plugin.PLUGIN_VERSION` == 1.8.20); auto-loop
+  healthy across the freeze/restart — `cycles_run` 23, inner-loop ticks
+  every ~64s, gates fail-closed (15 proposals rejected, direct engine).
+  No further restart pending.
+- Smoke: 1 new case `t_v1820_zombie_aware_is_running`; suite 167/167.
+  CHANGELOG backfilled with the missing [1.8.18]/[1.8.19] entries
+  (docs-only; derived from §1.8.18/§1.8.19 above).

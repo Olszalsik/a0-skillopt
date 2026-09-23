@@ -78,6 +78,20 @@
       <div>Rollouts: <strong x-text="rollouts"></strong></div>
       <div>Staged: <strong x-text="staged"></strong></div>
     </div>
+    <template x-if="loopState.cfg_empty_since">
+      <!-- v1.8.18 (P0, audit RC8): a silently-spinning loop is visible -->
+      <small class="so-err" style="display: block; margin-top: 8px;">
+        ⚠ auto-loop idle: it read an EMPTY config at
+        <span x-text="new Date(loopState.cfg_empty_since * 1000).toLocaleString()"></span> —
+        save your settings and wait ~30 s; the loop picks them up without a restart.
+      </small>
+    </template>
+    <template x-if="loopState.last_tick_at && loopState.cycles_run === 0">
+      <small style="opacity: 0.7; display: block; margin-top: 8px;">
+        Loop is ticking (last <span x-text="new Date(loopState.last_tick_at * 1000).toLocaleTimeString()"></span>)
+        but no cycle has fired yet — waiting for new rollouts / eligibility.
+      </small>
+    </template>
   </div>
 
   <!-- MANUAL TRIGGERS -->
@@ -232,7 +246,10 @@ function skilloptSettings() {
         this.staged = (s && s.staged_proposals) ? s.staged_proposals.length : 0;
       } catch (e) { this.setMsg('status: ' + e, false); }
       try {
-        const c = await this.api('/config');
+        // v1.8.18 (P0, audit RC1): read config via GET. api() defaults to
+        // POST, and POSTing /config with no body is a SAVE of {} — every
+        // page open used to wipe config.json (the auto-adopt toggle bug).
+        const c = await this.api('/config', { method: 'GET' });
         if (c && c.ok && c.config) {
           for (const k of Object.keys(c.config)) {
             if (k in this.cfg) this.cfg[k] = c.config[k];

@@ -297,7 +297,9 @@ def load_skill_policy(skill_name: str) -> dict[str, Any]:
     return policy
 
 
-def check_skill_eligible(skill_name: str) -> tuple[bool, str]:
+def check_skill_eligible(
+    skill_name: str, *, auto_adopt: bool = False
+) -> tuple[bool, str]:
     """Return (eligible, reason).
 
     Decision order (the first match wins):
@@ -374,7 +376,12 @@ def check_skill_eligible(skill_name: str) -> tuple[bool, str]:
             return False, "daily_budget_exceeded"
 
     # 7. Human approval gate.
-    if bool(policy.get("require_human_approval", False)):
+    #    v1.8.18 (P2.1, 2026-09-22 audit): `auto_adopt=True` is the
+    #    operator's explicit opt-in to full autonomy and overrides the
+    #    pending-approval block. Per-skill optout / immutable / pause
+    #    markers still win unconditionally (steps 1-2.5 above). The
+    #    dashboard Approve flow keeps its role for `auto_adopt: false`.
+    if bool(policy.get("require_human_approval", False)) and not auto_adopt:
         if not _human_approved(skill_name):
             return False, "require_human_approval_pending"
 
