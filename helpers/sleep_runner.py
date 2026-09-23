@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -287,6 +288,60 @@ def find_staged_proposals() -> list[Path]:
         elif child.is_dir() and (child / "SKILL.md").is_file():
             out.append(child / "SKILL.md")
     return out
+
+
+# ----------------------------------------------------------------------- #
+# v1.8.21: staged-proposal lifecycle moves (drain, not head-of-line)
+# ----------------------------------------------------------------------- #
+
+def _move_staged_proposal(src: str | os.PathLike, subdir: str, tag: str) -> Path | None:
+    """Move a staged proposal out of staging/ into staging/<subdir>/ with a
+    timestamped name, carrying its official-gate marker sidecar along.
+    staging/ itself stays the pending queue; find_staged_proposals() scans
+    only its top level, so moved files can never block the queue again.
+    Best-effort: returns the destination path, or None when the source is
+    already gone (moved by a concurrent actor)."""
+    src_path = Path(src)
+    marker = src_path.with_suffix(src_path.suffix + OFFICIAL_GATE_MARKER_SUFFIX)
+    if not src_path.is_file():
+        return None
+    dest_dir = staging_dir() / subdir
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    dest = dest_dir / ("%s__%s%s%s" % (src_path.stem, tag, ts, src_path.suffix))
+    n = 1
+    while dest.exists():
+        dest = dest_dir / ("%s__%s%s_%d%s" % (src_path.stem, tag, ts, n, src_path.suffix))
+        n += 1
+    try:
+        shutil.move(str(src_path), str(dest))
+    except Exception:
+        return None
+    try:
+        if marker.is_file():
+            shutil.move(
+                str(marker),
+                str(dest.with_suffix(dest.suffix + OFFICIAL_GATE_MARKER_SUFFIX)),
+            )
+    except Exception:
+        pass
+    return dest
+
+
+def quarantine_staged_proposal(src: str | os.PathLike, tag: str = "reject") -> Path | None:
+    """v1.8.21: move a REJECTED staged proposal out of staging/ (staging/
+    rejected/). Re-attempting identical bytes next tick is deterministic
+    waste and, with the old head-of-line _auto_adopt, one malformed
+    proposal blocked every staged proposal behind it (proven live
+    2026-09-23: a degenerate proposal re-rejected 14x over ~14h)."""
+    return _move_staged_proposal(src, "rejected", tag)
+
+
+def consume_staged_proposal(src: str | os.PathLike) -> Path | None:
+    """v1.8.21: move an ADOPTED staged proposal out of staging/
+    (staging/adopted/) so it cannot be re-attempted against the now-
+    identical live skill (which would no-op-reject it next tick)."""
+    return _move_staged_proposal(src, "adopted", "adopt")
 
 
 # ----------------------------------------------------------------------- #

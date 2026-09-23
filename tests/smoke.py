@@ -5958,6 +5958,196 @@ def t_v1820_zombie_aware_is_running() -> None:
     _ok("zombie-aware is_running treats state Z as not-running")
 
 
+@test("v1.8.21: _auto_adopt drains all staged proposals (adopt consumed, reject quarantined)")
+def t_v1821_auto_adopt_drains_staged() -> None:
+    """P2 follow-up: the old head-of-line _auto_adopt examined only the
+    newest staged proposal and returned on the first reject/skip, so one
+    malformed proposal blocked the queue forever. The drain must attempt
+    every candidate (bounded), consume the adopted proposal out of
+    staging, and quarantine the rejected one."""
+    import shutil as _shutil
+    import tempfile
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner as _sr, auto_loop as _al
+    except Exception:
+        from helpers import sleep_runner as _sr, auto_loop as _al
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_drain_"))
+    try:
+        _gov_setup(tmp)
+        stage = tmp / "staging"
+        stage.mkdir()
+        skills = tmp / "skills"
+        skills.mkdir()
+        # Governance defaults to opt-out for unknown skills
+        # (mode_opt_out_no_marker): opt both skills in explicitly.
+        (tmp / "v1821_drain_good").mkdir()
+        (tmp / "v1821_drain_good" / ".skillopt.optin").write_text("", encoding="utf-8")
+        (tmp / "v1821_drain_bad").mkdir()
+        (tmp / "v1821_drain_bad" / ".skillopt.optin").write_text("", encoding="utf-8")
+        saved_stage = _sr.staging_dir
+        saved_skills = _sr.a0_skills_dir
+        saved_log = _al._latest_sleep_log
+        saved_save = _al._save_state
+        _sr.staging_dir = lambda: stage
+        _sr.a0_skills_dir = lambda: skills
+        _al._latest_sleep_log = lambda: None
+        # RC7 isolation: _save_state writes the passed dict to the
+        # PRODUCTION .auto_loop_state.json - never let a test counter
+        # overwrite the live loop's state.
+        _al._save_state = lambda s: None
+        try:
+            # Well-formed, official-gated proposal: structural stages only
+            # (official gate marker skips the replay + held-out stages).
+            good_name = "v1821_drain_good"
+            good = stage / (good_name + ".md")
+            good_text = (
+                "# Improved skill\n\n## New section\n\n```python\nprint('x')\n```\n"
+                + "x" * 300
+            )
+            good.write_text(good_text, encoding="utf-8")
+            _sr.write_official_gate_marker(good, skill_name=good_name)
+            # Malformed proposal (zero '#' headers) - deterministic
+            # structural stage-2 reject, the exact live blocker class.
+            bad = stage / "v1821_drain_bad.md"
+            bad.write_text("plain text without headers\n" + "y" * 400, encoding="utf-8")
+
+            cfg = {
+                "auto_adopt": True,
+                "gate_min_chars": 50,
+                "ab_harness_enabled": False,
+                "auto_adopt_max_per_tick": 5,
+            }
+            thread = _al.AutoLoopThread(get_config=lambda: cfg)
+            state: dict = {}
+            thread._auto_adopt(state, cfg)
+
+            # The pending queue is fully drained.
+            left = [p.name for p in stage.iterdir() if p.is_file()]
+            assert not left, f"staging not drained: {left}"
+            # The adopted proposal is consumed (not re-attemptable). The
+            # v1.8.1 consume semantics deliberately clear the provenance
+            # marker first, so the adopted copy carries no sidecar.
+            adopted_files = list((stage / "adopted").glob("v1821_drain_good__adopt*.md"))
+            assert adopted_files, "adopted proposal was not consumed out of staging"
+            assert not list((stage / "adopted").glob("*.md.gate.json")), (
+                "adopted proposal must have its gate marker cleared (v1.8.1 semantics)"
+            )
+            assert (skills / good_name / "SKILL.md").is_file(), "adopted skill missing"
+            assert (skills / good_name / "SKILL.md").read_text(encoding="utf-8") == good_text
+            # The rejected proposals are quarantined, not deleted; a
+            # rejected proposal's marker sidecar travels with it.
+            quarantined = list((stage / "rejected").glob("v1821_drain_bad__reject*.md"))
+            assert quarantined, "rejected proposal was not quarantined"
+            bad2 = stage / "v1821_drain_bad2.md"
+            bad2.write_text("still no headers here\n" + "w" * 400, encoding="utf-8")
+            (tmp / "v1821_drain_bad2").mkdir()
+            (tmp / "v1821_drain_bad2" / ".skillopt.optin").write_text("", encoding="utf-8")
+            _sr.write_official_gate_marker(bad2, skill_name="v1821_drain_bad2")
+            cfg2 = dict(cfg)
+            thread2 = _al.AutoLoopThread(get_config=lambda: cfg2)
+            thread2._auto_adopt({}, cfg2)
+            assert list((stage / "rejected").glob("v1821_drain_bad2__reject*.md.gate.json")), (
+                "quarantined proposal's marker sidecar did not travel with it"
+            )
+            assert state.get("proposals_adopted", 0) >= 1
+            assert state.get("proposals_rejected", 0) >= 1
+        finally:
+            _sr.staging_dir = saved_stage
+            _sr.a0_skills_dir = saved_skills
+            _al._latest_sleep_log = saved_log
+            _al._save_state = saved_save
+    finally:
+        _shutil.rmtree(tmp, ignore_errors=True)
+    _ok("auto-adopt drains staging (adopt consumed, reject quarantined)")
+
+
+@test("v1.8.21: governance-skipped proposal stays in staging (no quarantine)")
+def t_v1821_governance_skip_stays() -> None:
+    """A governance skip is NOT a gate verdict: the skill may become
+    eligible later (approval / opt-in / pause lift), so the proposal must
+    remain queued - only rejects and adoptions leave staging."""
+    import shutil as _shutil
+    import tempfile
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner as _sr, auto_loop as _al
+    except Exception:
+        from helpers import sleep_runner as _sr, auto_loop as _al
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_govskip_"))
+    try:
+        gov = _gov_setup(tmp)
+        skill_dir = tmp / "v1821_govskip_skill"
+        skill_dir.mkdir()
+        (skill_dir / ".skillopt.optout").write_text("", encoding="utf-8")
+        stage = tmp / "staging"
+        stage.mkdir()
+        skills = tmp / "skills"
+        skills.mkdir()
+        saved_stage = _sr.staging_dir
+        saved_skills = _sr.a0_skills_dir
+        saved_save = _al._save_state
+        _sr.staging_dir = lambda: stage
+        _sr.a0_skills_dir = lambda: skills
+        _al._save_state = lambda s: None  # RC7 isolation (see drain test)
+        try:
+            staged = stage / "v1821_govskip_skill.md"
+            staged.write_text(
+                "# Proposal\n\n```python\nprint('x')\n```\n" + "z" * 300, encoding="utf-8")
+            cfg = {"auto_adopt": True, "gate_min_chars": 50, "ab_harness_enabled": False}
+            thread = _al.AutoLoopThread(get_config=lambda: cfg)
+            thread._auto_adopt({}, cfg)
+            assert staged.is_file(), (
+                "governance-skipped proposal must stay in staging "
+                "(the skill may become eligible later)"
+            )
+            rej = stage / "rejected"
+            if rej.is_dir():
+                assert not list(rej.glob("v1821_govskip_skill*")), (
+                    "governance-skipped proposal must not be quarantined"
+                )
+        finally:
+            _sr.staging_dir = saved_stage
+            _sr.a0_skills_dir = saved_skills
+            _al._save_state = saved_save
+            _shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        try:
+            gov.reset_for_tests()
+        except Exception:
+            pass
+    _ok("governance-skipped proposal stays in staging")
+
+
+@test("v1.8.21: run_sleep_cycle refuses the mock backend (fail-fast)")
+def t_v1821_runner_refuses_mock_backend() -> None:
+    """P3 enforcement: the official engine with the mock backend rejects
+    by construction (live 2026-09-23: 40 tasks in 1.1s, 0.2 -> 0.2,
+    tokens_used=0). The runner must refuse the wasted cycle - exit 1
+    before any engine/judge work - for BOTH an explicit mock backend and
+    the unset default."""
+    scripts_dir = str(PLUGIN_ROOT / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    import run_sleep_cycle as runner
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner as _sr
+    except Exception:
+        from helpers import sleep_runner as _sr
+    saved_cfg = _sr.merged_config
+    saved_argv = sys.argv
+    try:
+        _sr.merged_config = lambda: {"official_backend": "mock"}
+        sys.argv = ["run_sleep_cycle.py"]
+        assert runner.main() == 1, "explicit mock backend must be refused (exit 1)"
+
+        _sr.merged_config = lambda: {}
+        sys.argv = ["run_sleep_cycle.py"]
+        assert runner.main() == 1, "unset backend (engine default mock) must be refused"
+    finally:
+        _sr.merged_config = saved_cfg
+        sys.argv = saved_argv
+    _ok("run_sleep_cycle refuses mock/unset backend")
+
+
 @test("v1.8.19 P4: no test-fixture pollution in production run state (runs LAST)")
 def t_p4_no_fixture_pollution():
     """Guard against the RC7 leak class: the suite must never leave

@@ -704,12 +704,55 @@ class AutoLoopThread(threading.Thread):
                 self._log(f"drain_suggestions({skill}) failed: {e}")
 
     def _auto_adopt(self, state: dict[str, Any], cfg: dict[str, Any]) -> None:
-        """If auto_adopt is on and a proposal is staged, run the gate and adopt."""
+        """If auto_adopt is on and proposals are staged, run the gate and adopt.
+
+        v1.8.21 (P2 follow-up): DRAIN, not head-of-line. The previous
+        version examined only the newest staged proposal and returned on
+        the first governance-skip or gate-reject, so throughput was one
+        adoption attempt per 30-min tick and a single malformed proposal
+        blocked every staged proposal behind it (proven live 2026-09-23:
+        a degenerate proposal re-rejected 14x over ~14h while well-formed
+        proposals waited). Now every candidate gets an attempt per tick,
+        bounded by `auto_adopt_max_per_tick` (default 5); a rejected
+        proposal is QUARANTINED out of staging (staging/rejected/) —
+        re-attempting identical bytes is deterministic waste — and an
+        adopted one is consumed (staging/adopted/). Governance skips stay
+        in staging: the skill may become eligible later.
+        """
         staged = sleep_runner.find_staged_proposals()
         if not staged:
             return
         staged.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        src = staged[0]
+        try:
+            max_per_tick = int(cfg.get("auto_adopt_max_per_tick", 5) or 5)
+        except (TypeError, ValueError):
+            max_per_tick = 5
+        if max_per_tick < 1:
+            max_per_tick = 1
+        attempted = adopted = quarantined = skipped = 0
+        for src in staged[:max_per_tick]:
+            attempted += 1
+            try:
+                outcome = self._adopt_one(state, cfg, src)
+            except Exception as e:
+                # One candidate's bug can never stall the drain.
+                self._log(f"auto-loop: staged proposal {src.name!r} attempt failed: {e}")
+                outcome = "skipped"
+            if outcome == "adopted":
+                adopted += 1
+            elif outcome == "quarantined":
+                quarantined += 1
+            else:
+                skipped += 1
+        if attempted > 1:
+            self._log(
+                f"auto-loop: staged drain: attempted={attempted} adopted={adopted} "
+                f"quarantined={quarantined} skipped={skipped}"
+            )
+
+    def _adopt_one(self, state: dict[str, Any], cfg: dict[str, Any],
+                   src: "os.PathLike | str") -> str:
+        """Gate one staged proposal; returns 'adopted' | 'quarantined' | 'skipped'."""
         skill_name = src.stem if src.suffix == ".md" else "unknown"
 
         # v1.8.1 guard: an official run WITHOUT a concrete target copies its
@@ -720,7 +763,10 @@ class AutoLoopThread(threading.Thread):
                 f"auto-loop: skipping staged proposal {src.name!r} "
                 f"(no resolvable skill name in the filename)"
             )
-            return
+            # v1.8.21: quarantine it too - a nameless artifact can never
+            # become adoptable, so leaving it in staging is permanent churn.
+            sleep_runner.quarantine_staged_proposal(src, tag="nameless")
+            return "quarantined"
 
         # v1.8.1: provenance now comes from the per-proposal marker written
         # by official_adapter (state["last_engine"] was the engine of the
@@ -762,7 +808,9 @@ class AutoLoopThread(threading.Thread):
                 self._log(
                     f"governance: skipped {skill_name} ({gov_reason})"
                 )
-                return
+                # v1.8.21: STAY in staging (no quarantine) - the skill may
+                # become eligible later (approval, opt-in, pause lift).
+                return "skipped"
         except Exception as e:
             # Governance failed: fall through to the gate. Don't crash.
             self._log(f"governance: {skill_name} check failed: {e}; falling through")
@@ -854,10 +902,12 @@ class AutoLoopThread(threading.Thread):
             state["proposals_adopted"] = int(state.get("proposals_adopted", 0)) + 1
             _save_state(state)
             self._log(f"auto-loop: ADOPTED {skill_name} ({reason})")
+            outcome = "adopted"
         else:
             state["proposals_rejected"] = int(state.get("proposals_rejected", 0)) + 1
             _save_state(state)
             self._log(f"auto-loop: rejected {skill_name} ({reason})")
+            outcome = "rejected"
             # v1.3.0 (Day-4 item 6): record this rejection to the
             # failure memory so the next cycle's targeted prompt can
             # learn from it. Best-effort: a failure_memory bug here
@@ -919,6 +969,24 @@ class AutoLoopThread(threading.Thread):
             })
         except Exception as e:
             self._log(f"cycle_history.record_cycle_entry({skill_name}) failed: {e}")
+
+        # v1.8.21: lifecycle move AFTER the audit rows (they reference the
+        # staging path). Adopted -> staging/adopted/, rejected ->
+        # staging/rejected/: both leave the pending queue, so the drain
+        # always advances and a rejected proposal is never re-attempted
+        # (identical bytes fail deterministically).
+        if outcome == "adopted":
+            try:
+                moved = sleep_runner.consume_staged_proposal(src)
+                if moved is not None:
+                    self._log(f"auto-loop: consumed staged proposal {src.name!r} -> {moved.name!r}")
+            except Exception as e:
+                self._log(f"auto-loop: consume of adopted proposal {src.name!r} failed: {e}")
+            return "adopted"
+        moved = sleep_runner.quarantine_staged_proposal(src, tag="reject")
+        if moved is not None:
+            self._log(f"auto-loop: quarantined rejected proposal {src.name!r} -> {moved.name!r}")
+        return "quarantined"
 
     # ----------------------------------------------------------------- #
 

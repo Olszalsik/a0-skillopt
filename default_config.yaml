@@ -34,6 +34,12 @@ auto_loop_skill_target: ""
 # staged proposals in the WebUI, then turn it ON once you trust the output.
 auto_adopt: false
 
+# v1.8.21: max staged proposals the auto-adopt drain attempts per 30-min
+# tick (newest first). Bounds gate runtime; everything left over waits
+# for the next tick. Rejected proposals are quarantined to
+# staging/rejected/ and never re-attempted; governance skips stay.
+auto_adopt_max_per_tick: 5
+
 # =====================================================================
 # VALIDATION GATE — last-mile safety check on staged proposals
 # =====================================================================

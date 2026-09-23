@@ -75,7 +75,28 @@ def main() -> int:
     ap.add_argument('--judge-sample', type=int, default=3, help='max rollouts to judge in the judge phase')
     ap.add_argument('--timeout', type=int, default=600, help='official engine poll timeout in seconds')
     ap.add_argument('--skip-judge', action='store_true', help='skip the judge phase (hermetic/CI use only)')
+    ap.add_argument('--allow-mock-backend', action='store_true',
+                    help='deliberately run the official engine with the mock backend (test/CI only; '
+                         'the mock scorer always rejects by construction)')
     args = ap.parse_args()
+
+    # v1.8.21 (P3 enforcement, fail-fast): the official engine with the mock
+    # backend "replays" every task against the deterministic mock scorer
+    # (same score in, tokens_used=0) and rejects by construction - proven
+    # live 2026-09-23: 40 tasks "replayed" in 1.1s, held-out 0.2 -> 0.2,
+    # GATE_REJECTED. The operator's use_official_engine=false exists for
+    # exactly this reason. Refuse the wasted cycle unless a REAL backend is
+    # configured, or the caller explicitly opts back in.
+    _cfg = sleep_runner.merged_config()
+    _backend = str(_cfg.get('official_backend') or '').strip()
+    if not args.allow_mock_backend and (not _backend or _backend == 'mock'):
+        _why = ('official_backend is unset; the official engine defaults to --backend mock'
+                if not _backend else 'official_backend is "mock"')
+        emit('backend_guard', refused=True, backend=_backend or '(unset)',
+             note=_why + '; mock backend always rejects - configure a real '
+                  'official_backend or pass --allow-mock-backend for a deliberate test run')
+        return finish(1, 'INFRA_FAILED',
+                      detail=_why + ' (mock backend rejects by construction; refusing the run)')
 
     runs_dir = sleep_runner.runs_dir()
     _LOG_PATH = runs_dir / ('gated_cycle_' + time.strftime('%Y%m%dT%H%M%S') + '.jsonl')

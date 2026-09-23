@@ -4,6 +4,41 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.21] - 2026-09-23
+
+### Fix: auto-adopt drains the staging queue (head-of-line + quarantine + mock-backend guard)
+
+- **Head-of-line fix (P2 follow-up):** `_auto_adopt` previously examined
+  only the newest staged proposal and returned on the first
+  governance-skip or gate-reject - one malformed proposal blocked every
+  staged proposal behind it, and throughput was one adoption attempt per
+  30-min tick. Now every candidate is attempted per tick, bounded by the
+  new `auto_adopt_max_per_tick` (default 5, newest first); a per-candidate
+  exception can never stall the drain.
+- **Quarantine (proven live 2026-09-23):** a degenerate Sep-22 proposal
+  (zero `#` markdown headers) was re-rejected 14x over ~14h while 6
+  well-formed proposals waited behind it. New
+  `sleep_runner.quarantine_staged_proposal()` / `consume_staged_proposal()`
+  move rejected proposals to `staging/rejected/` and adopted ones to
+  `staging/adopted/` (official-gate marker sidecar travels along;
+  `find_staged_proposals()` scans staging top-level only, so moved files
+  can never re-enter the queue). Governance skips stay in staging - the
+  skill may become eligible later. The live malformed file was purged to
+  `staging/rejected/` at deploy time.
+- **Adopted proposals are consumed:** previously an adopted proposal stayed
+  in staging and would be no-op-rejected against the now-identical live
+  skill forever, polluting failure memory and the audit log each tick.
+- **Mock-backend guard (P3 enforcement):** `scripts/run_sleep_cycle.py`
+  now fails fast (exit 1, `INFRA_FAILED`) when `official_backend` is
+  unset or "mock" unless `--allow-mock-backend` is passed: the mock
+  scorer always rejects by construction (proven live 2026-09-23: 40
+  tasks "replayed" in 1.1s, held-out 0.2 -> 0.2, tokens_used=0). The
+  operator's `use_official_engine: false` exists for exactly this reason;
+  the runner can no longer burn a cycle on a guaranteed rejection.
+- Smoke: 3 new cases (drain+quarantine+consume end-to-end, governance
+  skip stays in staging, runner refuses mock backend); suite 170/170.
+  Version parity: plugin.yaml / plugin.py / hooks.py / execute.py.
+
 ## [1.8.20] - 2026-09-23
 
 ### Fix: gated cycle runner completes its first fully healthy lifecycle
