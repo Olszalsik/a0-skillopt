@@ -317,14 +317,25 @@ def _move_staged_proposal(src: str | os.PathLike, subdir: str, tag: str) -> Path
         shutil.move(str(src_path), str(dest))
     except Exception:
         return None
-    try:
-        if marker.is_file():
-            shutil.move(
-                str(marker),
-                str(dest.with_suffix(dest.suffix + OFFICIAL_GATE_MARKER_SUFFIX)),
-            )
-    except Exception:
-        pass
+    # Sidecars travel with the proposal: the official-gate marker (v1.8.1),
+    # and the v1.8.22 real-gate verdict sidecar + frozen held-out tasks
+    # file. Without this, a pending-real-gate proposal consumed or
+    # quarantined by the manual /adopt path would strand its sidecar in
+    # staging top level — and find_pending_real_gate_sidecar() (single
+    # flight) would then block every future real-gate spawn forever.
+    for _sidecar, _suffix in (
+        (marker, OFFICIAL_GATE_MARKER_SUFFIX),
+        (_real_gate_sidecar_path(src_path), REAL_GATE_SIDECAR_SUFFIX),
+        (_real_gate_tasks_path(src_path), REAL_GATE_TASKS_SUFFIX),
+    ):
+        try:
+            if _sidecar.is_file():
+                shutil.move(
+                    str(_sidecar),
+                    str(dest.with_suffix(dest.suffix + _suffix)),
+                )
+        except Exception:
+            pass
     return dest
 
 
@@ -549,7 +560,33 @@ def validate_proposal(
                 # real improvements pass, outright regressions (lift < 0)
                 # still reject. The real executor keeps the full
                 # gate_min_improvement_pp bar.
-                _is_mock = not bool(_cfg.get("replay_real_executor_enabled", False))
+                #
+                # v1.8.22: two changes.
+                # (a) EXECUTOR REROUTE — when the ASYNC real gate owns the
+                #     real confirmation (replay_real_gate_enabled, requires
+                #     replay_real_executor_enabled), stage 0.7 must NOT run
+                #     the real executor synchronously here: the drain would
+                #     block for up to 2xN monologues AND the async worker
+                #     would re-run the same counterfactual (double spend).
+                #     The in-gate executor is the cheap deterministic mock;
+                #     the real confirmation happens in the drain's async
+                #     stage (_real_gate_spawn).
+                # (b) MOCK VERDICT ADVISORY — with replay_mock_enforce false
+                #     (the default), the mock verdict is LOGGED, not
+                #     enforced: its keyword-relevance lift on real proposals
+                #     is noise (2026-09-23 drain: 5 of 7 proposals rejected
+                #     as mock "regression"). True restores the v1.8.19 hard
+                #     1.0pp mock bar. The legacy synchronous-real path
+                #     (async gate OFF, replay_real_executor_enabled ON)
+                #     keeps enforcing the full gate_min_improvement_pp bar.
+                _real_enabled = bool(_cfg.get("replay_real_executor_enabled", False))
+                _async_gate = bool(_cfg.get("replay_real_gate_enabled", False)) and _real_enabled
+                _is_mock = (not _real_enabled) or _async_gate
+                _enforce = (
+                    bool(_cfg.get("replay_mock_enforce", False))
+                    if _is_mock
+                    else True  # legacy synchronous-real path keeps its bar
+                )
                 _rc_cfg = dict(_cfg)
                 if _is_mock:
                     _rc_cfg["gate_min_improvement_pp"] = float(
@@ -566,9 +603,21 @@ def validate_proposal(
                 )
                 if _replay.get("ok"):
                     if not _replay.get("accepted"):
-                        return False, (
-                            f"replay_gate_rejected: {_replay.get('reason', 'unknown')}"
-                        )
+                        if _is_mock and not _enforce:
+                            try:
+                                import logging as _logging
+                                _logging.getLogger("skillopt.sleep_runner").info(
+                                    "[skillopt] mock replay gate (advisory, not "
+                                    "enforcing) for %s: %s",
+                                    skill_name,
+                                    _replay.get("reason", "unknown"),
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            return False, (
+                                f"replay_gate_rejected: {_replay.get('reason', 'unknown')}"
+                            )
                     # accepted=True: continue to the structural stages.
                 # ok=False: insufficient rollouts / executor unavailable ->
                 # fall through to the structural gate (loud-not-crash).
@@ -908,23 +957,16 @@ def launch_sleep_subprocess(
     ).encode("utf-8")
     log_fh.write(header)
 
-    # Cross-platform detached-subprocess flags.
-    # POSIX: start_new_session=True puts the child in its own session
-    # so signals from the parent don't reach it. Windows: that kwarg
-    # does not exist; use creationflags with CREATE_NEW_PROCESS_GROUP
-    # (and DETACHED_PROCESS so Ctrl-C in our console doesn't kill it).
+    # Cross-platform detached-subprocess flags — factored into
+    # _detached_popen_kwargs() in v1.8.22 so the real-gate worker
+    # launcher shares the exact same recipe.
     popen_kwargs: dict[str, Any] = dict(
         stdout=log_fh,
         stderr=subprocess.STDOUT,
         cwd=str(staging_dir()),
         env=sub_env,
+        **_detached_popen_kwargs(),
     )
-    if sys.platform == "win32":
-        DETACHED_PROCESS = 0x00000008
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        popen_kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-    else:
-        popen_kwargs["start_new_session"] = True
 
     proc = subprocess.Popen(cmd, **popen_kwargs)
     # v1.8.1: enforce the (previously dead) max_runs_retained retention so
@@ -1134,6 +1176,165 @@ def clear_official_gate_marker(staged_path: str | os.PathLike) -> None:
             marker.unlink()
     except Exception:
         pass
+
+
+# ----------------------------------------------------------------------- #
+# v1.8.22: async real-executor confirmation gate (verdict sidecars)
+# ----------------------------------------------------------------------- #
+
+REAL_GATE_SIDECAR_SUFFIX = ".md.realgate.json"
+REAL_GATE_TASKS_SUFFIX = ".md.realgate.tasks.json"
+
+
+def _real_gate_sidecar_path(staged_path: str | os.PathLike) -> Path:
+    """`<staging>/<skill>.md` -> `<staging>/<skill>.md.realgate.json` (not
+    matched by find_staged_proposals, which filters on .md/.proposed)."""
+    p = Path(staged_path)
+    return p.with_suffix(p.suffix + REAL_GATE_SIDECAR_SUFFIX)
+
+
+def _real_gate_tasks_path(staged_path: str | os.PathLike) -> Path:
+    """`<staging>/<skill>.md` -> `<staging>/<skill>.md.realgate.tasks.json`
+    — the held-out task set FROZEN at spawn time, so the worker's
+    measurement and the harvester's drift check share one immutable set."""
+    p = Path(staged_path)
+    return p.with_suffix(p.suffix + REAL_GATE_TASKS_SUFFIX)
+
+
+def write_real_gate_sidecar(staged_path: str | os.PathLike, payload: dict[str, Any]) -> Path | None:
+    """Write/update the real-gate verdict sidecar for a staged proposal.
+
+    Write-then-rename (os.replace) so a reader never sees a torn JSON —
+    the sidecar is the single source of truth for pending/done/failed
+    across restarts. Best-effort: returns the path, or None on failure.
+    """
+    try:
+        p = _real_gate_sidecar_path(staged_path)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(tmp, p)
+        return p
+    except Exception:
+        return None
+
+
+def read_real_gate_sidecar(staged_path: str | os.PathLike) -> dict[str, Any] | None:
+    """Return the real-gate sidecar dict for a staged proposal, or None
+    when absent/unreadable (a corrupt sidecar is treated as ABSENT: the
+    caller falls through to the normal drain path — never deadlock)."""
+    p = _real_gate_sidecar_path(staged_path)
+    if not p.is_file():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        try:
+            p.unlink()
+        except Exception:
+            pass
+        return None
+
+
+def find_pending_real_gate_sidecar() -> dict[str, Any] | None:
+    """Single-flight primitive: scan staging/ top level for a real-gate
+    sidecar with status == 'pending' whose worker pid is STILL RUNNING.
+    Returns its payload, or None when no live gate is in flight.
+
+    Derived from the filesystem (not in-memory state), so it survives A0
+    restarts and is correct from any process. A 'pending' sidecar with a
+    DEAD pid is deliberately NOT returned: the harvester's stale timeout
+    owns that case, so a dead worker cannot block future spawns forever.
+    Best-effort: never raises."""
+    try:
+        sd = staging_dir()
+        if not sd.is_dir():
+            return None
+        for child in sd.glob("*" + REAL_GATE_SIDECAR_SUFFIX):
+            try:
+                data = json.loads(child.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(data, dict) or data.get("status") != "pending":
+                continue
+            if is_running(int(data.get("pid") or 0)):
+                return data
+    except Exception:
+        pass
+    return None
+
+
+def _detached_popen_kwargs() -> dict[str, Any]:
+    """Cross-platform detached-subprocess flags (v1.8.22, factored out of
+    launch_sleep_subprocess so the real-gate worker uses the same recipe).
+    POSIX: start_new_session=True — signals from the parent don't reach
+    the child. Windows: CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS so a
+    Ctrl-C in the parent console cannot kill it."""
+    if sys.platform == "win32":
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        return {"creationflags": DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def launch_real_gate_worker(
+    *,
+    skill_name: str,
+    staged_path: str | os.PathLike,
+    sidecar_path: str | os.PathLike,
+    tasks_file: str | os.PathLike,
+    extra_args: list[str] | None = None,
+) -> dict[str, Any]:
+    """Spawn scripts/replay_gate_worker.py DETACHED to run the real replay
+    counterfactual for one staged proposal and write its verdict sidecar.
+
+    Mirrors launch_sleep_subprocess: .skillopt-env credentials, cwd
+    staging_dir(), detached flags (win: DETACHED_PROCESS | CREATE_NEW_
+    PROCESS_GROUP, posix: start_new_session), stdout redirected to a
+    dedicated run log (a detached child with no stdout handle dies on its
+    first write on Windows). NEVER adopts — the drain harvests the
+    sidecar verdict on a later tick.
+
+    Returns {pid, log_path, started_at, cmd}. Raises on spawn failure
+    (the caller has already written the pending sidecar and cleans up)."""
+    cmd = [
+        _a0_python(),
+        str(plugin_root() / "scripts" / "replay_gate_worker.py"),
+        "--skill-name", str(skill_name),
+        "--staged-path", str(staged_path),
+        "--sidecar", str(sidecar_path),
+        "--tasks-file", str(tasks_file),
+    ]
+    if extra_args:
+        cmd += [str(a) for a in extra_args]
+    env = build_subprocess_env()
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    log_path = runs_dir() / f"real_gate_worker_{ts}_{skill_name}.log"
+    log_fh = open(log_path, "ab", buffering=0)
+    log_fh.write(
+        (f"$ {' '.join(cmd)}\n"
+         f"# started at {time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n").encode("utf-8")
+    )
+    popen_kwargs: dict[str, Any] = dict(
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
+        cwd=str(staging_dir()),
+        env=env,
+        **_detached_popen_kwargs(),
+    )
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+    try:
+        enforce_run_log_retention()
+    except Exception:
+        pass
+    return {
+        "pid": proc.pid,
+        "log_path": str(log_path),
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "cmd": cmd,
+    }
 
 
 def rotate_log_if_large(path: str | os.PathLike, max_bytes: int = 5_000_000) -> bool:

@@ -388,9 +388,17 @@ def run_counterfactual(
             # replay_min_n remain; below that the gate reports not-run.
             _failed_tasks = 0
             for t in held_out_tasks:
+                # v1.8.22: per-task wall-clock latency (real executor only)
+                # — the budget math (2 x N x per-task timeout) needs the
+                # observed per-monologue latencies on record.
+                _t0 = _t1 = None
                 try:
+                    import time as _time
+                    _t0 = _time.monotonic()
                     sc = _real_score(t, current_skill_md, cfg, skill_name)
+                    _t1 = _time.monotonic()
                     sp = _real_score(t, proposed_skill_md, cfg, skill_name)
+                    _t2 = _time.monotonic()
                 except Exception as _te:  # noqa: BLE001 - per-task, not gate-level
                     log.warning(
                         "[skillopt] replay task failed (dropped from both arms): %s",
@@ -401,11 +409,16 @@ def run_counterfactual(
                         "error": str(_te)[:200],
                     })
                     continue
-                per_task.append({
+                _pt = {
                     "id": (t.get("id") if isinstance(t, dict) else None),
                     "current": round(sc, 4),
                     "proposed": round(sp, 4),
-                })
+                    "latency_s": {
+                        "current": round(_t1 - _t0, 1) if _t0 is not None and _t1 else None,
+                        "proposed": round(_t2 - _t1, 1) if _t1 and _t2 else None,
+                    },
+                }
+                per_task.append(_pt)
             usable = [p for p in per_task if "error" not in p]
             n = len(usable)
             if n < int(cfg.get("replay_min_n", 3) or 0):

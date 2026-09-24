@@ -304,6 +304,28 @@
     },
 
     /**
+     * v1.8.22: shape the /loop response's real_gate mirror into
+     * render-ready values for the Loop status card ("real gate pending"
+     * line). Pure function: no fetch, no DOM, no side-effects.
+     *
+     * loopState: the `/loop` JSON body (api/loop.py passes the whole
+     * .auto_loop_state.json dict through). Returns null when no gate is
+     * in flight, else { pending, skill, pid, started_ts, age_min }.
+     */
+    renderRealGate(loopState) {
+      const rg = loopState && loopState.real_gate;
+      if (!rg || typeof rg !== 'object') return null;
+      return {
+        pending: true,
+        skill: String(rg.skill || ''),
+        pid: Number(rg.pid || 0),
+        started_ts: Number(rg.started_ts || 0),
+        age_s: Number(rg.age_s || 0),
+        age_min: Math.round(Number(rg.age_s || 0) / 60),
+      };
+    },
+
+    /**
      * v1.7.0 (Phase C3): shape a /staged response into render-ready rows.
      * Pure: no fetch, no DOM. Each row carries the gate evidence the
      * config.html "Staged proposals" cards render (skill, proposal_id,

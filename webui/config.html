@@ -92,6 +92,16 @@
         but no cycle has fired yet — waiting for new rollouts / eligibility.
       </small>
     </template>
+    <template x-if="loopState.real_gate">
+      <!-- v1.8.22: async real-executor confirmation in flight -->
+      <small style="display: block; margin-top: 8px;">
+        🔬 real gate pending: <strong x-text="loopState.real_gate.skill"></strong>
+        since <span x-text="new Date((loopState.real_gate.started_ts || 0) * 1000).toLocaleString()"></span>
+        (pid <span x-text="loopState.real_gate.pid"></span>,
+        <span x-text="Math.round((loopState.real_gate.age_s || 0) / 60)"></span> min) —
+        verdict harvested on a later tick.
+      </small>
+    </template>
   </div>
 
   <!-- MANUAL TRIGGERS -->

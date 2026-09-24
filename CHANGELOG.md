@@ -4,6 +4,65 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.22] - 2026-09-24
+
+### Fix: smoke suite no longer bypasses LLM stubs when /a0 is importable (canonical module identity)
+
+- **Root cause (proven 2026-09-23):** the production helpers use two-path imports
+  (prefer `usr.plugins.skillopt.helpers.*`, fall back to bare `helpers.*`). When
+  `tests/smoke.py` runs with /a0 on sys.path (PYTHONPATH=/a0, `python -m`, or inside
+  the A0 framework runtime), BOTH variants import and Python treats them as two
+  different module objects: stubs applied to the bare variant are silently bypassed
+  and judge / ab-harness / replay-gate tests hit the real configured LLM.
+  Reproduction: PYTHONPATH=/a0 produced live minimax-m3 judge calls, a real
+  `replay_worker.py` spawn, and 3-6 order-dependent failures per run
+  (evidence: workdir logs `skillopt_suite_pypath.log`, `skillopt_suite_pypath_fixed2.log`).
+- **Fix (test process only):** `tests/smoke.py` now canonicalizes module identity at
+  header time — synthetic namespace packages (`usr`, `usr.plugins`,
+  `usr.plugins.skillopt`), eager aliasing of the bare `helpers`/`api`/`tools` top
+  packages, and eager aliasing of every bare `helpers.*` leaf into the
+  `usr.plugins.skillopt.helpers.*` `sys.modules` slots. Both import forms resolve
+  through the module cache to ONE object, so test stubs, `chat_model._CACHE` and
+  ab-harness registries stay single-instance in any launch environment. Production
+  two-path behavior is untouched; the dual-instance `is not` guards in older tests
+  degrade to no-ops under canonical identity.
+- **New regression tests (v1.8.22 section, 2 cases):** namespace imports alias the
+  bare modules (single identity); a bare-variant `_call_llm` stub is honoured through
+  the judge two-path import (no real LLM call).
+- **Verification:** full suite 172/172 PASS under PYTHONPATH=/a0 (the previously
+  failing condition) and 172/172 plain; zero real LLM calls
+  (logs: `skillopt_suite_pypath_fixed3.log`, `skillopt_suite_plain_fixed.log`).
+- Version bumped to 1.8.22 in plugin.yaml / plugin.py / hooks.py / execute.py.
+
+### Feature: async real-executor confirmation gate + advisory mock gate (P3 residual)
+
+Closes the adoption-throughput problem (the last P3 residual): the mock
+counterfactual's keyword heuristic rejected 5 of 7 real staged proposals as
+noise on the 2026-09-23 drain, while the real replay executor was unusable
+synchronously (2xN full monologues vs a 600s drain budget).
+
+- **Advisory mock (default):** `replay_mock_enforce: false` — a losing mock
+  verdict logs and proceeds; `true` restores the v1.8.19 1.0pp hard bar.
+- **Async confirm stage:** direct proposals spawn a DETACHED real-gate
+  worker (`scripts/replay_gate_worker.py`) and park pending; the verdict
+  lands in a `.md.realgate.json` sidecar; the next drain tick harvests it
+  (accepted -> adopt, measured regression -> quarantine, not-run/failed/
+  stale -> loud fail-open adopt).
+- **Single-flight + frozen tasks:** the sidecar is written before spawn and
+  blocks further spawns until harvested; the held-out set is frozen into a
+  `.md.realgate.tasks.json` at spawn time (no drift).
+- **Budget:** 450s per-task x 3 tasks (worst case 45 min, out-of-thread);
+  spawn records `replay_real_gate_cost_cents` (6c) in the budget tracker.
+- **Restart safety:** orphaned sidecars cleaned, mirror rehydrated, 4h
+  stale window, ctypes `is_running(pid)` on win32.
+- **TRAP A/B honored:** worker knobs are CLI-passed (config.json invisible
+  in the worker); stage 0.7 runs MOCK whenever the async gate owns real
+  confirmation (no double spend).
+- Observability: drain summary `pending=`, Loop-card real-gate line,
+  per-task `latency_s` in real verdicts.
+- Smoke: 11 new t_v1822_* cases; two legacy tests pinned to the retired
+  semantics; suite 183/183.
+
 ## [1.8.21] - 2026-09-23
 
 ### Fix: auto-adopt drains the staging queue (head-of-line + quarantine + mock-backend guard)

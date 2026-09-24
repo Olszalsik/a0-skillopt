@@ -84,6 +84,9 @@ def _load_state() -> dict[str, Any]:
         "running": False,
         "last_error": None,
         "last_engine": None,
+        # v1.8.22: mirror of the live real-gate sidecar (dashboard only —
+        # the sidecar file is the source of truth across restarts).
+        "real_gate": None,
     }
 
 
@@ -721,7 +724,12 @@ class AutoLoopThread(threading.Thread):
         """
         staged = sleep_runner.find_staged_proposals()
         if not staged:
+            # v1.8.22: even an empty queue needs the cleanup pass — a
+            # real-gate worker may have finished while staging was
+            # otherwise quiet, and the state mirror must not go stale.
+            self._real_gate_cleanup(state, cfg)
             return
+        self._real_gate_cleanup(state, cfg)
         staged.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         try:
             max_per_tick = int(cfg.get("auto_adopt_max_per_tick", 5) or 5)
@@ -729,7 +737,7 @@ class AutoLoopThread(threading.Thread):
             max_per_tick = 5
         if max_per_tick < 1:
             max_per_tick = 1
-        attempted = adopted = quarantined = skipped = 0
+        attempted = adopted = quarantined = skipped = pending = 0
         for src in staged[:max_per_tick]:
             attempted += 1
             try:
@@ -742,13 +750,368 @@ class AutoLoopThread(threading.Thread):
                 adopted += 1
             elif outcome == "quarantined":
                 quarantined += 1
+            elif outcome == "pending":
+                pending += 1
             else:
                 skipped += 1
-        if attempted > 1:
+        if attempted > 1 or pending:
             self._log(
                 f"auto-loop: staged drain: attempted={attempted} adopted={adopted} "
-                f"quarantined={quarantined} skipped={skipped}"
+                f"quarantined={quarantined} pending={pending} skipped={skipped}"
             )
+
+    # ----------------------------------------------------------------- #
+
+    def _real_gate_cleanup(self, state: dict[str, Any], cfg: dict[str, Any]) -> None:
+        """v1.8.22: real-gate rehydrate/orphan-cleanup pass, run at the
+        top of every _auto_adopt (including empty-queue ticks).
+
+        The sidecar file is the source of truth; state["real_gate"] is a
+        dashboard mirror. Orphaned sidecars (proposal left staging while
+        the worker was out) are unlinked once the pid is dead — without
+        this, a manually-consumed pending proposal would strand its
+        sidecar and single-flight would block every future real gate."""
+        try:
+            sd = sleep_runner.staging_dir()
+            if not sd.is_dir():
+                return
+            live: dict[str, Any] | None = None
+            for child in sd.glob("*" + sleep_runner.REAL_GATE_SIDECAR_SUFFIX):
+                try:
+                    rg = json.loads(child.read_text(encoding="utf-8"))
+                except Exception:
+                    # Corrupt sidecar: unlink, never deadlock single-flight.
+                    try:
+                        child.unlink()
+                    except OSError:
+                        pass
+                    continue
+                if not isinstance(rg, dict):
+                    continue
+                prop = Path(str(rg.get("proposal_path") or ""))
+                pid = int(rg.get("pid") or 0)
+                if not prop.is_file() and not sleep_runner.is_running(pid):
+                    # The verdict will never be consumable; the proposal
+                    # was consumed/quarantined by another actor.
+                    try:
+                        child.unlink()
+                    except OSError:
+                        pass
+                    continue
+                if rg.get("status") == "pending" and sleep_runner.is_running(pid):
+                    live = rg
+            if live is not None and not state.get("real_gate"):
+                # Restart mid-gate: rehydrate the dashboard mirror.
+                state["real_gate"] = {
+                    "skill": live.get("skill"),
+                    "proposal": Path(str(live.get("proposal_path") or "")).name,
+                    "pid": live.get("pid"),
+                    "sidecar": str(child),
+                    "started_ts": live.get("started_ts"),
+                    "started_at": live.get("started_at"),
+                    "jsonl_path": live.get("jsonl_path"),
+                }
+                _save_state(state)
+            elif live is None and state.get("real_gate"):
+                state["real_gate"] = None
+                _save_state(state)
+        except Exception as e:
+            self._log(f"real gate cleanup failed: {e}")
+
+    def _real_gate_enabled(
+        self, cfg: dict[str, Any], official_gated: bool, src: "os.PathLike | str"
+    ) -> bool:
+        """v1.8.22: should this structurally-valid proposal wait for the
+        ASYNC real replay confirmation instead of adopting immediately?
+
+        - Both replay_real_executor_enabled AND replay_real_gate_enabled
+          (the gate cannot work without its executor).
+        - official_gated proposals bypass: the upstream engine already ran
+          its monotonic gate (stage 0.7 skips them for the same reason).
+        - Single-flight is NOT checked here: the caller parks the
+          proposal as 'skipped' when another gate is in flight (see the
+          spawn branch in _adopt_one) so it never adopts unconfirmed.
+        - A proposal that already carries a sidecar is handled by the
+          harvest branch earlier in _adopt_one, never here."""
+        if not (
+            bool(cfg.get("replay_real_executor_enabled", False))
+            and bool(cfg.get("replay_real_gate_enabled", False))
+        ):
+            return False
+        if official_gated:
+            return False
+        if sleep_runner.read_real_gate_sidecar(src) is not None:
+            return False
+        return True
+
+    def _real_gate_spawn(
+        self, state: dict[str, Any], cfg: dict[str, Any],
+        src: "os.PathLike | str", skill_name: str,
+    ) -> str | None:
+        """Spawn the detached real-gate worker for one staged proposal.
+
+        Returns 'pending' on a successful spawn (the caller parks the
+        proposal), or None to fall through to the normal adopt path
+        (fewer than replay_min_n held-out tasks — a 45-min worker would
+        be guaranteed to return insufficient_n — or a spawn error).
+        Sidecar is written BEFORE the spawn: a crash between spawn and
+        sidecar write would orphan a running, never-harvested worker AND
+        let a second spawn for the same proposal double-spend."""
+        held = sleep_runner._load_held_out(skill_name)
+        min_n = int(cfg.get("replay_min_n", 3) or 3)
+        if len(held) < min_n:
+            self._log(
+                f"real gate: skipped for {skill_name} (held_out={len(held)} < "
+                f"min_n={min_n}); adopting without real confirmation"
+            )
+            return None
+        tasks_path = sleep_runner._real_gate_tasks_path(src)
+        tasks_path.write_text(json.dumps(held, ensure_ascii=False), encoding="utf-8")
+        sidecar_path = sleep_runner._real_gate_sidecar_path(src)
+        now = time.time()
+        payload: dict[str, Any] = {
+            "real_gate": True,
+            "schema": 1,
+            "skill": skill_name,
+            "proposal_path": str(src),
+            "staged_mtime": src.stat().st_mtime,
+            "status": "pending",
+            "pid": 0,
+            "started_ts": now,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now)),
+            "finished_ts": None,
+            "jsonl_path": None,
+            "tasks_file": str(tasks_path),
+            "held_out_ids": [
+                t.get("id") for t in held if isinstance(t, dict)
+            ],
+            "gate_passed": True,
+            "verdict": None,
+            "error": None,
+        }
+        write_result = sleep_runner.write_real_gate_sidecar(src, payload)
+        if write_result is None:
+            raise RuntimeError("real-gate sidecar write failed")
+        max_tasks = int(cfg.get("replay_real_max_tasks", 3) or 0)
+        per_task = int(cfg.get("replay_real_per_task_timeout_s", 450) or 450)
+        knobs = [
+            "--per-task-timeout-s", str(per_task),
+            "--max-tasks", str(max_tasks),
+            "--gate-min-improvement-pp",
+            str(float(cfg.get("gate_min_improvement_pp", 5.0) or 0.0)),
+            "--replay-min-n", str(min_n),
+        ]
+        try:
+            launched = sleep_runner.launch_real_gate_worker(
+                skill_name=skill_name,
+                staged_path=src,
+                sidecar_path=sidecar_path,
+                tasks_file=tasks_path,
+                extra_args=knobs,
+            )
+        except Exception:
+            # Spawn failed: remove the pending sidecar + frozen tasks so a
+            # half-spawn never blocks single-flight or parks the proposal
+            # in a 4h stale window for nothing.
+            for _p in (sidecar_path, tasks_path):
+                try:
+                    Path(str(_p)).unlink()
+                except OSError:
+                    pass
+            raise
+        payload["pid"] = launched.get("pid", 0)
+        sleep_runner.write_real_gate_sidecar(src, payload)
+        state["real_gate"] = {
+            "skill": skill_name,
+            "proposal": Path(str(src)).name,
+            "pid": payload["pid"],
+            "sidecar": str(sidecar_path),
+            "started_ts": payload["started_ts"],
+            "started_at": payload["started_at"],
+            "jsonl_path": payload["jsonl_path"],
+        }
+        _save_state(state)
+        # Budget bookkeeping: one gate = 2xN full monologues. Record-only
+        # (no can_spend block): eligibility was already checked at cycle
+        # time; a hard block here would park proposals invisibly.
+        try:
+            if budget is not None:
+                cost = int(cfg.get("replay_real_gate_cost_cents", 6) or 0)
+                if cost:
+                    bt = budget.BudgetTracker(skill_name=skill_name)
+                    bt.record_spend(cost)
+        except Exception as e:
+            self._log(f"real gate budget record failed for {skill_name}: {e}")
+        self._log(
+            f"real gate: spawned worker pid={payload['pid']} for {skill_name} "
+            f"(n_held_out={len(held)}, worst_case_s={2 * max_tasks * per_task if max_tasks else 'uncapped'})"
+        )
+        return "pending"
+
+    def _harvest_real_gate(
+        self, state: dict[str, Any], cfg: dict[str, Any],
+        src: "os.PathLike | str", skill_name: str,
+        rg: dict[str, Any],
+    ) -> str:
+        """Resolve a real-gate sidecar on a later tick. Decision matrix
+        (v1.8.22): fail-OPEN on 'could not measure' (not-run / failed /
+        stale — quarantining would permanently destroy good proposals on
+        a transient executor outage, the v1.8.21 head-of-line disease
+        with worse blast radius), fail-CLOSED on a real measurement
+        (regression / no-lift / insufficient lift quarantine)."""
+        status = rg.get("status")
+        verdict = rg.get("verdict") if isinstance(rg.get("verdict"), dict) else None
+        stale_after = int(cfg.get("replay_real_gate_stale_after_s", 14400) or 14400)
+        adopt: bool | None
+        note: str
+        if status == "done" and verdict is not None:
+            if verdict.get("ok"):
+                adopt = bool(verdict.get("accepted"))
+                note = (
+                    f"real_gate_accepted: {verdict.get('reason', '')}"
+                    if adopt
+                    else f"real_gate_rejected: {verdict.get('reason', '')}"
+                )
+            else:
+                # ok=False = could not run (consistent with stage 0.7's
+                # synchronous ok=False fall-through to structural).
+                adopt = True
+                note = f"real_gate_not_run: {verdict.get('reason', '')}"
+        elif status == "failed":
+            adopt = True
+            note = f"real_gate_failed: {rg.get('error', '')}"
+        elif status == "pending":
+            pid = int(rg.get("pid") or 0)
+            if sleep_runner.is_running(pid):
+                return "pending"
+            age = time.time() - float(rg.get("started_ts") or 0.0)
+            if age > stale_after:
+                adopt = True
+                note = f"real_gate_stale: worker pid={pid} dead after {int(age)}s"
+            else:
+                return "pending"  # within the grace window
+        else:
+            adopt = True
+            note = f"real_gate_unknown_status: {status!r}"
+
+        # Drift check — advisory, never veto: the measurement was paid
+        # for and is internally consistent (frozen tasks file).
+        try:
+            drift: list[str] = []
+            if abs(
+                float(rg.get("staged_mtime") or 0.0) - Path(str(src)).stat().st_mtime
+            ) > 1e-6:
+                drift.append("proposal_changed_since_spawn")
+            fresh_ids = [
+                t.get("id") for t in sleep_runner._load_held_out(skill_name)
+                if isinstance(t, dict)
+            ]
+            if list(rg.get("held_out_ids") or []) != fresh_ids:
+                drift.append("held_out_set_changed")
+            if drift:
+                note += f" [drift: {', '.join(drift)}]"
+        except Exception:
+            pass
+
+        state["real_gate"] = None
+        _save_state(state)
+
+        target = sleep_runner.a0_skills_dir() / skill_name / "SKILL.md"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        audit = sleep_runner.runs_dir() / "adoptions.log"
+        audit.parent.mkdir(parents=True, exist_ok=True)
+
+        if adopt:
+            proposed = src.read_text(encoding="utf-8")
+            target.write_text(proposed, encoding="utf-8")
+            try:
+                sleep_runner.clear_official_gate_marker(src)
+            except Exception:
+                pass
+            state["proposals_adopted"] = int(state.get("proposals_adopted", 0)) + 1
+            _save_state(state)
+            entry = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "skill": skill_name,
+                "source": str(src),
+                "target": str(target),
+                "passed": True,
+                "reason": note,
+                "real_gate": "harvested",
+                "held_out": None,
+            }
+            with open(audit, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            self._log(f"auto-loop: ADOPTED {skill_name} ({note})")
+            try:
+                from usr.plugins.skillopt.helpers import cycle_history  # type: ignore  # noqa: F401
+            except Exception:
+                from helpers import cycle_history  # type: ignore  # noqa: F401
+            try:
+                cycle_history.record_cycle_entry({
+                    "skill": skill_name,
+                    "outcome": "adopted",
+                    "outcome_detail": note,
+                    "proposal_id": Path(str(src)).stem,
+                    "proposed_size": len(proposed),
+                    "gate_reasons": [],
+                    "gate_stages_passed": ["real_gate"],
+                    "runtime_seconds": 0.0,
+                    "llm_calls": 0,
+                    "links": {
+                        "audit_log_entry": str(audit),
+                        "staged_proposal": str(src),
+                    },
+                })
+            except Exception as e:
+                self._log(f"cycle_history.record_cycle_entry({skill_name}) failed: {e}")
+            moved = sleep_runner.consume_staged_proposal(src)
+            if moved is not None:
+                self._log(f"auto-loop: consumed staged proposal {src.name!r} -> {moved.name!r}")
+            return "adopted"
+
+        # Quarantine: the real measurement rejected the proposal.
+        state["proposals_rejected"] = int(state.get("proposals_rejected", 0)) + 1
+        _save_state(state)
+        entry = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "skill": skill_name,
+            "source": str(src),
+            "target": str(target),
+            "passed": False,
+            "reason": note,
+            "real_gate": "harvested",
+            "held_out": None,
+        }
+        with open(audit, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        self._log(f"auto-loop: rejected {skill_name} ({note})")
+        try:
+            from usr.plugins.skillopt.helpers import failure_memory  # type: ignore  # noqa: F401
+        except Exception:
+            from helpers import failure_memory  # type: ignore  # noqa: F401
+        try:
+            first_line = ""
+            for line in src.read_text(encoding="utf-8").splitlines():
+                s = line.strip()
+                if s:
+                    first_line = s[:120]
+                    break
+            failure_memory.record_failure(
+                skill_name=skill_name,
+                proposal_summary=first_line or src.stem or skill_name,
+                failure_reason=note,
+                rollouts=[],
+                outcome="rejected",
+            )
+        except Exception as e:
+            self._log(f"failure_memory.record_failure({skill_name}) failed: {e}")
+        moved = sleep_runner.quarantine_staged_proposal(src, tag="real_gate_reject")
+        if moved is not None:
+            self._log(
+                f"auto-loop: quarantined rejected proposal {src.name!r} -> {moved.name!r}"
+            )
+        return "quarantined"
 
     def _adopt_one(self, state: dict[str, Any], cfg: dict[str, Any],
                    src: "os.PathLike | str") -> str:
@@ -815,6 +1178,15 @@ class AutoLoopThread(threading.Thread):
             # Governance failed: fall through to the gate. Don't crash.
             self._log(f"governance: {skill_name} check failed: {e}; falling through")
 
+        # v1.8.22: real-gate HARVEST branch. A proposal with a verdict
+        # sidecar skips the gate re-run entirely: the spawn-time sidecar
+        # recorded gate_passed=true, so harvesting before the text reads
+        # avoids double governance, double audit rows and a duplicate
+        # validate_proposal call. We act purely on the replay verdict.
+        rg = sleep_runner.read_real_gate_sidecar(src)
+        if rg is not None:
+            return self._harvest_real_gate(state, cfg, src, skill_name, rg)
+
         target = sleep_runner.a0_skills_dir() / skill_name / "SKILL.md"
         target.parent.mkdir(parents=True, exist_ok=True)
         proposed = src.read_text(encoding="utf-8")
@@ -859,11 +1231,44 @@ class AutoLoopThread(threading.Thread):
             "passed": ok,
             "reason": reason,
             "held_out": held_out,
+            # v1.8.22: distinguish confirm-pending / bypassed adoptions
+            # from adopt-immediately in adoptions.log.
+            "real_gate": "bypassed" if official_gated else None,
         }
         audit = sleep_runner.runs_dir() / "adoptions.log"
         audit.parent.mkdir(parents=True, exist_ok=True)
         with open(audit, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        # v1.8.22: real-gate SPAWN branch. A structurally-valid, direct
+        # (non-official-gated) proposal is parked in staging with a
+        # pending sidecar while a detached worker runs the REAL replay
+        # counterfactual (budget: 2 x replay_real_max_tasks x
+        # replay_real_per_task_timeout_s). The verdict is harvested on a
+        # later tick. Failures here fall through to the normal adopt
+        # path (fail-open, loud) — never block the drain on spawn errors.
+        if ok and self._real_gate_enabled(cfg, official_gated, src):
+            if sleep_runner.find_pending_real_gate_sidecar() is not None:
+                # Single-flight: one real gate at a time (filesystem-
+                # derived). This proposal keeps its place in staging —
+                # adopting it now would bypass the real verdict entirely.
+                self._log(
+                    f"real gate: single-flight busy; {skill_name} proposal "
+                    f"stays queued for a later tick"
+                )
+                return "skipped"
+            rg_outcome = None
+            try:
+                rg_outcome = self._real_gate_spawn(state, cfg, src, skill_name)
+            except Exception as e:
+                self._log(
+                    f"real gate: spawn failed for {skill_name}: {e}; "
+                    f"adopting without real confirmation"
+                )
+            if rg_outcome == "pending":
+                return "pending"
+            # rg_outcome None (insufficient held-out / spawn error): fall
+            # through to the normal adopt path below.
 
         # v1.2.0 (Task A.2): one-line summary of the A/B harness result
         # so the cycle log captures whether the harness ran, was
@@ -1026,6 +1431,14 @@ def get_loop_state() -> dict[str, Any]:
     snap = sleep_runner.get_status_snapshot()
     state["rollouts_now"] = snap["rollout_count"]
     state["staged_now"] = len(snap["staged_proposals"])
+    # v1.8.22: real-gate mirror — add a live age so the dashboard can
+    # show "pending for Xm" without parsing timestamps client-side.
+    rg = state.get("real_gate")
+    if isinstance(rg, dict) and rg.get("started_ts"):
+        try:
+            rg["age_s"] = round(time.time() - float(rg["started_ts"]), 1)
+        except (TypeError, ValueError):
+            pass
     # Surface the last error to the dashboard (was invisible in v1.0)
     err_path = sleep_runner.runs_dir() / LAST_ERROR_FILENAME
     if err_path.is_file():

@@ -42,6 +42,80 @@ from typing import Callable
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 
+# ----------------------------------------------------------------------- #
+# v1.8.22: canonical module identity (namespace stub-bypass fix)
+# ----------------------------------------------------------------------- #
+# The production helpers use two-path imports: they prefer
+# `usr.plugins.skillopt.helpers.*` and fall back to the bare `helpers.*`
+# when /a0 is not importable. When this suite runs with /a0 on sys.path
+# (PYTHONPATH=/a0, python -m, or inside the framework runtime), BOTH
+# variants import successfully and Python treats them as DIFFERENT module
+# objects: every stub applied to the bare variant is silently bypassed and
+# the judge / ab-harness / replay gate hit the real configured LLM (proven
+# 2026-09-23: PYTHONPATH=/a0 reproduced live minimax-m3 calls, a real
+# replay-worker spawn and 3-6 order-dependent failures inside this suite).
+#
+# Fix (test process only): synthetic namespace packages, eager top-level
+# aliasing and eager helpers-leaf aliasing make every
+# usr.plugins.skillopt.{helpers,api,tools}[.*] import resolve to the bare
+# plugin-root module, so both import forms yield ONE object (stubs, caches
+# and registries stay single-instance). The dual-instance
+# `is not` guards in older tests degrade to no-ops under canonical
+# identity. Production two-path behavior is untouched.
+
+import importlib
+import pkgutil
+import types
+
+sys.path.insert(0, str(PLUGIN_ROOT))
+
+for _ns_name in ('usr', 'usr.plugins', 'usr.plugins.skillopt'):
+    if _ns_name in sys.modules:
+        continue
+    _ns_pkg = types.ModuleType(_ns_name)
+    _ns_pkg.__path__ = []  # mark as package so dotted children resolve
+    sys.modules[_ns_name] = _ns_pkg
+    _parent, _, _leaf = _ns_name.rpartition('.')
+    if _parent:
+        setattr(sys.modules[_parent], _leaf, _ns_pkg)
+
+# Purge any pre-imported namespace-variant helper/api/tool modules so
+# every dotted import below re-resolves through the finder.
+_ns_prefix = 'usr.plugins.skillopt.'
+for _stale in [k for k in sys.modules
+               if k.startswith(_ns_prefix)
+               and k[len(_ns_prefix):].partition('.')[0] in ('helpers', 'api', 'tools')]:
+    del sys.modules[_stale]
+
+# Alias the three top packages eagerly: bare import wins.
+for _top in ('helpers', 'api', 'tools'):
+    try:
+        _mod = importlib.import_module(_top)
+    except Exception:
+        continue
+    if not str(getattr(_mod, '__file__', '') or '').startswith(str(PLUGIN_ROOT)):
+        print(f'smoke: WARNING bare {_top} resolved outside plugin root: {_mod.__file__!r}')
+    sys.modules[_ns_prefix + _top] = _mod
+    setattr(sys.modules[_ns_prefix.rstrip('.')], _top, _mod)
+
+# Alias every bare helpers.* leaf eagerly too: a dotted import then hits
+# the module cache FIRST and can never materialize a second identity
+# (covers both `import usr.plugins.skillopt.helpers.x` and the
+# `from usr.plugins.skillopt.helpers import x` form the production
+# two-path imports use).
+_helpers_pkg = sys.modules.get(_ns_prefix + 'helpers')
+if _helpers_pkg is not None and hasattr(_helpers_pkg, '__path__'):
+    for _mi in pkgutil.iter_modules(_helpers_pkg.__path__):
+        if _mi.name.startswith('_'):
+            continue
+        try:
+            _leaf = importlib.import_module(f'helpers.{_mi.name}')
+        except Exception:
+            continue
+        _dotted = _ns_prefix + 'helpers.' + _mi.name
+        sys.modules[_dotted] = _leaf
+        setattr(sys.modules[_ns_prefix + 'helpers'], _mi.name, _leaf)
+
 # v1.6.0: the A/B harness now defaults to ADVISORY-OFF (ab_harness_enabled:
 # false). The harness-functionality tests below exercise the harness itself,
 # so they opt in explicitly via this env override (read by ab_harness._config()).
@@ -3827,6 +3901,11 @@ def t_c2_validate_proposal_local_gate_rejects() -> None:
     ab_harness.reset_for_tests()
     old_ab = os.environ.get("SKILLOPT_AB_HARNESS_ENABLED")
     os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)  # A/B disabled -> stage 0 falls through
+    # v1.8.22: the mock verdict is ADVISORY by default — pin the old hard
+    # bar explicitly so this test still exercises the reject path.
+    from helpers import sleep_runner as _sr
+    _orig_mc = _sr.merged_config
+    _sr.merged_config = lambda: {**(_orig_mc() or {}), "replay_mock_enforce": True}
     skill = "c2_replay_skill_5"
     rollouts = _write_fake_rollouts(skill, n=3)
     try:
@@ -3842,6 +3921,7 @@ def t_c2_validate_proposal_local_gate_rejects() -> None:
         assert not ok, f"replay gate should reject a losing proposal, got ok={ok} reason={reason!r}"
         assert reason.startswith("replay_gate_rejected"), f"unexpected reason: {reason!r}"
     finally:
+        _sr.merged_config = _orig_mc
         _cleanup_rollouts(rollouts)
         if old_ab is None:
             os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
@@ -4805,6 +4885,11 @@ def t_v18_call_site_real_when_enabled() -> None:
                 base = dict(real_fn())  # preserve all real defaults
                 base["replay_local_gate_enabled"] = True
                 base["replay_real_executor_enabled"] = replay_real
+                # v1.8.22: pin the LEGACY sync-real path (no async gate) —
+                # with the async gate on (new default), stage 0.7 runs mock
+                # and the real confirmation happens via the sidecar harvest
+                # (covered by t_v1822_real_gate_spawns_and_parks).
+                base["replay_real_gate_enabled"] = False
                 base["ab_harness_enabled"] = False  # disable A/B so stage 0 falls through
                 base["fragment_per_fragment_gate"] = False
                 return base
@@ -6148,6 +6233,695 @@ def t_v1821_runner_refuses_mock_backend() -> None:
     _ok("run_sleep_cycle refuses mock/unset backend")
 
 
+# ----------------------------------------------------------------------- #
+# v1.8.22: fully-advisory mock gate + async real-executor confirmation
+# ----------------------------------------------------------------------- #
+
+
+def _sleepy_child(seconds: int = 6):
+    """A really-running child process (for is_running truth in tests)."""
+    import subprocess
+    return subprocess.Popen(
+        [sys.executable, "-c", f"import time; time.sleep({seconds})"]
+    )
+
+
+from contextlib import contextmanager as _contextmanager
+
+
+@_contextmanager
+def _real_gate_env(tmpdir: Path):
+    """Isolation recipe for the v1.8.22 drain/real-gate tests: extends the
+    v1.8.21 drain pattern (RC7 _save_state guard) with runs_dir (adoption
+    audit + auto_loop.log land in tmp, never production) and restore of
+    _load_held_out / launch_real_gate_worker."""
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner as _sr, auto_loop as _al
+    except Exception:
+        from helpers import sleep_runner as _sr, auto_loop as _al
+    _gov_setup(tmpdir)
+    stage = tmpdir / "staging"
+    stage.mkdir(exist_ok=True)
+    skills = tmpdir / "skills"
+    skills.mkdir(exist_ok=True)
+    runs = tmpdir / "runs"
+    runs.mkdir(exist_ok=True)
+    saved = {
+        "staging_dir": _sr.staging_dir,
+        "a0_skills_dir": _sr.a0_skills_dir,
+        "runs_dir": _sr.runs_dir,
+        "latest": _al._latest_sleep_log,
+        "save": _al._save_state,
+        "held": _sr._load_held_out,
+        "launch": _sr.launch_real_gate_worker,
+    }
+    _sr.staging_dir = lambda: stage
+    _sr.a0_skills_dir = lambda: skills
+    _sr.runs_dir = lambda: runs
+    _al._latest_sleep_log = lambda: None
+    _al._save_state = lambda s: None
+    try:
+        yield {"stage": stage, "skills": skills, "runs": runs}
+    finally:
+        _sr.staging_dir = saved["staging_dir"]
+        _sr.a0_skills_dir = saved["a0_skills_dir"]
+        _sr.runs_dir = saved["runs_dir"]
+        _al._latest_sleep_log = saved["latest"]
+        _al._save_state = saved["save"]
+        _sr._load_held_out = saved["held"]
+        _sr.launch_real_gate_worker = saved["launch"]
+
+
+def _v1822_valid_proposal(name: str, stage: Path) -> Path:
+    """A structurally-valid proposal (headers + example block + length)."""
+    src = stage / (name + ".md")
+    src.write_text(
+        "# Improved skill\n\n## New section\n\n```python\nprint('x')\n```\n"
+        + "x" * 300,
+        encoding="utf-8",
+    )
+    return src
+
+
+def _v1822_optin(tmpdir: Path, name: str) -> None:
+    (tmpdir / name).mkdir(parents=True, exist_ok=True)
+    (tmpdir / name / ".skillopt.optin").write_text("", encoding="utf-8")
+
+
+_V1822_RG_CFG = {
+    "auto_adopt": True,
+    "gate_min_chars": 50,
+    "ab_harness_enabled": False,
+    "auto_adopt_max_per_tick": 5,
+    "replay_real_executor_enabled": True,
+    "replay_real_gate_enabled": True,
+    "replay_real_gate_cost_cents": 0,  # never touch the production budget state
+}
+
+
+@test("v1.8.22: mock replay verdict is advisory by default (enforce flag restores the hard bar)")
+def t_v1822_mock_advisory_validate() -> None:
+    """The mock executor's keyword-relevance lift on real proposals is
+    noise (2026-09-23 drain: 5 of 7 rejected as mock "regression"). With
+    replay_mock_enforce false (default) a LOSING mock verdict must NOT
+    reject; with true the v1.8.19 1.0pp hard bar still applies; and with
+    the async gate on, stage 0.7 must run the MOCK executor (never real
+    synchronously — double spend)."""
+    import tempfile
+    from helpers import sleep_runner as _sr, replay_harness as _rh
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1822_advisory_"))
+    try:
+        _gov_setup(tmp)
+        saved_cfg = _sr.merged_config
+        saved_rollouts = _sr.list_rollouts
+        saved_run = _rh.run_counterfactual
+        held = [
+            {"id": "t1", "task": "alpha beta gamma", "last_response": "", "outcome": "success"},
+            {"id": "t2", "task": "alpha beta delta", "last_response": "", "outcome": "success"},
+        ]
+        _sr.list_rollouts = lambda: [Path("fake1.json"), Path("fake2.json")]
+        # Cheap json read: _load_held_out parses Path objects' text.
+        saved_read = Path.read_text
+
+        def _fake_read_text(self, *a, **kw):
+            if str(self).startswith("fake"):
+                import json as _json
+                return _json.dumps(held)
+            return saved_read(self, *a, **kw)
+
+        Path.read_text = _fake_read_text
+        try:
+            current = "# Unrelated\n\nBody."
+            proposed = "# alpha beta gamma\n\n```python\nx=1\n```\n" + "z" * 300
+            # (a) async gate on: executor MUST be mock even with the real
+            # executor enabled (the async stage owns real confirmation).
+            def _spy(**kw):
+                _spy.executor_seen = kw.get("executor")
+                return {"ok": True, "accepted": False, "reason": "rejected_regression",
+                        "executor": "mock", "n": 2, "lift_pp": -1.0,
+                        "hard_current": 0.5, "hard_proposed": 0.49,
+                        "per_task": []}
+
+            _spy.executor_seen = None
+            _rh.run_counterfactual = _spy
+            _sr.merged_config = lambda: {
+                "replay_local_gate_enabled": True,
+                "replay_real_executor_enabled": True,
+                "replay_real_gate_enabled": True,
+                "replay_mock_enforce": False,
+            }
+            ok, reason = _sr.validate_proposal(proposed, current, min_chars=50,
+                                               skill_name="v1822_advisory_skill",
+                                               ab_harness_enabled=False)
+            assert ok is True, f"advisory mock must not reject, got: {(ok, reason)!r}"
+            assert _spy.executor_seen == "mock", (
+                f"async gate on: stage 0.7 must use mock, saw {_spy.executor_seen!r}"
+            )
+            # (b) enforce=True restores the hard reject.
+            _sr.merged_config = lambda: {
+                "replay_local_gate_enabled": True,
+                "replay_real_executor_enabled": False,
+                "replay_mock_enforce": True,
+            }
+            ok, reason = _sr.validate_proposal(proposed, current, min_chars=50,
+                                               skill_name="v1822_advisory_skill",
+                                               ab_harness_enabled=False)
+            assert ok is False and "replay_gate_rejected" in reason, (
+                f"enforce=true must reject, got: {(ok, reason)!r}"
+            )
+        finally:
+            _rh.run_counterfactual = saved_run
+            _sr.merged_config = saved_cfg
+            _sr.list_rollouts = saved_rollouts
+            Path.read_text = saved_read
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("mock replay verdict advisory by default; enforce flag restores hard bar")
+
+
+@test("v1.8.22: official-gated proposals bypass the async real gate (adopt immediately)")
+def t_v1822_real_gate_official_gated_bypasses() -> None:
+    import shutil
+    import tempfile
+    from helpers import sleep_runner as _sr, auto_loop as _al
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1822_bypass_"))
+    try:
+        with _real_gate_env(tmp) as env:
+            stage = env["stage"]
+            skills = env["skills"]
+            launched = {"calls": 0}
+
+            def _no_spawn(**kw):
+                launched["calls"] += 1
+                return {"pid": 4242, "log_path": "x", "started_at": "t", "cmd": []}
+
+            _sr.launch_real_gate_worker = _no_spawn
+            name = "v1822_bypass_skill"
+            _v1822_optin(tmp, name)  # governance defaults to opt-out; opt in
+            src = _v1822_valid_proposal(name, stage)
+            _sr.write_official_gate_marker(src, skill_name=name)
+            thread = _al.AutoLoopThread(get_config=lambda: dict(_V1822_RG_CFG))
+            state: dict = {}
+            outcome = thread._adopt_one(state, dict(_V1822_RG_CFG), src)
+            assert outcome == "adopted", f"expected adopted, got {outcome!r}"
+            assert launched["calls"] == 0, "official-gated proposal must not spawn a real gate"
+            assert (skills / name / "SKILL.md").is_file(), "official-gated proposal must adopt immediately"
+            assert not list(stage.glob("*" + _sr.REAL_GATE_SIDECAR_SUFFIX)), "no sidecar expected"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("official-gated proposals bypass the async real gate")
+
+
+@test("v1.8.22: structurally-valid direct proposal spawns worker + parks pending")
+def t_v1822_real_gate_spawns_and_parks() -> None:
+    import shutil
+    import tempfile
+    from helpers import sleep_runner as _sr, auto_loop as _al
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1822_spawn_"))
+    try:
+        with _real_gate_env(tmp) as env:
+            stage = env["stage"]
+            skills = env["skills"]
+            runs = env["runs"]
+            _v1822_optin(tmp, "v1822_spawn_skill")
+            held = [{"id": f"t{i}", "task": f"task {i}", "outcome": "success"} for i in range(4)]
+            _sr._load_held_out = lambda skill: held
+            child = _sleepy_child()
+            try:
+                def _fake_launch(**kw):
+                    return {"pid": child.pid, "log_path": "x", "started_at": "t", "cmd": []}
+
+                _sr.launch_real_gate_worker = _fake_launch
+                name = "v1822_spawn_skill"
+                src = _v1822_valid_proposal(name, stage)
+                cfg = dict(_V1822_RG_CFG)
+                thread = _al.AutoLoopThread(get_config=lambda: cfg)
+                state: dict = {}
+                outcome = thread._adopt_one(state, cfg, src)
+                assert outcome == "pending", f"expected pending, got {outcome!r}"
+                sidecar = _sr.read_real_gate_sidecar(src)
+                assert sidecar is not None and sidecar.get("status") == "pending", sidecar
+                assert sidecar.get("pid") == child.pid, "sidecar must carry the worker pid"
+                assert sidecar.get("gate_passed") is True
+                tasks_file = Path(sidecar.get("tasks_file") or "")
+                assert tasks_file.is_file() and isinstance(
+                    json.loads(tasks_file.read_text(encoding="utf-8")), list
+                ), "frozen tasks file missing"
+                assert src.is_file(), "pending proposal must STAY in staging top level"
+                assert not (skills / name / "SKILL.md").is_file(), "must NOT adopt before the verdict"
+                assert isinstance(state.get("real_gate"), dict), "state mirror must be set"
+                assert state["real_gate"]["skill"] == name
+            finally:
+                try:
+                    child.terminate()
+                except Exception:
+                    pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("real gate spawns worker + parks proposal pending")
+
+
+@test("v1.8.22: real gate is single-flight (second proposal skips, stays queued)")
+def t_v1822_real_gate_single_flight() -> None:
+    import shutil
+    import tempfile
+    from helpers import sleep_runner as _sr, auto_loop as _al
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1822_flight_"))
+    try:
+        with _real_gate_env(tmp) as env:
+            stage = env["stage"]
+            _v1822_optin(tmp, "v1822_flight_a")
+            _v1822_optin(tmp, "v1822_flight_b")
+            _sr._load_held_out = lambda skill: [
+                {"id": f"t{i}", "task": f"task {i}", "outcome": "success"} for i in range(4)
+            ]
+            child = _sleepy_child()
+            try:
+                calls = {"n": 0}
+
+                def _fake_launch(**kw):
+                    calls["n"] += 1
+                    return {"pid": child.pid, "log_path": "x", "started_at": "t", "cmd": []}
+
+                _sr.launch_real_gate_worker = _fake_launch
+                a = _v1822_valid_proposal("v1822_flight_a", stage)
+                b = _v1822_valid_proposal("v1822_flight_b", stage)
+                b.touch()  # newer mtime -> attempted first
+                cfg = dict(_V1822_RG_CFG)
+                thread = _al.AutoLoopThread(get_config=lambda: cfg)
+                state: dict = {}
+                thread._auto_adopt(state, cfg)
+                assert calls["n"] == 1, (
+                    f"single-flight: exactly one spawn expected, got {calls['n']}"
+                )
+                assert a.is_file() and b.is_file(), "both proposals stay queued"
+                assert state.get("real_gate", {}).get("skill") in (
+                    "v1822_flight_a", "v1822_flight_b")
+            finally:
+                try:
+                    child.terminate()
+                except Exception:
+                    pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("real gate is single-flight (one spawn, others stay queued)")
+
+
+@test("v1.8.22: harvest adopts on accepted real verdict (sidecar consumed, mirror cleared)")
+def t_v1822_real_gate_harvest_adopt() -> None:
+    import shutil
+    import tempfile
+    from helpers import sleep_runner as _sr, auto_loop as _al
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1822_hadopt_"))
+    try:
+        with _real_gate_env(tmp) as env:
+            stage = env["stage"]
+            skills = env["skills"]
+            _v1822_optin(tmp, "v1822_hadopt_skill")
+            name = "v1822_hadopt_skill"
+            src = _v1822_valid_proposal(name, stage)
+            text = src.read_text(encoding="utf-8")
+            _sr.write_real_gate_sidecar(src, {
+                "real_gate": True, "schema": 1, "skill": name,
+                "proposal_path": str(src), "staged_mtime": src.stat().st_mtime,
+                "status": "done", "pid": 12345, "started_ts": time.time() - 60.0,
+                "finished_ts": time.time(), "jsonl_path": "x",
+                "tasks_file": "x", "held_out_ids": ["t1", "t2"],
+                "gate_passed": True,
+                "verdict": {"ok": True, "accepted": True, "executor": "real",
+                            "n": 2, "lift_pp": 8.0, "reason": "ok_lift_+8.00pp",
+                            "hard_current": 0.5, "hard_proposed": 0.58,
+                            "per_task": []},
+                "error": None,
+            })
+            cfg = dict(_V1822_RG_CFG)
+            thread = _al.AutoLoopThread(get_config=lambda: cfg)
+            state: dict = {"real_gate": {"skill": name}}
+            outcome = thread._adopt_one(state, cfg, src)
+            assert outcome == "adopted", f"expected adopted, got {outcome!r}"
+            assert (skills / name / "SKILL.md").read_text(encoding="utf-8") == text
+            assert not list(stage.glob("*" + _sr.REAL_GATE_SIDECAR_SUFFIX)), (
+                "harvested sidecar must leave staging top level with the proposal")
+            assert list((stage / "adopted").glob(f"{name}__adopt*.md")), "consumed to adopted/"
+            assert state.get("real_gate") is None, "state mirror cleared"
+            audit = env["runs"] / "adoptions.log"
+            assert audit.is_file() and "real_gate_accepted" in audit.read_text(encoding="utf-8")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("harvest adopts on accepted real verdict")
+
+
+@test("v1.8.22: harvest quarantines on rejected real verdict (sidecar travels)")
+def t_v1822_real_gate_harvest_quarantine() -> None:
+    import shutil
+    import tempfile
+    from helpers import sleep_runner as _sr, auto_loop as _al
+    from helpers import failure_memory as _fm
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1822_hrej_"))
+    try:
+        with _real_gate_env(tmp) as env:
+            stage = env["stage"]
+            _v1822_optin(tmp, "v1822_hrej_skill")
+            name = "v1822_hrej_skill"
+            src = _v1822_valid_proposal(name, stage)
+            _sr.write_real_gate_sidecar(src, {
+                "real_gate": True, "schema": 1, "skill": name,
+                "proposal_path": str(src), "staged_mtime": src.stat().st_mtime,
+                "status": "done", "pid": 12345, "started_ts": time.time() - 60.0,
+                "finished_ts": time.time(), "jsonl_path": "x", "tasks_file": "x",
+                "held_out_ids": ["t1"], "gate_passed": True,
+                "verdict": {"ok": True, "accepted": False, "executor": "real",
+                            "n": 2, "lift_pp": -2.0, "reason": "rejected_regression",
+                            "hard_current": 0.5, "hard_proposed": 0.48,
+                            "per_task": []},
+                "error": None,
+            })
+            saved_fm = _fm.record_failure
+            _fm.record_failure = lambda **kw: None
+            try:
+                cfg = dict(_V1822_RG_CFG)
+                thread = _al.AutoLoopThread(get_config=lambda: cfg)
+                outcome = thread._adopt_one({}, cfg, src)
+                assert outcome == "quarantined", f"expected quarantined, got {outcome!r}"
+                quarantined = list((stage / "rejected").glob(f"{name}__real_gate_reject*.md"))
+                assert quarantined, "proposal quarantined with real_gate_reject tag"
+                assert not src.is_file()
+                assert list((stage / "rejected").glob("*.md.realgate.json")), (
+                    "sidecar must travel with the quarantined proposal")
+                audit = env["runs"] / "adoptions.log"
+                assert "real_gate_rejected" in audit.read_text(encoding="utf-8")
+            finally:
+                _fm.record_failure = saved_fm
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("harvest quarantines on rejected real verdict (sidecar travels)")
+
+
+@test("v1.8.22: harvest fail-opens on not-run / failed sidecars (loud, adopt)")
+def t_v1822_real_gate_harvest_fail_open() -> None:
+    import shutil
+    import tempfile
+    from helpers import sleep_runner as _sr, auto_loop as _al
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1822_failopen_"))
+    try:
+        for variant, status, verdict, marker in (
+            ("notrun", "done", {"ok": False, "reason": "insufficient_usable_pairs:1 usable (2 task failures)"},
+             "real_gate_not_run"),
+            ("failed", "failed", None, "real_gate_failed"),
+        ):
+            with _real_gate_env(tmp) as env:
+                stage = env["stage"]
+                skills = env["skills"]
+                name = f"v1822_failopen_{variant}"
+                _v1822_optin(tmp, name)
+                src = _v1822_valid_proposal(name, stage)
+                payload = {
+                    "real_gate": True, "schema": 1, "skill": name,
+                    "proposal_path": str(src), "staged_mtime": src.stat().st_mtime,
+                    "status": status, "pid": 12345,
+                    "started_ts": time.time() - 60.0,
+                    "finished_ts": time.time(), "jsonl_path": "x",
+                    "tasks_file": "x", "held_out_ids": ["t1"],
+                    "gate_passed": True, "verdict": verdict,
+                    "error": "boom" if status == "failed" else None,
+                }
+                _sr.write_real_gate_sidecar(src, payload)
+                cfg = dict(_V1822_RG_CFG)
+                thread = _al.AutoLoopThread(get_config=lambda: cfg)
+                outcome = thread._adopt_one(state := {}, cfg, src)
+                assert outcome == "adopted", f"{variant}: expected fail-open adopt, got {outcome!r}"
+                assert (skills / name / "SKILL.md").is_file()
+                audit = env["runs"] / "adoptions.log"
+                assert marker in audit.read_text(encoding="utf-8"), (
+                    f"{variant}: expected {marker} note in adoptions.log")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("harvest fail-opens on not-run/failed sidecars")
+
+
+@test("v1.8.22: stale + grace window handling of pending sidecars")
+def t_v1822_real_gate_stale_and_grace() -> None:
+    import shutil
+    import tempfile
+    from helpers import sleep_runner as _sr, auto_loop as _al
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1822_stale_"))
+    try:
+        # (a) pid dead + beyond stale window -> fail-open adopt (real_gate_stale).
+        with _real_gate_env(tmp) as env:
+            stage, skills = env["stage"], env["skills"]
+            name = "v1822_stale_skill"
+            _v1822_optin(tmp, name)
+            src = _v1822_valid_proposal(name, stage)
+            _sr.write_real_gate_sidecar(src, {
+                "real_gate": True, "schema": 1, "skill": name,
+                "proposal_path": str(src), "staged_mtime": src.stat().st_mtime,
+                "status": "pending", "pid": 999999,
+                "started_ts": time.time() - 20000.0,  # > 4h stale window
+                "finished_ts": None, "jsonl_path": None, "tasks_file": "x",
+                "held_out_ids": ["t1"], "gate_passed": True,
+                "verdict": None, "error": None,
+            })
+            cfg = dict(_V1822_RG_CFG)
+            thread = _al.AutoLoopThread(get_config=lambda: cfg)
+            outcome = thread._adopt_one({}, cfg, src)
+            assert outcome == "adopted", f"stale must adopt, got {outcome!r}"
+            audit = env["runs"] / "adoptions.log"
+            assert "real_gate_stale" in audit.read_text(encoding="utf-8")
+        # (b) pid dead but young -> stays pending (grace window).
+        with _real_gate_env(tmp) as env:
+            stage = env["stage"]
+            name = "v1822_grace_skill"
+            _v1822_optin(tmp, name)
+            src = _v1822_valid_proposal(name, stage)
+            _sr.write_real_gate_sidecar(src, {
+                "real_gate": True, "schema": 1, "skill": name,
+                "proposal_path": str(src), "staged_mtime": src.stat().st_mtime,
+                "status": "pending", "pid": 999999,
+                "started_ts": time.time() - 60.0,  # young, dead pid
+                "finished_ts": None, "jsonl_path": None, "tasks_file": "x",
+                "held_out_ids": ["t1"], "gate_passed": True,
+                "verdict": None, "error": None,
+            })
+            cfg = dict(_V1822_RG_CFG)
+            thread = _al.AutoLoopThread(get_config=lambda: cfg)
+            outcome = thread._adopt_one({}, cfg, src)
+            assert outcome == "pending", f"young dead-pid must stay pending, got {outcome!r}"
+            assert src.is_file(), "grace-window proposal stays in staging"
+        # (c) pid alive -> stays pending regardless of age.
+        with _real_gate_env(tmp) as env:
+            stage = env["stage"]
+            name = "v1822_alive_skill"
+            _v1822_optin(tmp, name)
+            src = _v1822_valid_proposal(name, stage)
+            child = _sleepy_child()
+            try:
+                _sr.write_real_gate_sidecar(src, {
+                    "real_gate": True, "schema": 1, "skill": name,
+                    "proposal_path": str(src), "staged_mtime": src.stat().st_mtime,
+                    "status": "pending", "pid": child.pid,
+                    "started_ts": time.time() - 20000.0,
+                    "finished_ts": None, "jsonl_path": None, "tasks_file": "x",
+                    "held_out_ids": ["t1"], "gate_passed": True,
+                    "verdict": None, "error": None,
+                })
+                cfg = dict(_V1822_RG_CFG)
+                thread = _al.AutoLoopThread(get_config=lambda: cfg)
+                outcome = thread._adopt_one({}, cfg, src)
+                assert outcome == "pending", f"running worker must stay pending, got {outcome!r}"
+            finally:
+                try:
+                    child.terminate()
+                except Exception:
+                    pass
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("stale/ grace/ running pending sidecar handling")
+
+
+@test("v1.8.22: restart rehydrates the real-gate mirror; toggle-off harvests paid verdicts")
+def t_v1822_real_gate_restart_rehydrate_and_toggle_off() -> None:
+    import shutil
+    import tempfile
+    from helpers import sleep_runner as _sr, auto_loop as _al
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1822_rehyd_"))
+    try:
+        # (a) state without real_gate + live pending sidecar -> rehydrated.
+        with _real_gate_env(tmp) as env:
+            stage = env["stage"]
+            name = "v1822_rehyd_skill"
+            src = _v1822_valid_proposal(name, stage)
+            child = _sleepy_child()
+            try:
+                _sr.write_real_gate_sidecar(src, {
+                    "real_gate": True, "schema": 1, "skill": name,
+                    "proposal_path": str(src), "staged_mtime": src.stat().st_mtime,
+                    "status": "pending", "pid": child.pid,
+                    "started_ts": time.time(), "finished_ts": None,
+                    "jsonl_path": None, "tasks_file": "x",
+                    "held_out_ids": [], "gate_passed": True,
+                    "verdict": None, "error": None,
+                })
+                thread = _al.AutoLoopThread(get_config=lambda: dict(_V1822_RG_CFG))
+                state: dict = {}
+                thread._auto_adopt(state, dict(_V1822_RG_CFG))
+                assert isinstance(state.get("real_gate"), dict) and state["real_gate"]["skill"] == name, (
+                    f"mirror must rehydrate from the live sidecar, got {state.get('real_gate')!r}")
+            finally:
+                try:
+                    child.terminate()
+                except Exception:
+                    pass
+        # (b) replay_real_gate_enabled OFF but a done+accepted sidecar is
+        # present -> verdict still harvested (only SPAWNING is gated).
+        with _real_gate_env(tmp) as env:
+            stage, skills = env["stage"], env["skills"]
+            launched = {"calls": 0}
+
+            def _no_spawn(**kw):
+                launched["calls"] += 1
+                return {"pid": 4242, "log_path": "x", "started_at": "t", "cmd": []}
+
+            _sr.launch_real_gate_worker = _no_spawn
+            name = "v1822_toggle_skill"
+            _v1822_optin(tmp, name)
+            src = _v1822_valid_proposal(name, stage)
+            _sr.write_real_gate_sidecar(src, {
+                "real_gate": True, "schema": 1, "skill": name,
+                "proposal_path": str(src), "staged_mtime": src.stat().st_mtime,
+                "status": "done", "pid": 12345,
+                "started_ts": time.time() - 60.0, "finished_ts": time.time(),
+                "jsonl_path": "x", "tasks_file": "x", "held_out_ids": ["t1"],
+                "gate_passed": True,
+                "verdict": {"ok": True, "accepted": True, "executor": "real",
+                            "n": 1, "lift_pp": 9.0, "reason": "ok_lift_+9.00pp",
+                            "hard_current": 0.5, "hard_proposed": 0.59,
+                            "per_task": []},
+                "error": None,
+            })
+            cfg = dict(_V1822_RG_CFG)
+            cfg["replay_real_gate_enabled"] = False
+            thread = _al.AutoLoopThread(get_config=lambda: cfg)
+            outcome = thread._adopt_one({}, cfg, src)
+            assert outcome == "adopted", f"paid verdict must still harvest, got {outcome!r}"
+            assert (skills / name / "SKILL.md").is_file()
+            assert launched["calls"] == 0, "toggle-off must not spawn"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("restart rehydrate + toggle-off harvests paid verdicts")
+
+
+@test("v1.8.22: run_counterfactual(real) records per-task latency_s")
+def t_v1822_real_gate_run_counterfactual_latency() -> None:
+    from helpers import replay_harness as _rh
+    saved_score = _rh._real_score
+    try:
+        def _fake_score(task, skill_md, config, skill_name="replay"):
+            return 0.5 if "Unrelated" in (skill_md or "") else 0.7
+
+        _rh._real_score = _fake_score
+        tasks = [
+            {"id": f"t{i}", "task": f"task {i}", "last_response": "", "outcome": "success"}
+            for i in range(3)
+        ]
+        res = _rh.run_counterfactual(
+            "v1822_latency_skill", "# Unrelated\n\nCurrent.",
+            "# alpha\n\nProposed.", tasks,
+            executor="real",
+            config={"replay_real_executor_enabled": True,
+                    "replay_real_per_task_timeout_s": 450,
+                    "replay_real_max_tasks": 3,
+                    "gate_min_improvement_pp": 5.0,
+                    "replay_min_n": 3},
+        )
+        assert res.get("ok") is True, f"counterfactual should run, got {res!r}"
+        for pt in res["per_task"]:
+            assert isinstance(pt.get("latency_s"), dict), (
+                f"per-task latency missing: {pt!r}")
+            assert pt["latency_s"]["current"] is not None
+            assert pt["latency_s"]["proposed"] is not None
+    finally:
+        _rh._real_score = saved_score
+    _ok("run_counterfactual(real) records per-task latency_s")
+
+
+@test("v1.8.22: replay_gate_worker CLI contract (done sidecar on verdict, failed on missing input)")
+def t_v1822_real_gate_worker_cli_contract() -> None:
+    import shutil
+    import subprocess
+    import tempfile
+    from helpers import sleep_runner as _sr
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1822_cli_"))
+    try:
+        skills = tmp / "skills"
+        (skills / "v1822_cli_skill").mkdir(parents=True)
+        (skills / "v1822_cli_skill" / "SKILL.md").write_text(
+            "# Unrelated\n\nBody.", encoding="utf-8")
+        staged = tmp / "v1822_cli_skill.md"
+        staged.write_text(
+            "# alpha beta gamma\n\n```python\nx=1\n```\n" + "y" * 300,
+            encoding="utf-8")
+        tasks_file = tmp / "tasks.json"
+        held = [
+            {"id": f"t{i}", "task": "alpha beta gamma", "last_response": "",
+             "outcome": "success"} for i in range(2)
+        ]
+        tasks_file.write_text(json.dumps(held), encoding="utf-8")
+        sidecar = tmp / "v1822_cli_skill.md.realgate.json"
+        sidecar.write_text(json.dumps({
+            "real_gate": True, "schema": 1, "skill": "v1822_cli_skill",
+            "proposal_path": str(staged), "staged_mtime": staged.stat().st_mtime,
+            "status": "pending", "pid": 0, "started_ts": time.time(),
+            "finished_ts": None, "jsonl_path": None, "tasks_file": str(tasks_file),
+            "held_out_ids": ["t1", "t2"], "gate_passed": True,
+            "verdict": None, "error": None,
+        }), encoding="utf-8")
+        log_dir = tmp / "logs"
+        env = dict(os.environ)
+        env["SKILLOPT_SKILLS_DIR"] = str(skills)
+        env["SKILLOPT_NO_FRAMEWORK_CONFIG"] = "1"
+        cmd = [
+            sys.executable, str(PLUGIN_ROOT / "scripts" / "replay_gate_worker.py"),
+            "--skill-name", "v1822_cli_skill",
+            "--staged-path", str(staged),
+            "--sidecar", str(sidecar),
+            "--tasks-file", str(tasks_file),
+            "--executor", "mock",
+            "--per-task-timeout-s", "450", "--max-tasks", "2",
+            "--gate-min-improvement-pp", "5.0", "--replay-min-n", "2",
+            "--log-dir", str(log_dir),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=120)
+        assert proc.returncode == 0, f"worker failed: {proc.stdout[-800:]!r} {proc.stderr[-800:]!r}"
+        sidecar_data = json.loads(sidecar.read_text(encoding="utf-8"))
+        assert sidecar_data.get("status") == "done", sidecar_data
+        verdict = sidecar_data.get("verdict") or {}
+        assert verdict.get("accepted") is True, verdict
+        assert verdict.get("executor") == "mock"
+        jsonl = Path(sidecar_data.get("jsonl_path") or "")
+        assert jsonl.is_file(), f"jsonl log missing: {jsonl}"
+        phases = {ln.get("phase") for ln in
+                  (json.loads(x) for x in jsonl.read_text(encoding="utf-8").splitlines() if x.strip())}
+        assert {"start", "verdict", "summary"} <= phases, phases
+        # Missing staged path -> exit 1 + failed sidecar.
+        cmd2 = [
+            sys.executable, str(PLUGIN_ROOT / "scripts" / "replay_gate_worker.py"),
+            "--skill-name", "v1822_cli_skill",
+            "--staged-path", str(tmp / "missing.md"),
+            "--sidecar", str(sidecar),
+            "--tasks-file", str(tasks_file),
+            "--executor", "mock", "--replay-min-n", "1",
+            "--log-dir", str(log_dir),
+        ]
+        proc2 = subprocess.run(cmd2, capture_output=True, text=True, env=env, timeout=120)
+        assert proc2.returncode == 1, proc2.stdout[-500:]
+        sidecar_data2 = json.loads(sidecar.read_text(encoding="utf-8"))
+        assert sidecar_data2.get("status") == "failed", sidecar_data2
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok("replay_gate_worker CLI contract (done/failed sidecar)")
+
+
 @test("v1.8.19 P4: no test-fixture pollution in production run state (runs LAST)")
 def t_p4_no_fixture_pollution():
     """Guard against the RC7 leak class: the suite must never leave
@@ -6182,6 +6956,65 @@ def t_p4_no_fixture_pollution():
     _ok("no fixture pollution in logs/runs (clean)")
 
 
+# ======================================================================= #
+# Section: v1.8.22 canonical module identity                              #
+# ======================================================================= #
+
+_section_v1822 = 'v1.8.22 NEW: canonical module identity - namespace imports alias the bare plugin-root modules (2 cases)'
+
+@test('v1.8.22: namespace import returns the SAME module object as the bare import')
+def t_v1822_same_object() -> None:
+    purpose = 'Whether or not /a0 is importable, usr.plugins.skillopt.helpers.* and the bare helpers.* must resolve to ONE module object so test stubs, chat_model._CACHE and ab_harness registries stay single-instance (the 2026-09-23 stub-bypass regression class).'
+    import importlib
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import direct_optimizer, llm_judge, chat_model
+    ns_do = importlib.import_module('usr.plugins.skillopt.helpers.direct_optimizer')
+    ns_lj = importlib.import_module('usr.plugins.skillopt.helpers.llm_judge')
+    ns_cm = importlib.import_module('usr.plugins.skillopt.helpers.chat_model')
+    assert ns_do is direct_optimizer, (
+        'direct_optimizer: two module identities: '
+        f'bare={getattr(direct_optimizer, "__file__", None)!r} '
+        f'ns={getattr(ns_do, "__file__", None)!r} '
+        f'ns_name={getattr(ns_do, "__name__", None)!r}'
+    )
+    assert ns_lj is llm_judge, (
+        'llm_judge: two module identities: '
+        f'bare={getattr(llm_judge, "__file__", None)!r} '
+        f'ns={getattr(ns_lj, "__file__", None)!r} '
+        f'ns_name={getattr(ns_lj, "__name__", None)!r}'
+    )
+    assert ns_cm is chat_model, (
+        'chat_model: two module identities: '
+        f'bare={getattr(chat_model, "__file__", None)!r} '
+        f'ns={getattr(ns_cm, "__file__", None)!r} '
+        f'ns_name={getattr(ns_cm, "__name__", None)!r}'
+    )
+    print(' ns aliases resolve to the bare modules (single identity)')
+    _ok('namespace imports alias the bare modules')
+
+@test('v1.8.22: a bare-variant _call_llm stub is honoured through the judge two-path import')
+def t_v1822_stub_visible() -> None:
+    purpose = 'judge_outcome resolves its LLM target via the two-path import; a stub on the bare direct_optimizer MUST receive the call even with /a0 importable - otherwise the judge silently hits the real configured model (reproduced live 2026-09-23).'
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import direct_optimizer, llm_judge
+    calls: list = []
+
+    def _fake(prompt, model, max_tokens=300, system=None):
+        calls.append((prompt, model, system))
+        return json.dumps({'label': 'success', 'confidence': 0.9, 'reason': 'ok'})
+
+    saved = direct_optimizer._call_llm
+    direct_optimizer._call_llm = _fake
+    try:
+        r = llm_judge.judge_outcome({'task': 't', 'last_response': 'r'})
+    finally:
+        direct_optimizer._call_llm = saved
+    assert len(calls) == 1, (
+        f'stub bypassed - judge hit the real LLM ({len(calls)} captured calls)'
+    )
+    assert r.get('label') == 'success', r
+    _ok('stub visible through the two-path import (no real LLM call)')
+
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
     print(_section_v110)
@@ -6196,4 +7029,5 @@ if __name__ == "__main__":
     print(_section_v180)
     print(_section_v1812)
     print(_section_v1816)
+    print(_section_v1822)
     sys.exit(main())

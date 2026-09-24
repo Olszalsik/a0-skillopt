@@ -540,3 +540,162 @@ and `use_official_engine: false` (mock backend always rejects; direct
 - Smoke: 1 new case `t_v1820_zombie_aware_is_running`; suite 167/167.
   CHANGELOG backfilled with the missing [1.8.18]/[1.8.19] entries
   (docs-only; derived from §1.8.18/§1.8.19 above).
+
+## 1.8.21 Implementation status — staging drain: head-of-line + quarantine + mock guard (2026-09-23, 170/170 smoke)
+
+Fixes the three blockers found by the 2026-09-23 morning live audit
+(cycles_run 23, `passed: true` count in adoptions.log = 0, three
+proposed mechanisms identified):
+
+1. **Head-of-line blocking fixed:** `_auto_adopt` examined only
+   `staged[0]` (newest mtime) and returned on the first governance-skip
+   or gate-reject - one malformed proposal permanently blocked every
+   staged proposal behind it, and throughput was one adoption attempt
+   per 30-min tick. Now every candidate gets an attempt per tick,
+   bounded by the new `auto_adopt_max_per_tick` (default 5, newest
+   first); a per-candidate exception can never stall the drain; a
+   `staged drain: attempted=.. adopted=.. quarantined=.. skipped=..`
+   summary is logged when >1 candidate is attempted.
+2. **Quarantine + consume:** new `sleep_runner.quarantine_staged_proposal`
+   / `consume_staged_proposal` move rejected proposals to
+   `staging/rejected/` and adopted ones to `staging/adopted/` (the
+   official-gate marker sidecar travels along; adopted proposals keep
+   the v1.8.1 marker-clear-first semantics so `find_staged_proposals`
+   - which scans staging top-level only - can never re-see them).
+   Previously rejects AND adopts sat in staging and were re-attempted
+   forever (identical bytes fail deterministically). Governance skips
+   STAY in staging: the skill may become eligible later. The live
+   malformed Sep-22 proposal (`security-scan-untrusted-plugin.md`, zero
+   `#` headers, re-rejected 14x over ~14h while 6 well-formed proposals
+   waited) was purged to `staging/rejected/` at deploy time.
+3. **Mock-backend guard (P3 enforcement):** `scripts/run_sleep_cycle.py`
+   fails fast (exit 1 `INFRA_FAILED`) when `official_backend` is unset
+   or `"mock"`, unless `--allow-mock-backend` is passed for a deliberate
+   test run. Live proof this was pure waste: 40 tasks "replayed" in
+   1.1s, held-out 0.2 -> 0.2, tokens_used=0, GATE_REJECTED every time.
+
+- Test-isolation note (RC7 class): the drain tests patch
+  `auto_loop._save_state` to a no-op - it writes the passed dict to the
+  PRODUCTION `.auto_loop_state.json`.
+- Smoke: 3 new cases (drain end-to-end: adopt consumed + reject
+  quarantined + sidecar travel; governance skip stays in staging;
+  runner mock-guard); suite 170/170. Version parity across plugin.yaml
+  / plugin.py / hooks.py / execute.py.
+- Committed `63249ed`, tag `v1.8.21`, pushed.
+- Restart REQUIRED to load v1.8.21 live (drain + quarantine are
+  auto-loop-thread code; the manual-runner guard is subprocess-fresh).
+- **POST-RESTART PROOF (12:29, first tick on v1.8.21):** the drain ran
+  `attempted=5 adopted=1 quarantined=4 skipped=0` on the real queue —
+  **FIRST AUTONOMOUS ADOPTION EVER**: `agent-zero-api-handler-routing`
+  passed the gate (adoptions.log `passed: true`, reason ok) and was
+  written to `usr/skills/agent-zero-api-handler-routing/SKILL.md`
+  (2841 bytes); the proposal consumed to `staging/adopted/`; the 4
+  other staged proposals quarantined to `staging/rejected/` with real
+  gate verdicts (3x replay_gate_rejected: rejected_regression, 1x
+  rejected_no_lift). Zero human input. This is the §1.8.17
+  definition-of-done milestone (≥1 full autonomous adopt).
+## 1.8.22 part 2 — async real-executor confirmation gate + advisory mock (2026-09-24, 183/183 smoke)
+
+Completes P3's residual: the adoption-throughput problem. Live evidence
+(2026-09-23 drain on v1.8.21): 5 of 7 real-drain rejects were
+mock-executor noise (`rejected_regression` / `insufficient_lift` on the
+deterministic keyword heuristic) while the real replay executor remained
+unusable synchronously (P3: 2xN monologues vs a 600s synchronous budget
+- the auto-loop thread cannot block for 45 minutes).
+
+Design (operator-approved via 3 decisions):
+1. **Mock counterfactual gate is FULLY ADVISORY** (default
+   `replay_mock_enforce: false`). A losing mock verdict logs
+   `[skillopt] mock replay gate (advisory, not enforcing) for <skill>`
+   and the proposal proceeds; `replay_mock_enforce: true` restores the
+   v1.8.19 1.0pp hard bar (test t_c2...rejects pins that path).
+2. **Real gate = async confirm stage.** Direct (non-official-gated)
+   structurally-valid proposals get a DETACHED real-executor worker
+   (`scripts/replay_gate_worker.py`, new) and PARK as pending; the
+   verdict lands in a `.md.realgate.json` sidecar (write-then-rename);
+   the NEXT drain tick harvests it: accepted -> adopt
+   (`real_gate_accepted`), measured regression -> quarantine
+   (`real_gate_reject`), not-run/failed/stale -> FAIL-OPEN adopt
+   (loud tags `real_gate_not_run` / `real_gate_failed` /
+   `real_gate_stale` - a paid verdict we could not obtain must not
+   block the drain forever).
+3. **Budget (operator-locked):** 450s per-task timeout x 3 tasks
+   (`replay_real_per_task_timeout_s: 450`, `replay_real_max_tasks: 3`;
+   worst case 2x3x450s = 45 min per proposal, one worker in flight).
+
+Key mechanics:
+- **Sidecar-first single-flight:** the pending sidecar is written BEFORE
+  the worker spawns; `_adopt_one` skips (stays queued) whenever
+  `find_pending_real_gate_sidecar()` is non-None, so at most one real
+  gate runs at a time and every direct adoption eventually gets a real
+  verdict (no bypass-by-flight-state).
+- **Frozen tasks:** `_real_gate_spawn` freezes the held-out task list
+  into `<staged>.md.realgate.tasks.json`; the worker NEVER rescans
+  rollouts (spawn-time selection == run-time measurement; drift is
+  structurally eliminated; the harvest re-check is advisory-only,
+  tag `real_gate_drift`).
+- **TRAP A honored:** the worker's bare `helpers` import cannot see
+  config.json, so ALL knobs are CLI-passed by `_real_gate_spawn`
+  (merged_config resolved in-process). Enforced by a docstring warning
+  in replay_gate_worker.py.
+- **TRAP B honored:** with the async gate on, stage 0.7 runs the MOCK
+  executor even when `replay_real_executor_enabled: true` (no
+  synchronous double spend, no 45-min drain block).
+- **Restart safety:** `_real_gate_cleanup` rehydrates the
+  `state["real_gate"]` mirror from a live pending sidecar and unlinks
+  orphaned sidecars (missing proposal + dead pid); the harvest's
+  stale/grace window (`replay_real_gate_stale_after_s`, 4h default)
+  uses `sleep_runner.is_running(pid)`.
+- **Budget accounting:** each spawn records
+  `replay_real_gate_cost_cents` (default 6c) via the budget tracker
+  (best-effort); `_V1822_RG_CFG` in tests pins it to 0 so the suite
+  never touches the production budget state.
+- **Official-gated proposals bypass the real gate entirely** (the
+  upstream gate is authoritative) and adopt immediately.
+- `_move_staged_proposal` carries the realgate sidecar + tasks file
+  alongside the official marker (adopted/ and rejected/ both).
+- Observability: `staging drain` summary gains `pending=`; the Loop
+  status card shows the in-flight gate (skill/pid/age) via the
+  `real_gate` state mirror; per-task `latency_s` is recorded in
+  real-branch verdicts.
+
+New/changed:
+- `sleep_runner`: `REAL_GATE_SIDECAR_SUFFIX`/`REAL_GATE_TASKS_SUFFIX`,
+  write/read/find sidecar helpers, `_detached_popen_kwargs()`
+  (DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP on win32,
+  start_new_session on POSIX), `launch_real_gate_worker()`,
+  `is_running(pid)` ctypes-based on win32 (os.kill(pid,0) is Ctrl+C
+  there); stage 0.7 executor/enforcement selection per the matrix above.
+- `auto_loop`: `_real_gate_cleanup`, `_real_gate_enabled`,
+  `_real_gate_spawn`, `_harvest_real_gate`; `_adopt_one` harvest
+  branch + spawn branch + `real_gate` audit field
+  ("bypassed"/"spawned"/"harvested"); `_load_state` defaults gain
+  `real_gate: None`; `get_loop_state` exposes the mirror with age_s.
+- `scripts/replay_gate_worker.py` (new): single-proposal real gate,
+  JSONL phases (start/per_task/verdict/summary) to
+  `logs/runs/real_gate_*.jsonl`, exit 0 on verdict (either polarity),
+  1 -> sidecar status=failed.
+- `replay_harness.run_counterfactual(real)`: per-task `latency_s`.
+- config: new defaults in default_config.yaml (flat keys - the nested
+  YAML parser lesson): `replay_mock_enforce: false`,
+  `replay_real_gate_enabled: true`, `replay_real_gate_stale_after_s:
+  14400`, `replay_real_gate_cost_cents: 6`. Production config.json
+  enables the gate with `replay_real_executor_enabled: true`,
+  `replay_real_per_task_timeout_s: 450`, `replay_real_max_tasks: 3`.
+- Smoke: `_real_gate_env` isolation recipe (extends the v1.8.21 drain
+  pattern with runs_dir + held-out/launch restore; `exist_ok` mkdirs),
+  `_sleepy_child`, `_v1822_valid_proposal`, `_v1822_optin`; 11 new
+  t_v1822_* cases (advisory matrix, official-gated bypass, spawn+park,
+  single-flight, harvest adopt/quarantine/fail-open, stale/grace,
+  restart rehydrate + toggle-off, latency, worker CLI contract). Two
+  pre-existing tests updated to the new semantics (hard-reject test now
+  pins `replay_mock_enforce: true`; executor-selection test pins the
+  legacy sync path with `replay_real_gate_enabled: false`). Suite
+  183/183.
+
+Rollout: restart REQUIRED (auto-loop-thread code). Post-restart
+observation checklist (first eligible tick): spawn log line
+`real gate: spawned worker pid=...`, sidecar in staging
+(`*.md.realgate.json`, status pending), worker JSONL growing,
+next-tick harvest adopting/quarantining on the verdict, drain summary
+`pending=` count, dashboard Loop card real-gate line, budget +6c.

@@ -112,6 +112,30 @@ replay_real_max_tasks: 4
 # outright regressions (lift < 0). The REAL executor keeps the full
 # gate_min_improvement_pp bar (5.0).
 replay_mock_gate_min_improvement_pp: 1.0
+# v1.8.22: the MOCK stage-0.7 replay verdict is ADVISORY by default (log
+# only, never rejects) — its keyword-relevance lift on real proposals is
+# noise (2026-09-23 drain: 5 of 7 proposals rejected as mock "regression").
+# Set true to restore the v1.8.19 hard bar
+# (replay_mock_gate_min_improvement_pp, default 1.0) for the mock verdict.
+# Has no effect for official_gated proposals (stage 0.7 is skipped there).
+replay_mock_enforce: false
+# v1.8.22: the REAL replay confirmation runs ASYNC (detached worker +
+# verdict sidecar, harvested on a later auto-loop tick) instead of
+# synchronously inside validate_proposal. Requires
+# replay_real_executor_enabled. When false, the v1.8.19 behaviour is
+# preserved: the real executor runs synchronously inside stage 0.7.
+# Only the drain spawns the worker: with auto_adopt off the real gate
+# never spawns (the manual /adopt path stays human-gated).
+replay_real_gate_enabled: true
+# A real-gate verdict pending longer than this with a dead worker pid is
+# resolved FAIL-OPEN: the proposal is adopted with a loud
+# real_gate_stale note (quarantining would permanently destroy good
+# proposals on a transient executor outage). Default 4h.
+replay_real_gate_stale_after_s: 14400
+# v1.8.22: one real gate spawns 2 x replay_real_max_tasks full A0
+# monologues. Recorded once per gate spawn into the per-skill
+# BudgetTracker (cents-only); 0 disables the bookkeeping.
+replay_real_gate_cost_cents: 6
 
 # =====================================================================
 # STORAGE
