@@ -4,6 +4,54 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.23] - 2026-09-24
+
+### Fix: first real-gate run diagnosed — timeout under-budget + honest sidecar labeling
+
+The first-ever async real-gate run (2026-09-24, `agent-zero-api-handler-routing`)
+produced `insufficient_usable_pairs: 0 usable (3 task failures)`: all 6
+monologue replays hit the 450s per-task budget. Root causes fixed:
+
+- **Timeout under-budget**: production `config.json` ran
+  `replay_real_per_task_timeout_s: 450` — BELOW the harness's own documented
+  ceiling of 600 (`default_config.yaml` + `replay_harness` default; ROADMAP
+  751 marks 600 as the sanctioned ceiling, beyond it operator-level).
+  → `config.json` 450→600; `auto_loop._real_gate_spawn` default 450→600;
+  `replay_gate_worker` default 450→600.
+- **Timeout diagnosability**: `replay_worker` prints flushed phase marks
+  (`init_done` / `context_ready` / `monologue_done` elapsed seconds);
+  `replay_harness._real_score` preserves the killed worker's phase marks in
+  the timeout `RuntimeError` (was: opaque "timed out after 450s" with zero
+  diagnostics). Next timeout will show exactly which phase ate the budget.
+- **Honest sidecar labeling**: the spawn-time placeholder
+  `gate_passed: true` made completed sidecars read as "gate passed" even
+  when the verdict said could-not-measure. Spawn now records
+  `pre_gate_recorded: true` + `gate_passed: null`; the worker sets
+  `gate_passed = verdict.ok` on done (False on failed). No consumer reads
+  `gate_passed` (harvest keys on sidecar presence) — labeling-only change.
+  The on-disk 2026-09-24 sidecar retro-fixed (`gate_passed: false`).
+- **Re-adoption of a changed skill verified intended**: the 09-24
+  re-adoption of `agent-zero-api-handler-routing` was a genuine v2 (adds the
+  `methods`/405 handler knowledge from newer rollouts; live SKILL.md matches).
+  No-op re-adoption is already rejected by `validate_proposal` stages 5/6
+  (byte + whitespace-normalised identical).
+- **Test isolation (caught live by the v1.8.19 P4 pollution test)**:
+  `t_v121_judge_via_http` wrote its rollout fixtures into the PRODUCTION
+  `logs/rollouts` dir; the live inner-loop tick could scan them mid-test
+  and enqueue fixture suggestions into production run state (observed
+  2026-09-24: 6 files, one tick). The test now sandboxes
+  `ab_harness._rollouts_dir` to a tmpdir; leaked production files deleted.
+  Related: `t_v188_governance_pause_api` now tolerates a relocated suite
+  copy (no `PLUGIN_ROOT.parents[2]` IndexError when the plugin isn't 3
+  levels under an A0 root — discovered running the suite from a
+  container-local /tmp copy to bypass a 9p-flap D-state wedge).
+
+### Docs
+
+- AGENTS.md §1.8.23; production adoptions.log evidence recorded.
+
+---
+
 ## [1.8.22] - 2026-09-24
 
 ### Fix: smoke suite no longer bypasses LLM stubs when /a0 is importable (canonical module identity)

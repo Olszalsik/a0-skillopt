@@ -82,7 +82,7 @@ def main() -> int:
     # from inside the worker process (TRAP A, module docstring).
     ap.add_argument('--executor', default='real', choices=('real', 'mock'),
                     help="mock: hermetic test path (deterministic, no LLM)")
-    ap.add_argument('--per-task-timeout-s', type=float, default=450.0)
+    ap.add_argument('--per-task-timeout-s', type=float, default=600.0)
     ap.add_argument('--max-tasks', type=int, default=3)
     ap.add_argument('--gate-min-improvement-pp', type=float, default=5.0)
     ap.add_argument('--replay-min-n', type=int, default=3)
@@ -157,6 +157,9 @@ def main() -> int:
             emit('per_task', **pt)
         payload['status'] = 'done'
         payload['verdict'] = verdict
+        # v1.8.23: gate_passed now reflects the verdict: True iff the real
+        # gate MEASURED a result (verdict.ok); False on could-not-measure.
+        payload['gate_passed'] = bool(verdict.get('ok'))
         payload['finished_ts'] = time.time()
         payload['error'] = None
         _write_sidecar(sidecar, payload)
@@ -171,6 +174,8 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001 - any failure -> failed sidecar
         payload['status'] = 'failed'
         payload['error'] = f'{type(e).__name__}: {e}'[:500]
+        # v1.8.23: a failed worker produced no verdict — say so.
+        payload['gate_passed'] = False
         payload['finished_ts'] = time.time()
         _write_sidecar(sidecar, payload)
         emit('summary', verdict='failed', exit_code=1,

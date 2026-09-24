@@ -885,7 +885,15 @@ class AutoLoopThread(threading.Thread):
             "held_out_ids": [
                 t.get("id") for t in held if isinstance(t, dict)
             ],
-            "gate_passed": True,
+            # v1.8.23: honest sidecar labeling. At spawn NO gate has run yet —
+            # `gate_passed: True` here was a placeholder that made completed
+            # sidecars read as "gate passed" even when the verdict said
+            # could-not-measure. Spawn records `pre_gate_recorded: true` (the
+            # sentinel that a structural pre-gate ran and the real verdict
+            # lives in the sidecar) and leaves `gate_passed` None until the
+            # worker writes the verdict.
+            "pre_gate_recorded": True,
+            "gate_passed": None,
             "verdict": None,
             "error": None,
         }
@@ -893,7 +901,10 @@ class AutoLoopThread(threading.Thread):
         if write_result is None:
             raise RuntimeError("real-gate sidecar write failed")
         max_tasks = int(cfg.get("replay_real_max_tasks", 3) or 0)
-        per_task = int(cfg.get("replay_real_per_task_timeout_s", 450) or 450)
+        # v1.8.23: 450 was below the harness's own documented ceiling
+        # (default_config.yaml / replay_harness default 600) — production ran
+        # 6/6 monologue timeouts at 450s (real_gate_worker_20260924T112712).
+        per_task = int(cfg.get("replay_real_per_task_timeout_s", 600) or 600)
         knobs = [
             "--per-task-timeout-s", str(per_task),
             "--max-tasks", str(max_tasks),
@@ -1180,9 +1191,11 @@ class AutoLoopThread(threading.Thread):
 
         # v1.8.22: real-gate HARVEST branch. A proposal with a verdict
         # sidecar skips the gate re-run entirely: the spawn-time sidecar
-        # recorded gate_passed=true, so harvesting before the text reads
-        # avoids double governance, double audit rows and a duplicate
-        # validate_proposal call. We act purely on the replay verdict.
+        # recorded pre_gate_recorded=true (v1.8.23; the old gate_passed=true
+        # placeholder was misleading — see _real_gate_spawn), so harvesting
+        # before the text reads avoids double governance, double audit rows
+        # and a duplicate validate_proposal call. We act purely on the
+        # replay verdict.
         rg = sleep_runner.read_real_gate_sidecar(src)
         if rg is not None:
             return self._harvest_real_gate(state, cfg, src, skill_name, rg)

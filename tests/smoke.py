@@ -690,8 +690,18 @@ def t_v121_judge_via_http() -> None:
         ab_harness.set_judge_fn(_http_judge)
 
         # Inject rollouts so the harness has data to test on.
-        rollouts_dir = PLUGIN_ROOT / "logs" / "rollouts"
-        rollouts_dir.mkdir(parents=True, exist_ok=True)
+        # v1.8.23: sandbox the rollouts dir. This test used to write its
+        # r0..r5 fixtures into the PRODUCTION logs/rollouts dir; the live
+        # inner-loop tick (60s cadence in the running container) could scan
+        # them mid-test and enqueue fixture suggestions into production
+        # run state - the exact leak class the v1.8.19 P4 test flags.
+        # Same sandbox pattern as the other ab_harness tests.
+        import tempfile as _tempfile
+        _rd_tmp = _tempfile.TemporaryDirectory(prefix="skillopt_v121_")
+        _sandbox = Path(_rd_tmp.name)
+        _saved_rollouts_dir = ab_harness._rollouts_dir
+        ab_harness._rollouts_dir = lambda: _sandbox
+        rollouts_dir = _sandbox
         sample = [
             {
                 "id": f"r{i}", "ts": time.time(),
@@ -718,6 +728,8 @@ def t_v121_judge_via_http() -> None:
                 p = rollouts_dir / f"{r['id']}.json"
                 if p.is_file():
                     p.unlink()
+            ab_harness._rollouts_dir = _saved_rollouts_dir
+            _rd_tmp.cleanup()
         # The harness must have actually called the server.
         assert len(server.requests) >= 1, (
             f"harness did not POST to mock server; judge_fallback={result.get('judge_fallback')} "
@@ -5144,8 +5156,16 @@ def t_v188_governance_pause_api() -> None:
     mod = _ilu.module_from_spec(spec)
     spec.loader.exec_module(mod)
     tmp = _tempfile.mkdtemp(prefix='v188smoke_apipause_')
-    a0_root = str(PLUGIN_ROOT.parents[2])
-    if a0_root not in _sys.path:
+    # v1.8.23: tolerate a relocated suite copy (e.g. /tmp/skillopt23 during a
+    # 9p-flap run) where parents[2] doesn't exist — the usr.plugins import
+    # below is already optional (try/except), so the second module identity
+    # simply isn't checked in that layout.
+    a0_root = None
+    try:
+        a0_root = str(PLUGIN_ROOT.parents[2])
+    except IndexError:
+        pass
+    if a0_root and a0_root not in _sys.path:
         _sys.path.insert(0, a0_root)
     old_env = _os.environ.get('SKILLOPT_SKILLS_DIR')
     _os.environ['SKILLOPT_SKILLS_DIR'] = tmp
@@ -6463,7 +6483,9 @@ def t_v1822_real_gate_spawns_and_parks() -> None:
                 sidecar = _sr.read_real_gate_sidecar(src)
                 assert sidecar is not None and sidecar.get("status") == "pending", sidecar
                 assert sidecar.get("pid") == child.pid, "sidecar must carry the worker pid"
-                assert sidecar.get("gate_passed") is True
+                assert sidecar.get("pre_gate_recorded") is True
+                assert sidecar.get("gate_passed") is None, \
+                    "no gate verdict at spawn: gate_passed must be None (v1.8.23)"
                 tasks_file = Path(sidecar.get("tasks_file") or "")
                 assert tasks_file.is_file() and isinstance(
                     json.loads(tasks_file.read_text(encoding="utf-8")), list
@@ -6590,7 +6612,7 @@ def t_v1822_real_gate_harvest_quarantine() -> None:
                 "proposal_path": str(src), "staged_mtime": src.stat().st_mtime,
                 "status": "done", "pid": 12345, "started_ts": time.time() - 60.0,
                 "finished_ts": time.time(), "jsonl_path": "x", "tasks_file": "x",
-                "held_out_ids": ["t1"], "gate_passed": True,
+                "held_out_ids": ["t1"], "gate_passed": False,
                 "verdict": {"ok": True, "accepted": False, "executor": "real",
                             "n": 2, "lift_pp": -2.0, "reason": "rejected_regression",
                             "hard_current": 0.5, "hard_proposed": 0.48,
@@ -6643,7 +6665,7 @@ def t_v1822_real_gate_harvest_fail_open() -> None:
                     "started_ts": time.time() - 60.0,
                     "finished_ts": time.time(), "jsonl_path": "x",
                     "tasks_file": "x", "held_out_ids": ["t1"],
-                    "gate_passed": True, "verdict": verdict,
+                    "gate_passed": bool((verdict or {}).get("ok")), "verdict": verdict,
                     "error": "boom" if status == "failed" else None,
                 }
                 _sr.write_real_gate_sidecar(src, payload)
@@ -6679,7 +6701,7 @@ def t_v1822_real_gate_stale_and_grace() -> None:
                 "status": "pending", "pid": 999999,
                 "started_ts": time.time() - 20000.0,  # > 4h stale window
                 "finished_ts": None, "jsonl_path": None, "tasks_file": "x",
-                "held_out_ids": ["t1"], "gate_passed": True,
+                "held_out_ids": ["t1"], "pre_gate_recorded": True, "gate_passed": None,
                 "verdict": None, "error": None,
             })
             cfg = dict(_V1822_RG_CFG)
@@ -6700,7 +6722,7 @@ def t_v1822_real_gate_stale_and_grace() -> None:
                 "status": "pending", "pid": 999999,
                 "started_ts": time.time() - 60.0,  # young, dead pid
                 "finished_ts": None, "jsonl_path": None, "tasks_file": "x",
-                "held_out_ids": ["t1"], "gate_passed": True,
+                "held_out_ids": ["t1"], "pre_gate_recorded": True, "gate_passed": None,
                 "verdict": None, "error": None,
             })
             cfg = dict(_V1822_RG_CFG)
@@ -6722,7 +6744,7 @@ def t_v1822_real_gate_stale_and_grace() -> None:
                     "status": "pending", "pid": child.pid,
                     "started_ts": time.time() - 20000.0,
                     "finished_ts": None, "jsonl_path": None, "tasks_file": "x",
-                    "held_out_ids": ["t1"], "gate_passed": True,
+                    "held_out_ids": ["t1"], "pre_gate_recorded": True, "gate_passed": None,
                     "verdict": None, "error": None,
                 })
                 cfg = dict(_V1822_RG_CFG)
@@ -6759,7 +6781,7 @@ def t_v1822_real_gate_restart_rehydrate_and_toggle_off() -> None:
                     "status": "pending", "pid": child.pid,
                     "started_ts": time.time(), "finished_ts": None,
                     "jsonl_path": None, "tasks_file": "x",
-                    "held_out_ids": [], "gate_passed": True,
+                    "held_out_ids": [], "pre_gate_recorded": True, "gate_passed": None,
                     "verdict": None, "error": None,
                 })
                 thread = _al.AutoLoopThread(get_config=lambda: dict(_V1822_RG_CFG))
@@ -6873,7 +6895,7 @@ def t_v1822_real_gate_worker_cli_contract() -> None:
             "proposal_path": str(staged), "staged_mtime": staged.stat().st_mtime,
             "status": "pending", "pid": 0, "started_ts": time.time(),
             "finished_ts": None, "jsonl_path": None, "tasks_file": str(tasks_file),
-            "held_out_ids": ["t1", "t2"], "gate_passed": True,
+            "held_out_ids": ["t1", "t2"], "pre_gate_recorded": True, "gate_passed": None,
             "verdict": None, "error": None,
         }), encoding="utf-8")
         log_dir = tmp / "logs"

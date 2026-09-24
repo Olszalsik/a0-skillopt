@@ -245,7 +245,20 @@ def _real_score(
                 timeout=timeout, env=env,
             )
         except subprocess.TimeoutExpired as e:
-            raise RuntimeError(f"replay worker timed out after {timeout}s") from e
+            # v1.8.23: the killed worker's flushed stdout (phase marks:
+            # init_done / context_ready / monologue_done) survives in the
+            # exception — surface the tail so the timeout is diagnosable.
+            tail = (e.stdout or "") if isinstance(e.stdout, str) else (
+                (e.stdout or b"").decode("utf-8", "replace")
+                if isinstance(e.stdout, bytes) else ""
+            )
+            tail = " | ".join(
+                l for l in tail.strip().splitlines() if "phase:" in l or "replay worker" in l
+            )[-300:]
+            raise RuntimeError(
+                f"replay worker timed out after {timeout}s "
+                f"[last phase marks: {tail or 'none'}]"
+            ) from e
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip()[:500]
             raise RuntimeError(f"replay worker exit {proc.returncode}: {tail}")

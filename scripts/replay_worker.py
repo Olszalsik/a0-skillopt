@@ -230,7 +230,15 @@ async def _run_monologue(
     _orig_cwd = os.getcwd()
     os.chdir(workdir)
 
+    # v1.8.23: phase timing. A full framework init (all plugin extensions)
+    # is the dominant unknown when the parent's per-task budget times out;
+    # printing elapsed phase marks (flushed) lets the parent's timeout
+    # handler surface how far the monologue got before the kill.
+    import time as _phase_time
+    _ph_t0 = _phase_time.monotonic()
     config = initialize_agent(override_settings={"workdir_path": str(workdir)})
+    _ph_init = _phase_time.monotonic() - _ph_t0
+    print(f"[{PLUGIN_NAME}] phase: init_done={_ph_init:.1f}s", flush=True)
 
     # v1.8.0 tools-namespace fix (v2): agent.get_tool resolves its
     # unregistered-tool fallback via a package import that can lose to the
@@ -249,11 +257,15 @@ async def _run_monologue(
         pass
 
     ctx = AgentContext(config=config)
+    _ph_ctx = _phase_time.monotonic() - _ph_t0
+    print(f"[{PLUGIN_NAME}] phase: context_ready={_ph_ctx:.1f}s", flush=True)
     try:
         agent = ctx.agent0
         _inject_skill(agent, skill_name, skill_md)
         task = ctx.communicate(UserMessage(message=task_text))
         response = await task.result()
+        _ph_mono = _phase_time.monotonic() - _ph_t0
+        print(f"[{PLUGIN_NAME}] phase: monologue_done={_ph_mono:.1f}s", flush=True)
         # loop_data.last_response holds the final AI turn's text (the
         # response-tool message). Fall back to the communicate() return.
         last = ""

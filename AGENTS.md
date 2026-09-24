@@ -699,3 +699,61 @@ observation checklist (first eligible tick): spawn log line
 (`*.md.realgate.json`, status pending), worker JSONL growing,
 next-tick harvest adopting/quarantining on the verdict, drain summary
 `pending=` count, dashboard Loop card real-gate line, budget +6c.
+
+## 1.8.23 — first real-gate run diagnosed: timeout under-budget + honest sidecar labeling (2026-09-24)
+
+The first async real-gate run in production (2026-09-24,
+`agent-zero-api-handler-routing`, worker log
+`real_gate_worker_20260924T112712`) came back
+`insufficient_usable_pairs: 0 usable (3 task failures)` — all 6 monologue
+replays hit the 450s per-task budget, and the harvest fail-open adopted on
+`real_gate_not_run`. Investigation findings + fixes:
+
+- **Root cause (timeout)**: production `config.json` carried
+  `replay_real_per_task_timeout_s: 450` — BELOW the harness's own documented
+  600 ceiling (default_config.yaml:105, replay_harness default, ROADMAP 751
+  "beyond 600 is operator-level"). A replay monologue subprocess pays a full
+  framework init (initialize_agent + AgentContext + all plugin extensions)
+  before the monologue even starts, so 450s was never a realistic budget on
+  this instance. Fixed: config.json + auto_loop default + worker CLI default
+  all 600. The ROADMAP-mandated ceiling stays 600 (raising further is an
+  operator decision).
+- **Timeout diagnosability**: `replay_worker._run_monologue` now prints
+  flushed phase marks (`init_done` / `context_ready` / `monologue_done`
+  elapsed seconds) and `_real_score`'s `TimeoutExpired` handler embeds the
+  killed worker's phase marks in the raised `RuntimeError` — the next
+  timeout shows exactly which phase ate the budget instead of an opaque
+  "timed out after 450s".
+- **Honest sidecar labeling**: spawn-time `gate_passed: true` was a
+  placeholder that made COMPLETED sidecars read "gate passed" even when the
+  verdict was could-not-measure (found by reading the live
+  `...adopt20260924T122722.md.realgate.json`: `gate_passed: true` +
+  `verdict.ok: false`). Spawn now writes `pre_gate_recorded: true` +
+  `gate_passed: null`; the worker writes `gate_passed = verdict.ok` on done
+  and `false` on failed. Verified nothing consumes `gate_passed` (harvest
+  keys on sidecar presence via `read_real_gate_sidecar`); the on-disk
+  09-24 sidecar retro-fixed to `gate_passed: false`. Spawn/pending fixtures
+  updated in smoke.
+- **Re-adoption of a changed skill = intended behavior** (flag #3 from the
+  post-restart report, no code change): the 09-24 second adoption of
+  `agent-zero-api-handler-routing` was a genuine v2 — it adds the
+  `methods`/405 ApiHandler knowledge distilled from newer rollouts, and
+  live SKILL.md byte-matches the 09-24 proposal. No-op re-adoption is
+  already structurally rejected (validate_proposal stages 5 byte-identical
+  + stage 6 whitespace-normalised). No dedupe gap exists.
+- **Test-fixture leak caught + fixed (found by the v1.8.19 P4 pollution
+  test during this run's smoke)**: the v1.2.0 HTTP-judge smoke test
+  (`t_v121_judge_via_http`) wrote its `r0..r5` rollout fixtures into the
+  PRODUCTION `logs/rollouts` dir, and the live inner-loop tick in the
+  running container scanned them mid-test and enqueued 6 fixture
+  suggestions into production run state (all timestamped to one tick —
+  a race, not a deterministic leak; earlier runs got lucky). Fixed: the
+  test now sandboxes `ab_harness._rollouts_dir` to a tmpdir (same pattern
+  as the other ab_harness tests at smoke.py:1114/1183/1394); the 6 leaked
+  production files (`logs/runs/suggestions/v121_http_judge_r*.md`)
+  deleted.
+- Note (unchanged design): harvest stays fail-OPEN on could-not-measure
+  (v1.8.22 decision matrix — quarantining on a transient executor outage is
+  the v1.8.21 head-of-line disease with worse blast radius) and fail-CLOSED
+  on a real measurement. With the timeout fixed, the next run should
+  produce an actual measurement and fail-closed semantics finally engage.
