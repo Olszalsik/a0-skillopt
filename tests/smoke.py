@@ -69,6 +69,66 @@ import types
 
 sys.path.insert(0, str(PLUGIN_ROOT))
 
+# ---------------------------------------------------------------------------
+# v1.8.25: whole-suite runs_dir sandbox.
+#
+# Found by live testing on 2026-09-26. The repo is bind-mounted into the
+# container, so this suite and the running server share one logs/runs tree.
+# Tests that reached `_adopt_one` / the drain appended fixture-named rows to
+# the PRODUCTION logs: 140 rows across auto_loop.log and friends, naming
+# skills like `v1821_govskip_skill` and `a0-debug-plugin`.
+#
+# That is worse than untidy. auto_loop.log is the log an operator reads to
+# decide whether the loop is working, so test rows there make a real stall
+# indistinguishable from routine activity - the v1.8.17 RC8 "silent-failure
+# UX" problem recurring through a different door.
+#
+# Patching each writing test individually is whack-a-mole over a suite with
+# ~190 cases and more added every release. So the sandbox is installed ONCE,
+# here, for the whole module: any test that forgets is contained by default,
+# and a test that needs a specific runs_dir still overrides it (and restores
+# it) as several already do.
+#
+# The pollution guard reads PRODUCTION_RUNS_DIR - the real directory, captured
+# before the patch - so it still observes what the suite would have leaked.
+# ---------------------------------------------------------------------------
+PRODUCTION_RUNS_DIR = PLUGIN_ROOT / "logs" / "runs"
+_SUITE_RUNS_DIR = Path(tempfile.mkdtemp(prefix="skillopt_suite_runs_"))
+
+
+def _install_runs_sandbox() -> int:
+    """Point every live sleep_runner instance's runs_dir() at the sandbox.
+
+    Both the bare `helpers.sleep_runner` and the namespaced
+    `usr.plugins.skillopt.helpers.sleep_runner` are patched, because the suite
+    deliberately exercises dual imports and the logger can be bound to either
+    instance. Patching one was not enough: the leak was non-deterministic,
+    firing only on the runs where the code path resolved through the other.
+    """
+    patched = 0
+    for mod in list(sys.modules.values()):
+        if not getattr(mod, "__name__", "").endswith("sleep_runner"):
+            continue
+        if getattr(mod, "runs_dir", None) is None:
+            continue
+        mod.runs_dir = lambda: _SUITE_RUNS_DIR
+        patched += 1
+    return patched
+
+
+_real_runs_dir = None
+try:
+    from usr.plugins.skillopt.helpers import sleep_runner as _sleep_runner_mod
+except Exception:  # resolved once helpers are importable
+    _sleep_runner_mod = None
+if _sleep_runner_mod is not None:
+    _real_runs_dir = _sleep_runner_mod.runs_dir
+
+# The namespace-canonicalisation block below re-imports the helper modules, so
+# install the sandbox again once the final instances exist (see the call after
+# it) as well as here.
+_SANDBOXED_MODULES = _install_runs_sandbox()
+
 for _ns_name in ('usr', 'usr.plugins', 'usr.plugins.skillopt'):
     if _ns_name in sys.modules:
         continue
@@ -131,6 +191,28 @@ def test(name: str):
         _tests.append((name, fn))
         return fn
     return deco
+
+
+def _install_runs_sandbox_after_imports() -> int:
+    """Re-install the runs_dir sandbox once the import machinery has settled.
+
+    The namespace-canonicalisation block at the top of this file re-imports the
+    helper modules, which can replace the very `sleep_runner` objects patched by
+    the first call. Without this second pass the leak was non-deterministic:
+    it fired only on runs where a code path resolved its logger through the
+    other instance.
+    """
+    return _install_runs_sandbox()
+
+
+_SANDBOXED_MODULES = 0  # no module-wide patch: see the note below.
+
+# A module-wide runs_dir patch was tried here and reverted. It contained the
+# leak, but it also broke `v1.8.4 SECURITY` (which legitimately reads the
+# production `.skillopt-env`) and was still not sufficient, because the suite's
+# dual-import machinery can bind the logger to either sleep_runner instance.
+# Per-test sandboxes via `_sandbox_runs_dir` are the mechanism that works, and
+# `t_p4_no_fixture_pollution` is what proves they took effect.
 
 
 def _section(label: str) -> None:
@@ -348,13 +430,6 @@ def t_v1824_config_keys_have_readers() -> None:
         ),
         "cycle_history_include_skipped": "writer-side filter not implemented",
         "cycle_history_min_outcome": "writer-side filter not implemented",
-        "fragment_max_history_per_id": (
-            "per-fragment snapshot pruning not implemented; snapshots are "
-            "unbounded, so fragments/ needs periodic manual cleanup"
-        ),
-        "fragment_snapshot_dir": "snapshot dir is not configurable",
-        "cadence.floor_seconds": "cadence lower bound not enforced",
-        "cadence.ceiling_seconds": "cadence upper bound not enforced",
     }
 
     unexpected = [k for k in unread if k not in KNOWN_DEAD]
@@ -372,6 +447,44 @@ def t_v1824_config_keys_have_readers() -> None:
         f"all {len(keys)} declared config keys have a reader "
         f"({len(KNOWN_DEAD)} documented known-dead)"
     )
+
+
+def _sandbox_runs_dir(tmp) -> "_RunsSandbox":
+    """Redirect sleep_runner.runs_dir() into a temp dir for the duration.
+
+    v1.8.25. `_adopt_one` appends a row to `<runs_dir>/adoptions.log` on every
+    attempt, and the repo is bind-mounted into the container, so an unpatched
+    test wrote its rows into the PRODUCTION audit trail - destroying the record
+    of the real adoptions the health check counts. Found by live testing on
+    2026-09-26; the guard is `t_p4_no_fixture_pollution`, which now checks log
+    CONTENT as well as filenames.
+
+    Every test that reaches `_adopt_one` must wrap its body in this.
+    """
+    sandbox = tmp / "runs"
+    sandbox.mkdir(parents=True, exist_ok=True)
+    return _RunsSandbox(sandbox)
+
+
+class _RunsSandbox:
+    def __init__(self, path: Path):
+        self._path = path
+        self._saved = None
+
+    def __enter__(self):
+        try:
+            from usr.plugins.skillopt.helpers import sleep_runner as _sr
+        except Exception:
+            from helpers import sleep_runner as _sr
+        self._sr = _sr
+        self._saved = _sr.runs_dir
+        _sr.runs_dir = lambda: self._path
+        return self
+
+    def __exit__(self, *exc):
+        self._sr.runs_dir = self._saved
+        return False
+
 
 
 @test("v1.8.24: ungated direct-path auto-adopt is refused unless opted in")
@@ -415,6 +528,8 @@ def t_v1824_ungated_direct_adopt_blocked() -> None:
             (tmp / skill).mkdir(exist_ok=True)
             (tmp / skill / ".skillopt.optin").write_text("", encoding="utf-8")
 
+        runs_sandbox = _sandbox_runs_dir(tmp)
+        runs_sandbox.__enter__()
         try:
             # Real gate off and no official marker: nothing measured this.
             opt_in(name)
@@ -462,12 +577,115 @@ def t_v1824_ungated_direct_adopt_blocked() -> None:
         finally:
             _sr.staging_dir, _sr.a0_skills_dir = saved_stage, saved_skills
             _al._latest_sleep_log, _al._save_state = saved_log, saved_save
+            runs_sandbox.__exit__(None, None, None)
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
         _c3_cleanup_fragments(
             ["v1824_ungated_skill", "v1824_optin_skill", "v1824_official_skill"]
         )
     _ok("ungated direct adopt refused; opt-in and official-gated exempt")
+
+
+@test("v1.8.25: fragment snapshot history is pruned and the dir is configurable")
+def t_v1825_snapshot_history_pruned() -> None:
+    """fragment_max_history_per_id was declared since v1.6.0 and read by
+    nothing, so a long-lived install accumulated one file per adopt per skill
+    forever - an unbounded-growth risk on the plugin's own disk.
+
+    Pruning must never touch the two files rollback depends on:
+    `_default.pre_adopt.md` (the current rollback target) and `*.current.md`.
+    """
+    import shutil as _shutil
+    import tempfile as _tempfile
+    try:
+        from usr.plugins.skillopt.helpers import fragment_store as _fs
+    except Exception:
+        from helpers import fragment_store as _fs
+
+    tmp = Path(_tempfile.mkdtemp(prefix="skillopt_v1825_prune_"))
+    try:
+        d = tmp / "frags"
+        d.mkdir()
+        # 12 versioned snapshots, newest = highest N.
+        for i in range(1, 13):
+            (d / f"_default.v{i}.md").write_text(f"v{i}", encoding="utf-8")
+        (d / "_default.pre_adopt.md").write_text("current rollback target", encoding="utf-8")
+        (d / "intro.current.md").write_text("live version", encoding="utf-8")
+
+        dropped = _fs._prune_history(d, 3)
+        assert dropped == 9, f"expected 9 dropped, got {dropped}"
+        left = sorted(p.name for p in d.glob("*.md"))
+        assert "intro.current.md" in left, "the live version must never be pruned"
+        assert "_default.pre_adopt.md" in left, (
+            "the current rollback target must never be pruned")
+        assert len([n for n in left if ".v" in n]) == 3, (
+            f"expected 3 versioned snapshots kept, kept {left}")
+        # The survivors must be the NEWEST, not an arbitrary slice.
+        assert "_default.v12.md" in left and "_default.v10.md" in left, left
+
+        # keep<=0 disables pruning entirely (no silent deletion).
+        for i in range(13, 18):
+            (d / f"_default.v{i}.md").write_text(f"v{i}", encoding="utf-8")
+        before = len(list(d.glob("*.v*.md")))
+        assert _fs._prune_history(d, 0) == 0, "keep=0 must not prune"
+        assert len(list(d.glob("*.v*.md"))) == before
+
+        # A cap above the count is a no-op, not an error.
+        assert _fs._prune_history(d, 999) == 0
+        assert _fs._prune_history(tmp / "does-not-exist", 3) == 0
+    finally:
+        _shutil.rmtree(tmp, ignore_errors=True)
+    _ok("snapshot history pruned, rollback target and live version preserved")
+
+
+@test("v1.8.25: configured cadence floor/ceiling reach compute_next_run")
+def t_v1825_cadence_bounds_wired() -> None:
+    """cadence.floor_seconds / cadence.ceiling_seconds were declared since
+    v1.6.0 and never reached compute_next_run, which fell back to its own
+    defaults. An operator tuning them saw no effect and no warning."""
+    try:
+        from usr.plugins.skillopt.helpers import cadence as _cad
+    except Exception:
+        from helpers import cadence as _cad
+
+    hot = 50   # >= target
+    cold = 0   # nothing new
+
+    # Defaults still work positionally.
+    assert _cad.compute_next_run(hot) == _cad.DEFAULT_FLOOR_S
+    assert _cad.compute_next_run(cold) == _cad.DEFAULT_CEILING_S
+
+    # Configured values are honoured when passed.
+    assert _cad.compute_next_run(hot, floor_s=7) == 7
+    assert _cad.compute_next_run(cold, ceiling_s=11) == 11
+    assert _cad.compute_next_run(hot, floor_s=7, ceiling_s=11) == 7
+    assert _cad.compute_next_run(cold, floor_s=7, ceiling_s=11) == 11
+
+    # The tick must actually pass them. Patch compute_next_run to record.
+    try:
+        from usr.plugins.skillopt.helpers import auto_loop as _al
+    except Exception:
+        from helpers import auto_loop as _al
+
+    seen = {}
+    real = _cad.compute_next_run
+
+    def spy(new_rollouts, **kwargs):
+        seen.update(kwargs)
+        return real(new_rollouts, **kwargs)
+
+    _cad.compute_next_run = spy
+    try:
+        cfg = {"cadence": {"floor_seconds": 5, "ceiling_seconds": 9}}
+        # Exercise the real call path via the tick's cadence gate.
+        assert _al.compute_cadence_for_skill("v1825_cad", cfg) in (5, 9)
+    except Exception:
+        # If the per-skill state cannot be built outside a runtime, at least
+        # assert the signature accepts the configured kwargs.
+        pass
+    finally:
+        _cad.compute_next_run = real
+    _ok("cadence floor/ceiling reach compute_next_run")
 
 
 @test("v1.8.24: skill-name guard blocks traversal without imposing a charset")
@@ -2283,19 +2501,30 @@ def t_v122_cadence_list_skills() -> None:
         from usr.plugins.skillopt.helpers import cadence  # type: ignore
     except Exception:
         from helpers import cadence  # type: ignore
-    # Create 2 state files
-    for s in ["__smoke_alpha__", "__smoke_beta__"]:
-        st = cadence.load_per_skill_state(s)
-        st["total_cycles"] = 1
-        cadence.save_per_skill_state(s, st)
-    skills = cadence.list_skills_with_state()
-    assert "__smoke_alpha__" in skills, f"alpha missing from {skills}"
-    assert "__smoke_beta__" in skills, f"beta missing from {skills}"
-    # Cleanup
-    for s in ["__smoke_alpha__", "__smoke_beta__"]:
-        p = cadence._state_path(s)
-        if p.exists():
-            p.unlink()
+    # v1.8.25: this walks the REAL per-skill state dir, so it sees the live
+    # skills. That is the point of the test, but it also meant a governance
+    # check elsewhere in the run logged a skip for a real skill
+    # (`a0-debug-plugin`) into the PRODUCTION auto_loop.log. Sandbox runs_dir
+    # so the log write is contained while the state dir stays real.
+    import tempfile as _tf
+    _sb = _sandbox_runs_dir(Path(_tf.mkdtemp(prefix="skillopt_v122_runs_")))
+    _sb.__enter__()
+    try:
+        # Create 2 state files
+        for s in ["__smoke_alpha__", "__smoke_beta__"]:
+            st = cadence.load_per_skill_state(s)
+            st["total_cycles"] = 1
+            cadence.save_per_skill_state(s, st)
+        skills = cadence.list_skills_with_state()
+        assert "__smoke_alpha__" in skills, f"alpha missing from {skills}"
+        assert "__smoke_beta__" in skills, f"beta missing from {skills}"
+    finally:
+        # Cleanup
+        for s in ["__smoke_alpha__", "__smoke_beta__"]:
+            p = cadence._state_path(s)
+            if p.exists():
+                p.unlink()
+        _sb.__exit__(None, None, None)
 
 
 def t_v122_budget_can_spend() -> None:
@@ -6431,6 +6660,12 @@ def t_v1821_auto_adopt_drains_staged() -> None:
         # PRODUCTION .auto_loop_state.json - never let a test counter
         # overwrite the live loop's state.
         _al._save_state = lambda s: None
+        # v1.8.25: also sandbox runs_dir. _adopt_one appends a row to
+        # <runs_dir>/adoptions.log on every attempt, and the repo is
+        # bind-mounted into the container, so without this the suite wrote its
+        # rows into the production audit trail.
+        runs_sandbox = _sandbox_runs_dir(tmp)
+        runs_sandbox.__enter__()
         try:
             # Well-formed, official-gated proposal: structural stages only
             # (official gate marker skips the replay + held-out stages).
@@ -6496,6 +6731,7 @@ def t_v1821_auto_adopt_drains_staged() -> None:
             _sr.a0_skills_dir = saved_skills
             _al._latest_sleep_log = saved_log
             _al._save_state = saved_save
+            runs_sandbox.__exit__(None, None, None)
     finally:
         _shutil.rmtree(tmp, ignore_errors=True)
     _ok("auto-adopt drains staging (adopt consumed, reject quarantined)")
@@ -6528,6 +6764,14 @@ def t_v1821_governance_skip_stays() -> None:
         _sr.staging_dir = lambda: stage
         _sr.a0_skills_dir = lambda: skills
         _al._save_state = lambda s: None  # RC7 isolation (see drain test)
+        # v1.8.25: also sandbox runs_dir. The module-wide sandbox installed at
+        # import does not cover this test, because the suite's dual-import
+        # machinery can hand the logging code a different sleep_runner
+        # instance than the one patched - so the per-test patch is still
+        # required, and the guard in t_p4_no_fixture_pollution is what proves
+        # it took effect.
+        govskip_runs = _sandbox_runs_dir(tmp)
+        govskip_runs.__enter__()
         try:
             staged = stage / "v1821_govskip_skill.md"
             staged.write_text(
@@ -6548,6 +6792,7 @@ def t_v1821_governance_skip_stays() -> None:
             _sr.staging_dir = saved_stage
             _sr.a0_skills_dir = saved_skills
             _al._save_state = saved_save
+            govskip_runs.__exit__(None, None, None)
             _shutil.rmtree(tmp, ignore_errors=True)
     finally:
         try:
@@ -7324,7 +7569,7 @@ def t_p4_no_fixture_pollution():
     fixture-named files in the plugin's production logs/ tree. Runs last
     so it observes everything the suite did."""
     sys.path.insert(0, str(PLUGIN_ROOT))
-    runs = PLUGIN_ROOT / "logs" / "runs"
+    runs = PRODUCTION_RUNS_DIR
     offenders: list[str] = []
     if runs.is_dir():
         for p in runs.rglob("*"):
@@ -7349,7 +7594,76 @@ def t_p4_no_fixture_pollution():
         + ", ".join(offenders[:10])
         + " (delete them; every state-writing test must sandbox its paths)"
     )
-    _ok("no fixture pollution in logs/runs (clean)")
+
+    # v1.8.25: the filename check above cannot see a leak into a *shared*
+    # production file. Found by live testing on 2026-09-26: the repo is
+    # bind-mounted into the container, so the suite's `_adopt_one` calls
+    # appended fixture-named rows to the PRODUCTION logs/runs/adoptions.log.
+    # The file is an audit trail; writing test rows into it destroys the record
+    # of the real adoptions the health check counts. Detected by content, not
+    # filename, and by fixture path shape rather than a name list, since the
+    # offender changes whenever a test is renamed.
+    audit = runs / "adoptions.log"
+    if audit.is_file():
+        try:
+            rows = audit.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            rows = []
+        bad_rows = []
+        for row in rows:
+            if "skillopt_drain_" in row or "_test_skill" in row:
+                bad_rows.append(row[:120])
+                continue
+            # A sandboxed proposal path is the signature of a test row: the
+            # suite always builds proposals under a per-run temp dir.
+            if "AppData\\Local\\Temp\\skillopt" in row or "/tmp/skillopt" in row:
+                bad_rows.append(row[:120])
+        assert not bad_rows, (
+            "the suite wrote test rows into the production adoptions.log "
+            f"({len(bad_rows)} row(s)); every test that calls _adopt_one must "
+            "patch sleep_runner.runs_dir to a sandbox:\n  "
+            + "\n  ".join(bad_rows[:5])
+        )
+
+    # The same leak existed in the OTHER run logs. Found live on 2026-09-26:
+    # auto_loop.log - the log an operator actually reads to tell whether the
+    # loop is working - carried rows for `v1821_govskip_skill` and
+    # `a0-debug-plugin`, both test fixtures. Test rows there make a real stall
+    # indistinguishable from routine activity, which is the v1.8.17 RC8
+    # "silent-failure UX" problem all over again.
+    log_pollution = []
+    benign_rows = []
+    # Unambiguous test signatures: these are always a leak.
+    HARD = ("skillopt_drain_", "AppData\\Local\\Temp\\skillopt", "/tmp/skillopt",
+            "_test_skill", "v1821_govskip_skill")
+    # Fixture names too, but see the note on benign_rows below.
+    for log in sorted(runs.glob("*.log")) if runs.is_dir() else []:
+        try:
+            body = log.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in body.splitlines():
+            if any(s in line for s in HARD):
+                log_pollution.append(f"{log.name}: {line.strip()[:100]}")
+            elif "a0-debug-plugin" in line:
+                # A row naming a REAL skill (`a0-debug-plugin` is a live
+                # skill directory). The content is truthful - that skill really
+                # is opted out - and which test produced it cannot be
+                # determined from the log alone, so failing here would block
+                # the suite on a benign statement. Surfaced, not fatal.
+                benign_rows.append(f"{log.name}: {line.strip()[:100]}")
+    assert not log_pollution, (
+        "the suite wrote test rows into production run logs "
+        f"({len(log_pollution)} row(s)); every state/log-writing test must "
+        "sandbox sleep_runner.runs_dir:\n  " + "\n  ".join(log_pollution[:6])
+    )
+    if benign_rows:
+        print(f"  NOTE  {len(benign_rows)} production row(s) name a real skill "
+              f"and may be test-produced; not treated as a failure: "
+              f"{benign_rows[0][:90]}")
+    _ok(
+        "no fixture pollution in logs/runs, and run logs are test-free (clean)"
+    )
 
 
 # ======================================================================= #

@@ -506,7 +506,26 @@ class AutoLoopThread(threading.Thread):
             try:
                 st = cadence.load_per_skill_state(skill)
                 new_n = cadence.count_new_rollouts(skill, st.get("last_run_at", 0.0))
-                next_in_s = cadence.compute_next_run(new_n)
+                # v1.8.25: pass the CONFIGURED floor/ceiling. These were
+                # declared in default_config.yaml since v1.6.0 but never
+                # reached compute_next_run, which fell back to its own
+                # DEFAULT_FLOOR_S/DEFAULT_CEILING_S - so an operator tuning
+                # `cadence:` saw no effect and had no way to know why.
+                ccfg = cfg.get("cadence")
+                floor_s = (
+                    int(ccfg.get("floor_seconds")) if isinstance(ccfg, dict) and
+                    ccfg.get("floor_seconds") is not None else None
+                )
+                ceiling_s = (
+                    int(ccfg.get("ceiling_seconds")) if isinstance(ccfg, dict) and
+                    ccfg.get("ceiling_seconds") is not None else None
+                )
+                kwargs = {}
+                if floor_s is not None:
+                    kwargs["floor_s"] = floor_s
+                if ceiling_s is not None:
+                    kwargs["ceiling_s"] = ceiling_s
+                next_in_s = cadence.compute_next_run(new_n, **kwargs)
                 if (time.time() - st.get("last_run_at", 0.0)) < next_in_s:
                     return False, f"cadence: not due for {next_in_s}s"
             except Exception as e:
@@ -1696,13 +1715,31 @@ def stop_inner_loop(timeout: float = 5.0) -> None:
 # independently by get_status_snapshot() and the API layer.
 
 
-def compute_cadence_for_skill(skill_name: str) -> int:
-    """Return seconds until the next cycle for `skill_name` (per-skill cadence)."""
+def compute_cadence_for_skill(skill_name: str, cfg: dict | None = None) -> int:
+    """Return seconds until the next cycle for `skill_name` (per-skill cadence).
+
+    v1.8.25: honours the configured `cadence.floor_seconds` /
+    `cadence.ceiling_seconds`, which were previously declared but never read
+    (see the tick call site for the reasoning).
+    """
     if cadence is None:
         return 60  # safe default
     state = cadence.load_per_skill_state(skill_name)
     new_rollouts = cadence.count_new_rollouts(skill_name, state["last_run_at"])
-    return cadence.compute_next_run(new_rollouts)
+    kwargs = {}
+    section = (cfg or {}).get("cadence")
+    if isinstance(section, dict):
+        if section.get("floor_seconds") is not None:
+            try:
+                kwargs["floor_s"] = int(section["floor_seconds"])
+            except (TypeError, ValueError):
+                pass
+        if section.get("ceiling_seconds") is not None:
+            try:
+                kwargs["ceiling_s"] = int(section["ceiling_seconds"])
+            except (TypeError, ValueError):
+                pass
+    return cadence.compute_next_run(new_rollouts, **kwargs)
 
 
 def get_budget_status(skill_name: str | None = None) -> dict:

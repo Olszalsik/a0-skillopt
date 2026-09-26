@@ -207,14 +207,95 @@ def _plugin_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _config_int(key: str, default: int | None = None) -> int | None:
+    """Read an int config key, tolerating a missing or unreadable config.
+
+    Never raises: a snapshot helper must not fail because the config is odd.
+    """
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
+
+        raw = sleep_runner.default_config().get(key, default)
+    except Exception:
+        return default
+    if raw is None or isinstance(raw, bool):
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+def _config_str(key: str, default: str) -> str:
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
+
+        raw = sleep_runner.default_config().get(key, default)
+    except Exception:
+        return default
+    return raw if isinstance(raw, str) and raw.strip() else default
+
+
+def _prune_history(directory: Path, keep: int | None) -> int:
+    """Drop the oldest versioned snapshots, keeping the newest `keep`.
+
+    v1.8.25. `fragment_max_history_per_id` was declared since v1.6.0 and read
+    by nothing, so a long-lived install accumulated one file per adopt per
+    skill forever. That is an unbounded-growth risk on the plugin's own disk,
+    and it is why `fragments/` needed manual cleanup.
+
+    Only versioned snapshots are pruned. `_default.pre_adopt.md` (the current
+    rollback target) and `*.current.md` (the live version) are never touched -
+    pruning either would destroy the ability to roll back.
+    """
+    if not keep or keep <= 0 or not directory.is_dir():
+        return 0
+
+    versioned: list[tuple[int, str, Path]] = []
+    for path in directory.glob("*.md"):
+        name = path.name
+        if name.endswith(".current.md") or name == "_default.pre_adopt.md":
+            continue
+        # Numeric version, NOT the name. Sorting on the name is a real trap:
+        # lexicographically `_default.v9.md` sorts AFTER `_default.v12.md`, so
+        # a name-ordered prune keeps the OLD versions and drops the new ones -
+        # silently discarding the recent history an operator would roll back to.
+        m = re.match(r"^(?:_default|[\w.-]+?)\.v(\d+)\.md$", name)
+        if m:
+            versioned.append((int(m.group(1)), name, path))
+            continue
+        m = re.match(r"^(?:_default|[\w.-]+?)\.(\d+)\.md$", name)
+        if m:
+            versioned.append((int(m.group(1)), name, path))
+    if len(versioned) <= keep:
+        return 0
+    # Highest version first, so the tail is the oldest.
+    versioned.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    dropped = 0
+    for _num, _name, path in versioned[keep:]:
+        try:
+            path.unlink()
+            dropped += 1
+        except OSError:
+            pass
+    if dropped:
+        try:
+            _append_fragment_log(
+                f"action=prune dir={directory.name!r} dropped={dropped} keep={keep}"
+            )
+        except Exception:
+            pass
+    return dropped
+
+
 def _snapshots_root() -> Path:
-    p = _plugin_root() / "fragments"
+    p = _plugin_root() / _config_str("fragment_snapshot_dir", "fragments")
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def _snapshots_dir_for_skill(skill_path: str | os.PathLike) -> Path:
-    p = _plugin_root() / "fragments" / Path(skill_path).stem
+    p = _plugin_root() / _config_str("fragment_snapshot_dir", "fragments") / Path(skill_path).stem
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -505,11 +586,13 @@ def snapshot_default(skill_name: str, current_bytes: str) -> dict[str, Any]:
                     n = max(n, int(m.group(1)) + 1)
             primary.rename(d / f"_default.v{n}.md")
         primary.write_text(current_bytes, encoding="utf-8")
+        pruned = _prune_history(d, _config_int("fragment_max_history_per_id", 0))
         _append_fragment_log(
             f"action=snapshot_default skill={skill_name!r} bytes={len(current_bytes)}"
+            + (f" pruned={pruned}" if pruned else "")
         )
         return {"ok": True, "snapshot_path": str(primary),
-                "bytes": len(current_bytes)}
+                "bytes": len(current_bytes), "pruned": pruned}
     except Exception as e:
         log.debug("[skillopt] snapshot_default failed: %s", e)
         return {"ok": False, "error": str(e)}

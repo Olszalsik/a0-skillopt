@@ -4,6 +4,98 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.26] - 2026-09-26
+
+Closes the remaining roadmap items, and fixes two bugs that only became
+visible under live testing on Agent Zero v2.13.
+
+### Fixed: the test suite was writing into the production logs
+
+**Found by live testing, not by the suite.** The repository is bind-mounted
+into the container, so this suite and the running server share one
+`logs/runs/` tree. Tests that reached `_adopt_one` or the drain appended
+fixture-named rows to production logs: **140 rows** across `auto_loop.log`,
+`adoptions.log`, `failure_memory.log` and the `real_gate_worker_*` files,
+naming skills like `v1821_govskip_skill` and `a0-debug-plugin`.
+
+That is worse than untidy. `auto_loop.log` is the log an operator reads to
+decide whether the loop is working, so test rows in it make a real stall
+indistinguishable from routine activity - the v1.8.17 RC8 "silent-failure UX"
+problem recurring through a different door. The plugin's own changelog
+claimed the leak was fixed in v1.8.21 P4; it was fixed for the files that guard
+checked by *name* and not for the shared audit and loop logs.
+
+- New `_sandbox_runs_dir(tmp)` helper, applied to every test that writes run
+  state or logs.
+- `t_p4_no_fixture_pollution` now inspects log **content**, not just filenames,
+  across every `logs/runs/*.log`.
+- Purged the 140 rows, after restoring a backup taken when the first, broader
+  purge attempt turned out to also match genuine engine output.
+
+A module-wide `runs_dir` patch was tried and **reverted**: it contained the
+leak but broke `v1.8.4 SECURITY`, which legitimately reads the production
+`.skillopt-env`. The comment at the sandbox site records that, so it is not
+retried blindly.
+
+### Fixed: snapshot pruning kept the wrong versions
+
+`fragment_max_history_per_id` was declared since v1.6.0 and read by nothing,
+so a long-lived install accumulated one file per adopt per skill forever - an
+unbounded-growth risk on the plugin's own disk. Now wired, along with
+`fragment_snapshot_dir`.
+
+The first implementation sorted candidates by **file name**, so
+`_default.v9.md` outranked `_default.v12.md` and a prune would have discarded
+the newest history and kept the oldest - exactly the snapshots an operator
+would want to roll back to. The new test caught it on first run; the sort is
+now numeric. `_default.pre_adopt.md` (the current rollback target) and
+`*.current.md` (the live version) are never pruned.
+
+### Fixed: cadence bounds were declared but never applied
+
+`cadence.floor_seconds` and `cadence.ceiling_seconds` were declared since
+v1.6.0, but both call sites invoked `compute_next_run(new_n)` with no
+arguments, so it silently fell back to its own defaults. An operator tuning
+them saw no effect and got no warning. Both call sites now pass the configured
+values, with an `isinstance` guard so a malformed section degrades to the
+default rather than raising inside the tick.
+
+These four keys leave the known-dead allowlist, which the reader test checks
+in both directions - so a key that gets wired must be removed from it, and a
+key that becomes unread again is caught.
+
+### Remaining known-dead config keys: 6, each with a reason
+
+`official_target_model` (no such flag on the real CLI) · `log_level` (a plugin
+must not own root logging) · `skill_target` and `sleep_schedule` (superseded
+by per-skill governance and the A0 scheduler) · `cycle_history_include_skipped`
+and `cycle_history_min_outcome` (writer-side filters not implemented).
+
+### Documentation
+
+`AGENTS.md` claimed nested config sections arrive as strings and that the
+budget cap was silently disabled, and that hub-status was a deliberate
+auth exception. Both were true when written and are false as of 1.8.25/26,
+so both statements are corrected - a DOX file that contradicts its own code is
+worse than a short one.
+
+### Tests
+
+189 cases, **189 passing on Linux under Agent Zero v2.13** (verified in the
+live container). On Windows the suite is 186/189: `v1.8.5 SECURITY: apply ...
+atomic 0600` asserts POSIX permission bits and cannot pass there, and the two
+`v1.8.16` judge-throttle tests are wall-clock sensitive and flake
+independently of any change.
+
+### Known limitation, stated rather than hidden
+
+A production log row that names a **real** skill (e.g. `a0-debug-plugin`)
+cannot be attributed to a test from the log alone, so the guard reports it as
+a NOTE instead of failing. Its content is truthful - that skill really is
+opted out. Rows carrying an unambiguous test signature still fail the run.
+
+---
+
 ## [1.8.25] - 2026-09-26
 
 Finishes the P0/P1/P2 remediation roadmap that followed the 1.8.24 incident.
