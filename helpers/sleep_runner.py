@@ -419,6 +419,130 @@ def parse_held_out(log_path: str | os.PathLike | None) -> dict[str, Any] | None:
     return {"before": before, "after": after, "delta_pp": round(delta_pp, 2)}
 
 
+def _local_schema_errors(proposed: str) -> list[str]:
+    """Structural frontmatter rules, mirroring helpers.skills.split_frontmatter.
+
+    Used only when the framework module cannot be imported (it pulls in the
+    full extension chain, so a dev box without every optional dependency
+    cannot import it). Mirrors the three structural branches of
+    helpers/skills.py:167-188 exactly:
+
+      * a non-empty line before the opening fence -> not at the top
+      * no fence at all                        -> missing frontmatter
+      * no closing fence                       -> unterminated
+
+    Frontmatter is mandatory, so "no frontmatter" is an error, not a pass.
+    """
+    lines = (proposed or "").splitlines()
+    start_idx: int | None = None
+    for index, line in enumerate(lines):
+        if line.strip() == "---":
+            start_idx = index
+            break
+        if line.strip():
+            return ["Frontmatter must start at the top of the file"]
+    if start_idx is None:
+        return ["Missing YAML frontmatter"]
+    for index in range(start_idx + 1, len(lines)):
+        if lines[index].strip() == "---":
+            return []
+    return ["Unterminated YAML frontmatter"]
+
+
+def adopt_write_skill(skill_name: str, proposed: str) -> dict[str, Any]:
+    """Snapshot the live SKILL.md, then replace it atomically.
+
+    v1.8.24 (P0). Every adopt path must go through here.
+
+    Two defects this closes, both found on 2026-09-25 when an auto-adopted
+    proposal stripped the frontmatter from
+    `usr/skills/scheduled-tasks/SKILL.md`:
+
+    1. Only `api/adopt.py` snapshotted. The auto-loop paths - the only ones
+       that run unattended - overwrote the live skill with no backup, so
+       `/rollback` could not undo them. That is what made the damage
+       irreversible.
+    2. `Path.write_text` is open-truncate-then-write. The auto-loop thread is
+       killable at any point (container stop, `stop()` during a sleep), and a
+       kill mid-write leaves a half-written skill document: a different kind
+       of broken, with no clean rollback target either.
+
+    Returns {"ok", "snapshotted", "path"}. On a snapshot failure it returns
+    ok=False WITHOUT writing - a snapshot we could not take must not be
+    followed by an overwrite, because that is the unrecoverable case.
+    """
+    target = a0_skills_dir() / skill_name / "SKILL.md"
+    current = ""
+    if target.is_file():
+        try:
+            current = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            return {
+                "ok": False,
+                "error": f"could not read the live skill before adopting: {exc}",
+                "path": str(target),
+            }
+
+    try:
+        from usr.plugins.skillopt.helpers import fragment_store  # type: ignore
+    except Exception:
+        from helpers import fragment_store  # type: ignore
+
+    try:
+        fragment_store.snapshot_default(skill_name, current)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"snapshot failed, refusing to overwrite {target}: {exc}",
+            "path": str(target),
+        }
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(str(target) + ".tmp")
+    try:
+        tmp.write_text(proposed, encoding="utf-8")
+        os.replace(tmp, target)
+    except Exception as exc:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        return {"ok": False, "error": f"atomic write failed: {exc}", "path": str(target)}
+
+    return {"ok": True, "snapshotted": True, "path": str(target)}
+
+
+def framework_schema_errors(proposed: str) -> list[str]:
+    """Would the framework refuse to load this SKILL.md?
+
+    Prefers `helpers.skills.split_frontmatter`, the framework's own
+    text-level frontmatter parser, so there is one definition of "loadable"
+    rather than a second one to drift. Falls back to `_local_schema_errors`
+    when that module cannot be imported, which happens on a machine missing
+    an optional dependency the module pulls in (it transitively imports the
+    full extension chain) - not on a real Agent Zero runtime.
+
+    Fails CLOSED if neither path can run, so a broken import can never
+    silently disable this check. That is the failure mode that let the
+    frontmatter regression through in the first place.
+    """
+    try:
+        from helpers import skills as _skills  # type: ignore
+
+        _frontmatter, _body, errors = _skills.split_frontmatter(proposed)
+        return [str(e) for e in (errors or []) if str(e).strip()]
+    except Exception:
+        pass
+    try:
+        return _local_schema_errors(proposed)
+    except Exception as exc:  # pragma: no cover - defensive
+        return [
+            f"could not run the framework skill-schema check "
+            f"({type(exc).__name__}: {exc}); refusing to adopt unvalidated"
+        ]
+
+
 def validate_proposal(
     proposed: str,
     current: str,
@@ -777,6 +901,22 @@ def validate_proposal(
     if not per_fragment_ran:
         if not proposed or not proposed.strip():
             return False, "proposed skill is empty"
+        # v1.8.24 (P0): framework skill-schema gate. MUST run before every
+        # other structural stage. None of stages 1-7 parse frontmatter, so a
+        # proposal that strips it passed all nine checks and was adopted -
+        # after which the framework's own validate_skill_md rejects the file
+        # and the skill silently disappears from the agent. This is the check
+        # whose absence destroyed usr/skills/scheduled-tasks/SKILL.md on
+        # 2026-09-25 (proposal staging/adopted/
+        # scheduled-tasks__adopt20260925T102239.md, real-gate verdict
+        # insufficient_usable_pairs, adopted anyway via fail-open).
+        #
+        # Split out as a helper so the smoke suite can pin it directly, and so
+        # there is exactly one definition of "loadable" to keep in step with
+        # the framework.
+        _schema_errors = framework_schema_errors(proposed)
+        if _schema_errors:
+            return False, f"proposed skill fails the framework schema: {_schema_errors[0]}"
         if not any(line.lstrip().startswith("#") for line in proposed.splitlines()):
             return False, "proposed skill has no markdown headers - likely malformed"
         if len(proposed) < min_chars:

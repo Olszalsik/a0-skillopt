@@ -964,12 +964,32 @@ class AutoLoopThread(threading.Thread):
         src: "os.PathLike | str", skill_name: str,
         rg: dict[str, Any],
     ) -> str:
-        """Resolve a real-gate sidecar on a later tick. Decision matrix
-        (v1.8.22): fail-OPEN on 'could not measure' (not-run / failed /
-        stale — quarantining would permanently destroy good proposals on
-        a transient executor outage, the v1.8.21 head-of-line disease
-        with worse blast radius), fail-CLOSED on a real measurement
-        (regression / no-lift / insufficient lift quarantine)."""
+        """Resolve a real-gate sidecar on a later tick.
+
+        Decision matrix (corrected 2026-09-26):
+
+        - `status == "done"` + `verdict.ok` -> the gate measured. Adopt on
+          `accepted`, otherwise quarantine. Fail CLOSED either way.
+        - `status == "done"` + `verdict.ok is False` -> the gate RAN TO
+          COMPLETION and returned a verdict that did not clear the bar
+          (typically `insufficient_usable_pairs`). Quarantine. This is
+          evidence, not an absence of evidence.
+        - `status in ("failed", stale-pending, unknown)` -> no verdict was
+          ever produced. Fail OPEN, so a transient executor outage cannot
+          permanently block the drain.
+
+        Why the completed-negative case changed (2026-09-26): the previous
+        code treated every `ok=False` as "could not run" and adopted. The
+        first production real-gate run returned
+        `insufficient_usable_pairs:1 usable (2 task failures)` with
+        `status: done`, and the harvest adopted it anyway. That proposal
+        stripped the frontmatter from `usr/skills/scheduled-tasks/SKILL.md`,
+        which made the skill unloadable by the framework - and because the
+        auto-adopt path took no snapshot, it was unrecoverable. The risk is
+        asymmetric: a quarantined proposal sits in `staging/rejected/` and an
+        operator can re-approve it, whereas an adopted proposal overwrites a
+        live skill. So a completed measurement must never fail open.
+        """
         status = rg.get("status")
         verdict = rg.get("verdict") if isinstance(rg.get("verdict"), dict) else None
         stale_after = int(cfg.get("replay_real_gate_stale_after_s", 14400) or 14400)
@@ -984,10 +1004,13 @@ class AutoLoopThread(threading.Thread):
                     else f"real_gate_rejected: {verdict.get('reason', '')}"
                 )
             else:
-                # ok=False = could not run (consistent with stage 0.7's
-                # synchronous ok=False fall-through to structural).
-                adopt = True
-                note = f"real_gate_not_run: {verdict.get('reason', '')}"
+                # status == "done", so the worker finished. ok=False means the
+                # measurement did not clear the bar (e.g. too few usable
+                # replay pairs), NOT that the gate was skipped. Quarantine.
+                adopt = False
+                note = (
+                    f"real_gate_inconclusive: {verdict.get('reason', '')}"
+                )
         elif status == "failed":
             adopt = True
             note = f"real_gate_failed: {rg.get('error', '')}"
@@ -1034,7 +1057,15 @@ class AutoLoopThread(threading.Thread):
 
         if adopt:
             proposed = src.read_text(encoding="utf-8")
-            target.write_text(proposed, encoding="utf-8")
+            # v1.8.24 (P0): snapshot + atomic replace. This path previously
+            # called target.write_text() with no backup, so an unattended
+            # auto-adopt could not be rolled back.
+            _w = sleep_runner.adopt_write_skill(skill_name, proposed)
+            if not _w.get("ok"):
+                self._log(
+                    f"adopt aborted for {skill_name}: {_w.get('error')}"
+                )
+                return _w.get("error", "adopt write failed")
             try:
                 sleep_runner.clear_official_gate_marker(src)
             except Exception:
@@ -1310,7 +1341,12 @@ class AutoLoopThread(threading.Thread):
                 self._log(f"ab_harness status read failed: {e}")
 
         if ok:
-            target.write_text(proposed, encoding="utf-8")
+            # v1.8.24 (P0): snapshot + atomic replace, same reason as the
+            # real-gate harvest path above.
+            _w = sleep_runner.adopt_write_skill(skill_name, proposed)
+            if not _w.get("ok"):
+                self._log(f"adopt aborted for {skill_name}: {_w.get('error')}")
+                return _w.get("error", "adopt write failed")
             # v1.8.1: the proposal is consumed — clear its provenance marker
             # so a later manual re-adopt re-runs the full local gate.
             try:

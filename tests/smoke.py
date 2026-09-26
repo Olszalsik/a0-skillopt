@@ -224,7 +224,7 @@ def t_v110_files() -> None:
 def t_v110_byte_identical() -> None:
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers.sleep_runner import validate_proposal
-    text = "# Skill\nA 1904 char block\n```\nexample\n```\n" + "x" * 1700
+    text = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Skill\nA 1904 char block\n```\nexample\n```\n" + "x" * 1700
     ok, reason = validate_proposal(text, text, min_chars=200, min_improvement_pp=0.0, max_shrink_ratio=0.5, held_out=None)
     assert not ok, f"expected reject, got ok reason={reason!r}"
     assert "byte-identical" in reason or "no-op" in reason, f"unexpected reason: {reason!r}"
@@ -234,8 +234,8 @@ def t_v110_byte_identical() -> None:
 def t_v110_ws_normalised() -> None:
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers.sleep_runner import validate_proposal
-    a = "# Skill\nA 1904 char block\n```\nexample\n```\n" + "x" * 1700
-    b = "# Skill\nA  1904  char  block\n```\nexample\n```\n" + "x" * 1700
+    a = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Skill\nA 1904 char block\n```\nexample\n```\n" + "x" * 1700
+    b = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Skill\nA  1904  char  block\n```\nexample\n```\n" + "x" * 1700
     ok, reason = validate_proposal(a, b, min_chars=200, min_improvement_pp=0.0, max_shrink_ratio=0.5, held_out=None)
     assert not ok, f"expected reject, got ok reason={reason!r}"
     assert "whitespace" in reason or "no-op" in reason, f"unexpected reason: {reason!r}"
@@ -256,20 +256,79 @@ def t_v110_shrink() -> None:
 def t_v110_held_out() -> None:
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers.sleep_runner import validate_proposal
-    proposed = "# New Skill\nA substantially different skill body.\n```\nexample\n```\n" + "y" * 1800
-    current = "# Old Skill\nA completely different body.\n```\nexample\n```\n" + "x" * 1800
+    proposed = "---\nname: fixture\ndescription: smoke test fixture\n---\n# New Skill\nA substantially different skill body.\n```\nexample\n```\n" + "y" * 1800
+    current = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Old Skill\nA completely different body.\n```\nexample\n```\n" + "x" * 1800
     held = {"before": 0.5, "after": 0.51, "delta_pp": 1.0}  # below 5pp
     ok, reason = validate_proposal(proposed, current, min_chars=200, min_improvement_pp=5.0, max_shrink_ratio=0.5, held_out=held)
     assert not ok, f"expected reject, got ok reason={reason!r}"
     assert "held-out" in reason or "held_out" in reason, f"unexpected reason: {reason!r}"
 
 
+@test("v1.8.24: validate_proposal enforces the framework skill schema "
+       "(frontmatter is mandatory)")
+def t_v1824_schema_gate_rejects_unloadable() -> None:
+    """Regression guard for the 2026-09-25 scheduled-tasks incident.
+
+    None of the v1.1.0 structural stages parse frontmatter, so a proposal that
+    stripped it passed all nine checks and was adopted - after which the
+    framework's own validate_skill_md rejected the file and the skill silently
+    disappeared from the agent. Stage 1 must reject it first.
+    """
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner as _sr
+    except Exception:
+        from helpers import sleep_runner as _sr
+
+    FM = "---\nname: fixture\ndescription: smoke test fixture skill\n---\n\n"
+    BODY = "# Skill\n\n```example\nblock\n```\n" + "body line. " * 40
+
+    # The schema helper itself.
+    assert _sr.framework_schema_errors(FM + BODY) == [], (
+        "a skill with frontmatter must be loadable")
+    assert _sr.framework_schema_errors("# No frontmatter\n\nbody") == [
+        "Frontmatter must start at the top of the file"
+    ], "frontmatter-stripping text must be reported"
+    assert _sr.framework_schema_errors("---\nname: x\nno closing fence") == [
+        "Unterminated YAML frontmatter"
+    ]
+    assert _sr.framework_schema_errors("body only") == [
+        "Frontmatter must start at the top of the file"
+    ], "non-empty content before the fence is the framework's first error"
+    # "Missing YAML frontmatter" is only reachable when nothing precedes a
+    # fence, i.e. a document with no content at all.
+    assert _sr.framework_schema_errors("\n\n   \n") == [
+        "Missing YAML frontmatter"
+    ], "frontmatter is mandatory, so an empty document is an error not a pass"
+    # Leading blank lines are tolerated, same as the framework.
+    assert _sr.framework_schema_errors("\n\n" + FM + BODY) == []
+
+    # And the gate rejects before any other stage can approve it.
+    # ab_harness_enabled=False skips stage 0 (the A/B harness) so this pins the
+    # structural stages deterministically rather than the harness's verdict.
+    current = FM + ("# Old\n\n```example\nold\n```\n" + "old line. " * 40)
+    ok, reason = _sr.validate_proposal(
+        "# Improvement without frontmatter\n\n```example\nnew\n```\n" + "new. " * 60,
+        current, skill_name="v1824_schema", ab_harness_enabled=False,
+    )
+    assert not ok, "the gate must reject a proposal with no frontmatter"
+    assert "framework schema" in reason, f"unexpected reason: {reason!r}"
+
+    # A legitimate edit to a loadable skill still passes.
+    ok2, reason2 = _sr.validate_proposal(
+        FM + "# Improved\n\n```example\nnew\n```\n" + "improved. " * 60,
+        current, skill_name="v1824_schema", ab_harness_enabled=False,
+    )
+    assert ok2, f"a valid rewrite must still be accepted, got {reason2!r}"
+
+    _ok("schema gate rejects unloadable proposals, accepts loadable ones")
+
+
 @test("v1.1.0: validate_proposal accepts a good proposal with passing held-out")
 def t_v110_pass() -> None:
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers.sleep_runner import validate_proposal
-    proposed = "# New Skill\nA substantially different skill body.\n```\nexample\n```\n" + "y" * 1800
-    current = "# Old Skill\nA completely different body.\n```\nexample\n```\n" + "x" * 1800
+    proposed = "---\nname: fixture\ndescription: smoke test fixture\n---\n# New Skill\nA substantially different skill body.\n```\nexample\n```\n" + "y" * 1800
+    current = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Old Skill\nA completely different body.\n```\nexample\n```\n" + "x" * 1800
     held = {"before": 0.4, "after": 0.5, "delta_pp": 10.0}
     ok, reason = validate_proposal(proposed, current, min_chars=200, min_improvement_pp=5.0, max_shrink_ratio=0.5, held_out=held)
     assert ok, f"expected accept, got reject reason={reason!r}"
@@ -565,7 +624,7 @@ def t_v120_gate_intact() -> None:
     # blocks (the engine always emits one) - include them in both
     # baseline and new so we're testing the gate semantics, not the
     # example-block presence check.
-    text = "# Skill\n```\nabcdefghij\n```\n" + ("abcdefghij\n" * 190)
+    text = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Skill\n```\nabcdefghij\n```\n" + ("abcdefghij\n" * 190)
     # 1. byte identical
     ok, _ = validate_proposal(text, text, min_chars=200, min_improvement_pp=0.0, max_shrink_ratio=0.5, held_out=None)
     assert not ok, "byte-identical no longer rejected"
@@ -574,7 +633,7 @@ def t_v120_gate_intact() -> None:
     ok, _ = validate_proposal(text2, text, min_chars=200, min_improvement_pp=0.0, max_shrink_ratio=0.5, held_out=None)
     assert not ok, "whitespace-normalised identical no longer rejected"
     # 3. good proposal with passing held-out still passes
-    new = "# Skill v2\n```\nrefactored body\n```\n" + ("xyz\n" * 600)
+    new = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Skill v2\n```\nrefactored body\n```\n" + ("xyz\n" * 600)
     held = {"before": 0.3, "after": 0.4, "delta_pp": 10.0}
     ok, reason = validate_proposal(new, text, min_chars=200, min_improvement_pp=5.0, max_shrink_ratio=0.5, held_out=held)
     assert ok, f"good proposal with passing held-out now rejected: {reason!r}"
@@ -719,8 +778,8 @@ def t_v121_judge_via_http() -> None:
         try:
             result = ab_harness.run_paired_test(
                 skill_name="v121_http_judge",
-                proposed_text="# New\n```\nabc\n```\n" + ("x\n" * 300),
-                current_text="# Old\n```\ndef\n```\n" + ("y\n" * 300),
+                proposed_text="---\nname: fixture\ndescription: smoke test fixture\n---\n# New\n```\nabc\n```\n" + ("x\n" * 300),
+                current_text="---\nname: fixture\ndescription: smoke test fixture\n---\n# Old\n```\ndef\n```\n" + ("y\n" * 300),
                 n=6,
             )
         finally:
@@ -1045,7 +1104,7 @@ def t_v121_gate_no_skill_path() -> None:
     compat test for the fragment store."""
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers import sleep_runner  # type: ignore
-    text = "# Skill\n```\nabcdefghij\n```\n" + ("abcdefghij\n" * 190)
+    text = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Skill\n```\nabcdefghij\n```\n" + ("abcdefghij\n" * 190)
     # Without skill_path, byte-identical must be rejected
     ok, _ = sleep_runner.validate_proposal(
         text, text, min_chars=200, min_improvement_pp=0.0,
@@ -1199,8 +1258,8 @@ def t_v121_harness_no_rollouts() -> None:
         # written by other tests in the same run.
         result = ab_harness.run_paired_test(
             skill_name="definitely_no_such_skill_v121_xyz",
-            proposed_text="# Proposed\n```\nexample\n```\nbody body body\n" * 50,
-            current_text="# Current\n```\nexample\n```\nbody body body\n" * 50,
+            proposed_text="---\nname: fixture\ndescription: smoke test fixture\n---\n# Proposed\n```\nexample\n```\nbody body body\n" * 50,
+            current_text="---\nname: fixture\ndescription: smoke test fixture\n---\n# Current\n```\nexample\n```\nbody body body\n" * 50,
         )
         assert result["samples"] == 0
         assert result["can_run"] is False
@@ -1232,8 +1291,8 @@ def t_v121_harness_judge_unreachable() -> None:
         try:
             result = ab_harness.run_paired_test(
                 skill_name="v121_skill_judge_broken",
-                proposed_text="# Proposed\n```\nex\n```\n" + ("body\n" * 60),
-                current_text="# Current\n```\nex\n```\n" + ("body\n" * 60),
+                proposed_text="---\nname: fixture\ndescription: smoke test fixture\n---\n# Proposed\n```\nex\n```\n" + ("body\n" * 60),
+                current_text="---\nname: fixture\ndescription: smoke test fixture\n---\n# Current\n```\nex\n```\n" + ("body\n" * 60),
             )
             assert result["can_run"] is True, "harness should have run with 6 rollouts"
             assert result["passed"] is False, "harness must fail closed when judge raises"
@@ -1260,8 +1319,8 @@ def t_v121_harness_counts_wins() -> None:
         try:
             result = ab_harness.run_paired_test(
                 skill_name="v121_skill_counts",
-                proposed_text="# Proposed\n```\nex\n```\n" + ("body\n" * 80),
-                current_text="# Current\n```\nex\n```\n" + ("body\n" * 80),
+                proposed_text="---\nname: fixture\ndescription: smoke test fixture\n---\n# Proposed\n```\nex\n```\n" + ("body\n" * 80),
+                current_text="---\nname: fixture\ndescription: smoke test fixture\n---\n# Current\n```\nex\n```\n" + ("body\n" * 80),
             )
             assert result["can_run"] is True
             assert result["wins"] == result["samples"], \
@@ -1294,8 +1353,8 @@ def t_v121_harness_rejects_loss() -> None:
         try:
             result = ab_harness.run_paired_test(
                 skill_name="v121_skill_loser",
-                proposed_text="# Proposed\n```\nex\n```\n" + ("body\n" * 80),
-                current_text="# Current\n```\nex\n```\n" + ("body\n" * 80),
+                proposed_text="---\nname: fixture\ndescription: smoke test fixture\n---\n# Proposed\n```\nex\n```\n" + ("body\n" * 80),
+                current_text="---\nname: fixture\ndescription: smoke test fixture\n---\n# Current\n```\nex\n```\n" + ("body\n" * 80),
             )
             assert result["can_run"] is True
             assert result["passed"] is False, "harness should reject losing proposals"
@@ -1367,8 +1426,8 @@ def t_v121_gate_rejects_loser() -> None:
     try:
         rollouts = _write_fake_rollouts("v121_skill_gate_loser", n=8)
         try:
-            current = "# Current\n```\nex\n```\n" + ("body\n" * 80)
-            proposed = "# Proposed\n```\nex\n```\n" + ("better body\n" * 100)
+            current = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Current\n```\nex\n```\n" + ("body\n" * 80)
+            proposed = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Proposed\n```\nex\n```\n" + ("better body\n" * 100)
             ok, reason = validate_proposal(
                 proposed, current, min_chars=200, min_improvement_pp=0.0,
                 max_shrink_ratio=0.5, held_out=None,
@@ -1406,8 +1465,8 @@ def t_v121_gate_falls_through_when_no_data() -> None:
     _orig_rd = ab_harness._rollouts_dir
     ab_harness._rollouts_dir = lambda: Path(_tmp_rd.name)
     try:
-        current = "# Current\n```\nex\n```\n" + ("abcdefghij\n" * 30)
-        proposed = "# Proposed v2\n```\nrefactored\n```\n" + ("xyz\n" * 600)
+        current = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Current\n```\nex\n```\n" + ("abcdefghij\n" * 30)
+        proposed = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Proposed v2\n```\nrefactored\n```\n" + ("xyz\n" * 600)
         held = {"before": 0.3, "after": 0.5, "delta_pp": 20.0}
         ok, reason = validate_proposal(
             proposed, current, min_chars=200, min_improvement_pp=5.0,
@@ -1433,8 +1492,8 @@ def t_v121_gate_backward_compat() -> None:
         return {"verdict": "lose", "confidence": 0.9, "reason": "forced"}
     ab_harness.set_judge_fn(always_lose)
     try:
-        current = "# Current\n```\nex\n```\n" + ("abcdefghij\n" * 30)
-        proposed = "# Proposed v2\n```\nrefactored\n```\n" + ("xyz\n" * 600)
+        current = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Current\n```\nex\n```\n" + ("abcdefghij\n" * 30)
+        proposed = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Proposed v2\n```\nrefactored\n```\n" + ("xyz\n" * 600)
         held = {"before": 0.3, "after": 0.5, "delta_pp": 20.0}
         # No skill_name -> harness stage is skipped, structural gate runs unchanged
         ok, reason = validate_proposal(
@@ -3248,8 +3307,8 @@ def t_v160_official_fallback() -> None:
 def t_v160_official_gated_skips_heldout() -> None:
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers.sleep_runner import validate_proposal
-    proposed = "# New Skill\nA substantially different body.\n```\nexample\n```\n" + "y" * 1800
-    current = "# Old Skill\nA completely different body.\n```\nexample\n```\n" + "x" * 1800
+    proposed = "---\nname: fixture\ndescription: smoke test fixture\n---\n# New Skill\nA substantially different body.\n```\nexample\n```\n" + "y" * 1800
+    current = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Old Skill\nA completely different body.\n```\nexample\n```\n" + "x" * 1800
     held = {"before": 0.5, "after": 0.51, "delta_pp": 1.0}  # below 5pp -> normally rejects
     # Without official_gated: rejects on held-out
     ok, reason = validate_proposal(
@@ -3270,7 +3329,7 @@ def t_v160_official_gated_keeps_structural() -> None:
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers.sleep_runner import validate_proposal
     # Byte-identical must still reject even when official_gated
-    text = "# Skill\nA 1904 char block\n```\nexample\n```\n" + "x" * 1700
+    text = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Skill\nA 1904 char block\n```\nexample\n```\n" + "x" * 1700
     ok, reason = validate_proposal(
         text, text, min_chars=200, min_improvement_pp=5.0,
         max_shrink_ratio=0.5, held_out=None, official_gated=True,
@@ -3924,8 +3983,8 @@ def t_c2_validate_proposal_local_gate_rejects() -> None:
         # Current skill's directive keywords (refactor/module/nested/groups)
         # overlap the rollout task text -> high score. Proposed skill's
         # keywords (cooking/bake/cake) do not -> low score -> regression.
-        current = "# Refactor Module\n**nested groups** parse trees\n\n```example\nrefactor module\n```\n" + ("x" * 180)
-        proposed = "# Cooking Recipes\n**bake cake** slowly\n\n```example\nbake a cake\n```\n" + ("y" * 180)
+        current = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Refactor Module\n**nested groups** parse trees\n\n```example\nrefactor module\n```\n" + ("x" * 180)
+        proposed = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Cooking Recipes\n**bake cake** slowly\n\n```example\nbake a cake\n```\n" + ("y" * 180)
         ok, reason = validate_proposal(
             proposed, current, min_chars=200, min_improvement_pp=5.0,
             max_shrink_ratio=0.5, held_out=None, skill_name=skill,
@@ -3957,8 +4016,8 @@ def t_c2_validate_proposal_official_gated_skips_replay() -> None:
     skill = "c2_replay_skill_6"
     rollouts = _write_fake_rollouts(skill, n=3)
     try:
-        current = "# Refactor Module\n**nested groups** parse trees\n\n```example\nrefactor module\n```\n" + ("x" * 180)
-        proposed = "# Cooking Recipes\n**bake cake** slowly\n\n```example\nbake a cake\n```\n" + ("y" * 180)
+        current = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Refactor Module\n**nested groups** parse trees\n\n```example\nrefactor module\n```\n" + ("x" * 180)
+        proposed = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Cooking Recipes\n**bake cake** slowly\n\n```example\nbake a cake\n```\n" + ("y" * 180)
         ok, reason = validate_proposal(
             proposed, current, min_chars=200, min_improvement_pp=5.0,
             max_shrink_ratio=0.5, held_out=None, skill_name=skill,
@@ -4027,10 +4086,19 @@ def _c3_cleanup_fragments(skill_names):
 
 
 def _c3_valid_skill_md(seed: str) -> str:
-    """A structurally valid SKILL.md proposal (>=200 chars, headers,
-    example block) the gate will accept. Distinct per seed so proposed !=
-    current and not whitespace-identical."""
+    """A structurally valid SKILL.md proposal the gate will accept.
+
+    Valid means: YAML frontmatter at the top (mandatory since v1.8.24 - the
+    framework's own validate_skill_md rejects a SKILL.md without it, so a
+    proposal that drops it is unloadable), >=200 chars, markdown headers, and
+    an example block. Distinct per seed so proposed != current and they are
+    not whitespace-identical.
+    """
     return (
+        "---\n"
+        f"name: {seed}\n"
+        "description: smoke test fixture skill\n"
+        "---\n\n"
         f"# {seed} Skill v2\n\n"
         "```example\n# example block\n```\n\n"
         + (f"{seed} body line that is long enough to pass the gate. " * 12)
@@ -4161,7 +4229,7 @@ def t_c3_rollback_restores_default() -> None:
     tmp_skills = Path(tempfile.mkdtemp(prefix="skillopt_c3_rb_"))
     os.environ["SKILLOPT_SKILLS_DIR"] = str(tmp_skills)
     skill = "c3_rollback"
-    original = "# Original Skill\n\n```example\norig\n```\n" + "original line\n" * 40
+    original = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Original Skill\n\n```example\norig\n```\n" + "original line\n" * 40
     target = tmp_skills / skill / "SKILL.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(original, encoding="utf-8")
@@ -4876,8 +4944,8 @@ def t_v18_call_site_real_when_enabled() -> None:
     old_ab = os.environ.pop("SKILLOPT_AB_HARNESS_ENABLED", None)
     skill = "v18_callsite_skill"
     rollouts = _write_fake_rollouts(skill, n=3)
-    current = "# Refactor Module\n**nested groups**\n\n```example\nrefactor module\n```\n" + ("x" * 180)
-    proposed = "# Refactor Module v2\n**nested groups deeper**\n\n```example\nrefactor module\n```\n" + ("y" * 180)
+    current = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Refactor Module\n**nested groups**\n\n```example\nrefactor module\n```\n" + ("x" * 180)
+    proposed = "---\nname: fixture\ndescription: smoke test fixture\n---\n# Refactor Module v2\n**nested groups deeper**\n\n```example\nrefactor module\n```\n" + ("y" * 180)
 
     captured = {}
 
@@ -6106,6 +6174,10 @@ def t_v1821_auto_adopt_drains_staged() -> None:
             good_name = "v1821_drain_good"
             good = stage / (good_name + ".md")
             good_text = (
+                "---\n"
+                f"name: {good_name}\n"
+                "description: smoke test fixture skill\n"
+                "---\n\n"
                 "# Improved skill\n\n## New section\n\n```python\nprint('x')\n```\n"
                 + "x" * 300
             )
@@ -6313,9 +6385,16 @@ def _real_gate_env(tmpdir: Path):
 
 
 def _v1822_valid_proposal(name: str, stage: Path) -> Path:
-    """A structurally-valid proposal (headers + example block + length)."""
+    """A structurally-valid proposal: frontmatter, headers, example block,
+    length. Frontmatter is mandatory since v1.8.24 - a proposal without it is
+    unloadable by the framework, so the gate rejects it before the real-gate
+    matrix under test ever runs."""
     src = stage / (name + ".md")
     src.write_text(
+        "---\n"
+        f"name: {name}\n"
+        "description: smoke test fixture skill\n"
+        "---\n\n"
         "# Improved skill\n\n## New section\n\n```python\nprint('x')\n```\n"
         + "x" * 300,
         encoding="utf-8",
@@ -6372,7 +6451,7 @@ def t_v1822_mock_advisory_validate() -> None:
         Path.read_text = _fake_read_text
         try:
             current = "# Unrelated\n\nBody."
-            proposed = "# alpha beta gamma\n\n```python\nx=1\n```\n" + "z" * 300
+            proposed = "---\nname: fixture\ndescription: smoke test fixture\n---\n# alpha beta gamma\n\n```python\nx=1\n```\n" + "z" * 300
             # (a) async gate on: executor MUST be mock even with the real
             # executor enabled (the async stage owns real confirmation).
             def _spy(**kw):
@@ -6640,22 +6719,47 @@ def t_v1822_real_gate_harvest_quarantine() -> None:
     _ok("harvest quarantines on rejected real verdict (sidecar travels)")
 
 
-@test("v1.8.22: harvest fail-opens on not-run / failed sidecars (loud, adopt)")
-def t_v1822_real_gate_harvest_fail_open() -> None:
+@test("v1.8.24: harvest fails CLOSED on a completed negative verdict, "
+       "open only when no verdict was produced")
+def t_v1824_real_gate_harvest_decision_matrix() -> None:
+    """Regression guard for the 2026-09-25 scheduled-tasks incident.
+
+    The `inconclusive` row below is the exact sidecar that destroyed
+    usr/skills/scheduled-tasks/SKILL.md: the worker finished (`status: done`),
+    returned a verdict that did not clear the bar (`ok: false`,
+    `insufficient_usable_pairs`), and the old matrix read every `ok=False` as
+    "could not run" and adopted anyway. A completed measurement is evidence,
+    not an absence of evidence.
+
+    Fail-open is now reserved for the case it was written for: the worker
+    never produced a verdict at all.
+    """
     import shutil
     import tempfile
     from helpers import sleep_runner as _sr, auto_loop as _al
-    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1822_failopen_"))
+
+    # (variant, status, verdict, expected_outcome, expected_marker)
+    CASES = (
+        ("accepted", "done", {"ok": True, "accepted": True, "reason": "lift 7pp"},
+         "adopted", "real_gate_accepted"),
+        ("measured_reject", "done", {"ok": True, "accepted": False, "reason": "regression"},
+         "quarantined", "real_gate_rejected"),
+        # THE INCIDENT: completed run, verdict below the bar -> quarantine.
+        ("inconclusive", "done",
+         {"ok": False, "reason": "insufficient_usable_pairs:1 usable (2 task failures)"},
+         "quarantined", "real_gate_inconclusive"),
+        # No verdict ever produced -> fail open, so a transient outage in the
+        # executor cannot permanently block the drain.
+        ("failed", "failed", None, "adopted", "real_gate_failed"),
+        ("unknown", "weird", None, "adopted", "real_gate_unknown_status"),
+    )
+
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1824_matrix_"))
     try:
-        for variant, status, verdict, marker in (
-            ("notrun", "done", {"ok": False, "reason": "insufficient_usable_pairs:1 usable (2 task failures)"},
-             "real_gate_not_run"),
-            ("failed", "failed", None, "real_gate_failed"),
-        ):
+        for variant, status, verdict, expected, marker in CASES:
             with _real_gate_env(tmp) as env:
-                stage = env["stage"]
-                skills = env["skills"]
-                name = f"v1822_failopen_{variant}"
+                stage, skills = env["stage"], env["skills"]
+                name = f"v1824_matrix_{variant}"
                 _v1822_optin(tmp, name)
                 src = _v1822_valid_proposal(name, stage)
                 payload = {
@@ -6671,15 +6775,22 @@ def t_v1822_real_gate_harvest_fail_open() -> None:
                 _sr.write_real_gate_sidecar(src, payload)
                 cfg = dict(_V1822_RG_CFG)
                 thread = _al.AutoLoopThread(get_config=lambda: cfg)
-                outcome = thread._adopt_one(state := {}, cfg, src)
-                assert outcome == "adopted", f"{variant}: expected fail-open adopt, got {outcome!r}"
-                assert (skills / name / "SKILL.md").is_file()
+                outcome = thread._adopt_one({}, cfg, src)
+                assert outcome == expected, (
+                    f"{variant}: expected {expected!r}, got {outcome!r}")
+                live = (skills / name / "SKILL.md")
+                if expected == "adopted":
+                    assert live.is_file(), f"{variant}: live skill was not written"
+                else:
+                    assert not live.is_file(), (
+                        f"{variant}: a quarantined proposal must NOT overwrite "
+                        f"the live skill")
                 audit = env["runs"] / "adoptions.log"
                 assert marker in audit.read_text(encoding="utf-8"), (
                     f"{variant}: expected {marker} note in adoptions.log")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    _ok("harvest fail-opens on not-run/failed sidecars")
+    _ok("harvest decision matrix: closed on a completed verdict, open on none")
 
 
 @test("v1.8.22: stale + grace window handling of pending sidecars")

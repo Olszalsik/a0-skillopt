@@ -4,6 +4,107 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.24] - 2026-09-26
+
+### Fix: a partial upgrade of the install could not adopt an unloadable skill
+
+An auto-adopted proposal stripped the YAML frontmatter from
+`usr/skills/scheduled-tasks/SKILL.md`, after which the framework's own
+`validate_skill_md` rejected the file and the skill silently disappeared from
+the agent. Three independent defects combined to allow it.
+
+#### 1. A completed real-gate verdict was treated as no verdict
+
+`_harvest_real_gate` assumed every `ok=False` meant "could not run" and
+adopted. The sidecar that caused the incident was:
+
+```json
+{ "status": "done", "gate_passed": false,
+  "verdict": { "ok": false, "reason": "insufficient_usable_pairs:1 usable (2 task failures)" } }
+```
+
+The worker **ran to completion** and returned a verdict that did not clear the
+bar. A completed measurement is evidence, not an absence of evidence.
+
+The matrix is now:
+
+| sidecar | outcome |
+|---|---|
+| `done` + `ok:true` + `accepted` | adopt |
+| `done` + `ok:true` + rejected | quarantine |
+| `done` + `ok:false` | **quarantine** (was: adopt) |
+| `failed` / stale / unknown status | adopt (no verdict was produced) |
+
+Fail-open is reserved for the case it was written for: the worker never
+produced a verdict. The risk is asymmetric — a quarantined proposal sits in
+`staging/rejected/` and an operator can re-approve it, whereas an adopted
+proposal overwrites a live skill.
+
+#### 2. No stage validated the frontmatter
+
+`validate_proposal`'s nine stages check emptiness, headers, length, example
+block, byte/whitespace equality and shrink ratio. **None parse YAML
+frontmatter**, so a proposal that dropped it passed every stage. A new stage
+runs first and delegates to the framework's own `helpers.skills.split_frontmatter`
+(falling back to an equivalent local implementation when that module cannot be
+imported, and failing closed if neither can run).
+
+#### 3. The auto-adopt paths took no snapshot and wrote non-atomically
+
+Only `api/adopt.py` snapshotted. Both auto-loop paths and the agent-callable
+`skillopt_sleep` tool overwrote the live skill with `Path.write_text` and no
+backup — which is why the damage was unrecoverable via `/rollback`, and why a
+kill mid-write would leave a half-written skill document. All three now go
+through `sleep_runner.adopt_write_skill()`, which snapshots first (refusing to
+overwrite if the snapshot fails) and then replaces atomically via a temp file.
+
+#### 4. Root cause: the generator was never told to keep the frontmatter
+
+The gate alone would have blocked *all* evolution. Auditing `staging/`,
+**32 of 32** existing proposals were missing their frontmatter block.
+`direct_optimizer`'s system prompt said only *"output ONLY the improved skill
+document"*, which reads as "rewrite the prose", so the model consistently
+discarded the metadata. Fixed at the source:
+
+- the system prompt now requires the frontmatter block be reproduced
+  byte-for-byte at the top, and states that compressing the body does not
+  license touching metadata;
+- `restore_frontmatter()` re-attaches the original block when a model drops it
+  anyway. `name` and `description` are identity, not prose, so the optimizer
+  should not be rewriting them.
+
+#### Recovery
+
+`usr/skills/scheduled-tasks/SKILL.md` was restored from the tracked source at
+`skills/scheduled-tasks/SKILL.md` and verified byte-identical. The proposal
+that damaged it is quarantined in `staging/rejected/` and renamed
+`.INVALID-FRONTMATTER` so a re-scan cannot pick it up.
+
+#### Tests
+
+Two regression tests added, and both are the incident reproduced:
+
+- `v1.8.24: validate_proposal enforces the framework skill schema` — asserts
+  the helper's error strings and that the gate rejects the actual proposal
+  that caused the incident, while still accepting a valid rewrite;
+- `v1.8.24: harvest fails CLOSED on a completed negative verdict, open only
+  when no verdict was produced` — the full five-row decision matrix, and it
+  asserts a quarantined proposal does **not** overwrite the live skill.
+
+Suite: 184 tests, 183 passing. The single failure is the pre-existing
+`v1.8.5 SECURITY: apply ... atomic 0600` test, which asserts POSIX permission
+bits and cannot pass on Windows. `v1.8.16` (judge limiter throttle pacing) is
+timing-sensitive and flakes independently of this change.
+
+#### Housekeeping
+
+- `fragments/` is now gitignored wholesale. It is pre-adopt snapshot state —
+  the same class as `staging/` and `logs/` — but only two sub-patterns were
+  ignored, so ~400 test-generated directories surfaced as untracked noise. A
+  snapshot is a copy of a live user skill file and must never be committed.
+
+---
+
 ## [1.8.23] - 2026-09-24
 
 ### Fix: first real-gate run diagnosed — timeout under-budget + honest sidecar labeling

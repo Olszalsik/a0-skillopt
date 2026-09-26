@@ -169,7 +169,19 @@ class SkilloptSleep(Tool):
                 ),
                 break_loop=False,
             )
-        target.write_text(proposed, encoding="utf-8")
+        # v1.8.24 (P0): snapshot + atomic replace. This path had neither, and
+        # it is agent-callable, so an unguarded write here is the same
+        # unrecoverable case the auto-loop had.
+        _w = sleep_runner.adopt_write_skill(skill_name, proposed)
+        if not _w.get("ok"):
+            return Response(
+                message=(
+                    f"Adoption ABORTED for skill `{skill_name}`.\n"
+                    f"  error: {_w.get('error')}\n"
+                    f"  The live SKILL.md was left untouched."
+                ),
+                break_loop=False,
+            )
         # v1.8.1: proposal consumed — clear its provenance marker.
         try:
             sleep_runner.clear_official_gate_marker(src)

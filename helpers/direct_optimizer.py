@@ -113,7 +113,15 @@ _OPTIMIZER_SYSTEM = (
     "You are an expert at improving Agent Zero skill documents. You receive "
     "the current skill, a list of successful uses, and a list of failed uses. "
     "You output ONLY the improved skill document - no preamble, no explanation, "
-    "no markdown fences."
+    "no markdown fences.\n\n"
+    "MANDATORY - YAML frontmatter. The document starts with a `---` fenced YAML "
+    "block containing at least `name` and `description`. You MUST reproduce "
+    "that block at the very top of your output, byte-for-byte, before any other "
+    "content. Do not add, rename, reorder or drop any frontmatter key. The "
+    "framework refuses to load a SKILL.md whose frontmatter is missing or is "
+    "not the first thing in the file, so a document without it is worse than "
+    "useless - it makes the skill invisible to the agent. Compress the BODY "
+    "only; the frontmatter is metadata, not prose."
 )
 
 
@@ -220,6 +228,42 @@ def _extract_skill_text(llm_response: str) -> str:
     return text.strip()
 
 
+def _split_frontmatter(text: str) -> tuple[str, str]:
+    """Return (frontmatter_block_including_fences, remainder). ('\n', text) when absent."""
+    lines = (text or "").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return ("", text or "")
+    for index in range(1, len(lines)):
+        if lines[index].strip() == "---":
+            return ("\n".join(lines[: index + 1]) + "\n", "\n".join(lines[index + 1 :]))
+    return ("", text or "")
+
+
+def restore_frontmatter(current: str, improved: str) -> str:
+    """Re-attach the current skill's frontmatter if the model dropped it.
+
+    v1.8.24. The optimizer is told to output "only the improved skill
+    document", which reads to the model as "rewrite the prose" - and every
+    staged proposal in this plugin's history had lost its YAML block as a
+    result (32 of them, audited 2026-09-26). Since the framework refuses to
+    load a SKILL.md whose frontmatter is missing, such a proposal is not a
+    worse rewrite, it is a skill the agent can no longer see.
+
+    `name` and `description` are identity, not prose: the optimizer has no
+    business changing them, so when it omits the block the original is
+    restored verbatim rather than the optimization being thrown away. The
+    framework-schema gate in `sleep_runner.validate_proposal` remains the
+    backstop for the case this cannot repair.
+    """
+    improved_fm, _improved_body = _split_frontmatter(improved)
+    if improved_fm.strip():
+        return improved  # model kept it; nothing to do
+    current_fm, _current_body = _split_frontmatter(current)
+    if not current_fm.strip():
+        return improved  # nothing to restore from
+    return current_fm.rstrip("\n") + "\n\n" + (improved or "").lstrip("\n")
+
+
 def _write_critique(skill_name: str, current: str, improved: str, successes: int, failures: int, model: str) -> Path | None:
     """Write a human-readable critique file alongside the staged proposal.
 
@@ -313,6 +357,10 @@ def optimize_skill(skill_name: str, min_rollouts: int = 3, model: str | None = N
     improved = _extract_skill_text(improved)
     if not improved or len(improved) < 100:
         return {"ok": False, "skill": skill_name, "reason": f"LLM output too short ({len(improved)} chars)"}
+
+    # v1.8.24: the model routinely drops the YAML frontmatter, which makes the
+    # proposal unloadable. Put it back rather than discarding the rewrite.
+    improved = restore_frontmatter(current_skill, improved)
 
     staging_path = sleep_runner.staging_dir() / f"{skill_name}.md"
     staging_path.write_text(improved, encoding="utf-8")
