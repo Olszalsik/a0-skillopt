@@ -383,6 +383,20 @@ class AutoLoopThread(threading.Thread):
         if use_official:
             try:
                 from usr.plugins.skillopt.helpers import official_adapter  # type: ignore
+                # v1.8.28: self-heal durability. Only /a0 is bind-mounted, so
+                # /opt/venv-a0 loses the engine on every rebuild; the plugin
+                # re-installs it rather than silently reverting to direct.
+                # ensure_engine() is a no-op when the engine is already
+                # importable and rate-limited after a failure, so this costs
+                # nothing on a healthy install.
+                oa_ensure = getattr(official_adapter, "ensure_engine", None)
+                if callable(oa_ensure):
+                    healed = oa_ensure()
+                    if not healed.get("available"):
+                        self._log(
+                            f"auto-loop: official engine unavailable for {skill!r} "
+                            f"({healed.get('reason')}); using direct_optimizer"
+                        )
                 probe = official_adapter.probe_official()
             except Exception as e:
                 self._log(f"official_adapter import/probe failed: {e}; using direct")
@@ -931,6 +945,9 @@ class AutoLoopThread(threading.Thread):
             str(float(cfg.get("gate_min_improvement_pp", 5.0) or 0.0)),
             "--replay-min-n", str(min_n),
         ]
+        if str(cfg.get("replay_evalkit_enabled", False)).strip().lower() in {
+                "1", "true", "yes", "on"}:
+            knobs.append("--evalkit")
         try:
             launched = sleep_runner.launch_real_gate_worker(
                 skill_name=skill_name,

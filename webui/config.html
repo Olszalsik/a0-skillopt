@@ -189,6 +189,40 @@
     <small style="opacity: 0.8;">The optimizer LLM is separate from the agent's chat LLM. Set AZURE_OPENAI_API_KEY / ANTHROPIC_API_KEY in your env, or run the <code>skillopt_setup</code> tool once to auto-translate A0's existing env vars.</small>
   </div>
 
+  <!-- ROLLOUT PRIVACY -->
+  <div class="so-card">
+    <h4>Rollout privacy</h4>
+    <label style="display: block; margin: 6px 0;">
+      <input type="checkbox" x-model="cfg.privacy_redact_secrets" />
+      <strong>Redact common credential patterns</strong>
+    </label>
+    <small style="display: block; opacity: 0.8;">Best-effort protection for new rollouts, direct model prompts, the official-engine bridge, and real replay. This does not detect every secret or personal detail.</small>
+    <label style="display: block; margin: 8px 0 0 0;">
+      <input type="checkbox" x-model="cfg.privacy_include_tool_args" />
+      Include tool arguments in new rollouts
+    </label>
+    <label style="display: block; margin: 6px 0 0 0;">
+      <input type="checkbox" x-model="cfg.privacy_include_tool_results" />
+      Include tool results in new rollouts
+    </label>
+    <small style="display: block; margin-top: 8px; opacity: 0.7;">Arguments and results are excluded by default. When enabled, common credential patterns are still redacted if redaction is on. Existing rollout files are not rewritten.</small>
+    <small x-show="privacyStatus.available" style="display: block; margin-top: 8px;">
+      Effective: redaction <strong x-text="privacyStatus.redact_secrets ? 'on' : 'off'"></strong>;
+      args <strong x-text="privacyStatus.include_tool_args ? 'included' : 'excluded'"></strong>;
+      results <strong x-text="privacyStatus.include_tool_results ? 'included' : 'excluded'"></strong>.
+    </small>
+  </div>
+
+  <!-- OPTIONAL PAIRED EVALUATION -->
+  <div class="so-card">
+    <h4>Paired replay report</h4>
+    <label style="display: block; margin: 6px 0;">
+      <input type="checkbox" x-model="cfg.replay_evalkit_enabled" />
+      Attach the official SkillOpt evalkit report to completed real-gate records
+    </label>
+    <small style="display: block; opacity: 0.8;">Uses the already-scored current/proposed task pairs. Requires an installed skillopt_sleep version with evalkit support. The report is informational and cannot change the gate or adoption result.</small>
+  </div>
+
   <!-- SAVE -->
   <div class="so-card">
     <div class="so-row">
@@ -217,6 +251,10 @@ function skilloptSettings() {
       auto_loop_skill_target: '',
       auto_adopt: false,
       backend: 'auto',
+      privacy_redact_secrets: true,
+      privacy_include_tool_args: false,
+      privacy_include_tool_results: false,
+      replay_evalkit_enabled: false,
     },
     skills: [],
     rollouts: 0,
@@ -224,6 +262,7 @@ function skilloptSettings() {
     stagedProposals: [],
     govState: {},
     loopState: {},
+    privacyStatus: { available: false },
 
     async init() {
       await this.refresh();
@@ -254,6 +293,7 @@ function skilloptSettings() {
         this.skills = (s && s.skills_available) || [];
         this.rollouts = (s && s.rollout_count) || 0;
         this.staged = (s && s.staged_proposals) ? s.staged_proposals.length : 0;
+        this.privacyStatus = (s && s.privacy) || { available: false };
       } catch (e) { this.setMsg('status: ' + e, false); }
       try {
         // v1.8.18 (P0, audit RC1): read config via GET. api() defaults to

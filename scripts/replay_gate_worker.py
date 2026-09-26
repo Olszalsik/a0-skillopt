@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import subprocess
 import sys
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -69,6 +72,81 @@ def _write_sidecar(sidecar: Path, payload: dict) -> None:
     tmp.replace(sidecar)
 
 
+def _evalkit_report(per_task: list[dict]) -> dict:
+    """Run upstream's optional paired evalkit over already-scored pairs.
+
+    This is a post-hoc report only. Any discovery, input, timeout, or CLI
+    failure is recorded as unavailable and cannot change the gate verdict.
+    """
+    pairs = []
+    seen = set()
+    for row in per_task:
+        task_id = row.get("id")
+        a = row.get("current")
+        b = row.get("proposed")
+        if not isinstance(task_id, str) or not task_id or task_id in seen:
+            return {"available": False, "reason": "invalid_or_duplicate_task_ids"}
+        if (isinstance(a, bool) or isinstance(b, bool)
+                or not isinstance(a, (int, float)) or not isinstance(b, (int, float))
+                or not math.isfinite(a) or not math.isfinite(b)
+                or not 0 <= a <= 1 or not 0 <= b <= 1):
+            return {"available": False, "reason": "invalid_paired_scores"}
+        seen.add(task_id)
+        pairs.append((task_id, float(a), float(b)))
+    if not pairs:
+        return {"available": False, "reason": "no_paired_scores"}
+
+    command = [sys.executable, "-m", "skillopt_sleep.evalkit"]
+    try:
+        help_result = subprocess.run(
+            command + ["--help"], capture_output=True, text=True, timeout=15,
+            check=False,
+        )
+    except Exception as exc:
+        return {"available": False, "reason": "capability_probe_failed:" + type(exc).__name__}
+    help_text = (help_result.stdout or "") + (help_result.stderr or "")
+    required = (
+        "--manifest", "--a", "--b", "--allow-graded", "--boot", "--seed", "--json"
+    )
+    if help_result.returncode != 0 or any(flag not in help_text for flag in required):
+        return {"available": False, "reason": "installed_evalkit_missing_required_options"}
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="skillopt-evalkit-") as tmp_dir:
+            tmp = Path(tmp_dir)
+            manifest = tmp / "manifest.json"
+            arm_a = tmp / "current.json"
+            arm_b = tmp / "proposed.json"
+            manifest.write_text(json.dumps([p[0] for p in pairs]), encoding="utf-8")
+            arm_a.write_text(json.dumps({p[0]: p[1] for p in pairs}), encoding="utf-8")
+            arm_b.write_text(json.dumps({p[0]: p[2] for p in pairs}), encoding="utf-8")
+            result = subprocess.run(
+                command + [
+                    "--manifest", str(manifest), "--a", str(arm_a),
+                    "--b", str(arm_b), "--allow-graded", "--boot", "10000",
+                    "--seed", "42", "--json",
+                ],
+                capture_output=True, text=True, timeout=90, check=False,
+            )
+        if result.returncode != 0:
+            return {
+                "available": True, "ok": False,
+                "reason": "evalkit_exit_" + str(result.returncode),
+                "detail": (result.stderr or result.stdout or "")[:500],
+            }
+        report = json.loads(result.stdout)
+        if not isinstance(report, dict):
+            return {"available": True, "ok": False, "reason": "evalkit_returned_non_object"}
+        # Restrict the persisted report to JSON data and keep its size bounded.
+        compact = json.loads(json.dumps(report, allow_nan=False))
+        encoded = json.dumps(compact, ensure_ascii=False)
+        if len(encoded) > 12000:
+            return {"available": True, "ok": False, "reason": "evalkit_report_too_large"}
+        return {"available": True, "ok": True, "n": len(pairs), "report": compact}
+    except Exception as exc:
+        return {"available": True, "ok": False, "reason": type(exc).__name__ + ":" + str(exc)[:300]}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description='SkillOpt async real-gate worker')
     ap.add_argument('--skill-name', required=True)
@@ -86,6 +164,8 @@ def main() -> int:
     ap.add_argument('--max-tasks', type=int, default=3)
     ap.add_argument('--gate-min-improvement-pp', type=float, default=5.0)
     ap.add_argument('--replay-min-n', type=int, default=3)
+    ap.add_argument('--evalkit', action='store_true',
+                    help='attach an optional official paired evalkit report')
     ap.add_argument('--log-dir', default=None,
                     help='JSONL log dir (default: sleep_runner.runs_dir())')
     args = ap.parse_args()
@@ -157,6 +237,16 @@ def main() -> int:
             emit('per_task', **pt)
         payload['status'] = 'done'
         payload['verdict'] = verdict
+        if args.evalkit and verdict.get('ok'):
+            try:
+                payload['evalkit'] = _evalkit_report(verdict.get('per_task') or [])
+            except Exception as eval_exc:
+                # Reporting is strictly post-gate and must never turn a
+                # measured pass/reject into an infrastructure failure.
+                payload['evalkit'] = {
+                    'available': False,
+                    'reason': 'report_error:' + type(eval_exc).__name__,
+                }
         # v1.8.23: gate_passed now reflects the verdict: True iff the real
         # gate MEASURED a result (verdict.ok); False on could-not-measure.
         payload['gate_passed'] = bool(verdict.get('ok'))

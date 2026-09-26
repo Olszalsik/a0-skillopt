@@ -76,6 +76,18 @@ def _rollout_to_records(rollout: dict) -> tuple:
     session_records -> list of user/assistant records for the
     project's sessionId.jsonl file
     """
+    # Re-sanitize when materializing the upstream transcript cache. This also
+    # covers rollout JSON written before the harvester privacy controls were
+    # introduced; the source rollout itself remains unchanged.
+    try:
+        try:
+            from usr.plugins.skillopt.helpers import privacy  # type: ignore
+        except ImportError:
+            from helpers import privacy  # type: ignore
+        rollout = privacy.sanitize_rollout(rollout)
+    except Exception as exc:
+        raise RuntimeError("privacy controls unavailable; refusing to bridge rollout") from exc
+
     task = (rollout.get("task") or rollout.get("task_type") or "").strip()
     outcome = (rollout.get("outcome") or "").strip()
     skill = (rollout.get("skill_used") or rollout.get("task_type") or "").strip()
@@ -160,6 +172,77 @@ def _rollout_to_records(rollout: dict) -> tuple:
     return history_record, session_records, session_id, project_path
 
 
+def _sanitize_local_bridge_cache(root: Path, *, enabled: bool) -> int:
+    """Redact old A0-owned entries in the plugin-local cache, atomically.
+
+    Never rewrite a user's Claude home or an arbitrary transcript override.
+    Those locations may contain unrelated sessions owned by another app.
+    """
+    local_root = (sleep_runner.plugin_root() / ".cache" / "claude_code").resolve()
+    if not enabled or root.resolve() != local_root:
+        return 0
+    try:
+        from usr.plugins.skillopt.helpers import privacy  # type: ignore
+    except ImportError:
+        from helpers import privacy  # type: ignore
+
+    changed = 0
+    files = [root / "history.jsonl", * (root / "projects").glob("*/*.jsonl")]
+    for path in files:
+        if not path.is_file():
+            continue
+        try:
+            original = path.read_text(encoding="utf-8")
+            rows = original.splitlines()
+            updated = []
+            file_changed = False
+            for line in rows:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    # Preserve a malformed file byte-for-byte rather than
+                    # risk dropping a record while migrating old cache data.
+                    updated = []
+                    break
+                if not isinstance(row, dict):
+                    updated = []
+                    break
+                is_a0_session = str(row.get("sessionId") or "").startswith("a0-")
+                if path.name == "history.jsonl" or is_a0_session:
+                    display = row.get("display")
+                    if isinstance(display, str):
+                        safe = privacy.redact_text(display)
+                        if safe != display:
+                            row["display"] = safe
+                            file_changed = True
+                    message = row.get("message")
+                    if is_a0_session and isinstance(message, dict):
+                        content = message.get("content")
+                        if isinstance(content, str):
+                            safe = privacy.redact_text(content)
+                            if safe != content:
+                                message["content"] = safe
+                                file_changed = True
+                updated.append(json.dumps(row, ensure_ascii=False))
+            if file_changed and updated:
+                tmp = path.with_suffix(path.suffix + ".tmp")
+                tmp.write_text("\n".join(updated) + "\n", encoding="utf-8")
+                os.replace(tmp, path)
+                changed += 1
+        except Exception:
+            continue
+    return changed
+
+
+def privacy_settings_for_bridge() -> bool:
+    """Return redaction policy, refusing to bridge if policy cannot load."""
+    try:
+        from usr.plugins.skillopt.helpers import privacy  # type: ignore
+    except ImportError:
+        from helpers import privacy  # type: ignore
+    return privacy.privacy_settings()["redact_secrets"]
+
+
 def bridge_rollouts_to_claude_history() -> dict:
     """Convert A0 rollouts into Claude Code history + session files.
 
@@ -171,6 +254,9 @@ def bridge_rollouts_to_claude_history() -> dict:
     Idempotent via .bridge_index.json. Returns a small status dict.
     """
     root = _bridge_root()
+    cache_files_redacted = _sanitize_local_bridge_cache(
+        root, enabled=privacy_settings_for_bridge()
+    )
     history_path = root / "history.jsonl"
     projects_dir = root / "projects"
     history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -227,4 +313,5 @@ def bridge_rollouts_to_claude_history() -> dict:
         "total_in_index": len(index),
         "bridge_root": str(root),
         "is_plugin_local": str(root).startswith(str(sleep_runner.plugin_root())),
+        "legacy_cache_files_redacted": cache_files_redacted,
     }

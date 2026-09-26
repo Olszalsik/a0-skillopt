@@ -236,7 +236,10 @@ def _safe_call(*fns):
     return None
 
 
-def _tool_step_from_output(output_msg: Any) -> dict[str, Any] | None:
+def _tool_step_from_output(
+    output_msg: Any, *, include_args: bool = False, include_result: bool = False,
+    redact_secrets: bool = True,
+) -> dict[str, Any] | None:
     """Build one trajectory step from an OutputMessage whose content dict
     carries tool metadata (tool_name / tool_result), as written by
     `Agent.hist_add_tool_result`. Returns None for plain text messages."""
@@ -253,14 +256,26 @@ def _tool_step_from_output(output_msg: Any) -> dict[str, Any] | None:
         return None
     name = str(tool_name or "")
     # hist_add_tool_result stores tool_result under content; some tool
-    # calls also carry 'tool_args'/'arguments'. Capture a compact form.
+    # calls also carry 'tool_args'/'arguments'. Keep payloads excluded by
+    # default because they commonly contain user data and credentials.
     args = content.get("tool_args") or content.get("arguments") or ""
-    return {
+    step = {
         "role": "tool",
         "name": name,
-        "args": _truncate(_flatten_content(args), 120) if args else "",
-        "result": _truncate(_flatten_content(tool_result), 200) if tool_result is not None else "",
     }
+    if include_args and args:
+        try:
+            from usr.plugins.skillopt.helpers.privacy import redact_text  # type: ignore
+            step["args"] = redact_text(_truncate(_flatten_content(args), 120), enabled=redact_secrets)
+        except Exception:
+            return None
+    if include_result and tool_result is not None:
+        try:
+            from usr.plugins.skillopt.helpers.privacy import redact_text  # type: ignore
+            step["result"] = redact_text(_truncate(_flatten_content(tool_result), 200), enabled=redact_secrets)
+        except Exception:
+            return None
+    return step
 
 
 def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
@@ -281,6 +296,16 @@ def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
 
     sr = _sr()
     if sr is None:
+        return
+
+    # Privacy controls must resolve before any task text is persisted. If the
+    # helper cannot load, skip this rollout rather than write unsanitized data.
+    try:
+        from usr.plugins.skillopt.helpers import privacy  # type: ignore
+        privacy_config = sr.merged_config()
+        privacy_options = privacy.privacy_settings(privacy_config)
+    except Exception as e:
+        log.warning("[skillopt] privacy controls unavailable; skipping rollout: %s", e)
         return
 
     # Extract what we can from the framework's context.
@@ -324,7 +349,12 @@ def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
     # Build a compact trajectory from tool/result messages (cap at 5).
     traj: list[dict[str, Any]] = []
     for msg in history_output[-12:]:
-        step = _tool_step_from_output(msg)
+        step = _tool_step_from_output(
+            msg,
+            include_args=privacy_options["include_tool_args"],
+            include_result=privacy_options["include_tool_results"],
+            redact_secrets=privacy_options["redact_secrets"],
+        )
         if step is not None:
             traj.append(step)
     traj = traj[:5]
@@ -344,11 +374,11 @@ def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
     record = {
         "id": uuid.uuid4().hex,
         "ts": time.time(),
-        "task": _truncate(user_msg, 600),
+        "task": privacy.redact_text(_truncate(user_msg, 600), enabled=privacy_options["redact_secrets"]),
         "task_type": skill_used or "general",
         "skill_used": skill_used,
         "outcome": heuristic_label,
-        "last_response": _truncate(asst_msg, 1200),
+        "last_response": privacy.redact_text(_truncate(asst_msg, 1200), enabled=privacy_options["redact_secrets"]),
         "trajectory": traj,
         "model": model,
         "duration_s": duration_s,
@@ -382,7 +412,9 @@ def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
                         # Truncate to keep rollouts small (a SKILL.md
                         # can be tens of KB; the rollout needs to stay
                         # under ~10KB to be useful downstream).
-                        record["fragments_active_text"] = text[:4096]
+                        record["fragments_active_text"] = privacy.redact_text(
+                            text[:4096], enabled=privacy_options["redact_secrets"]
+                        )
     except Exception as e:
         # Fragment store is optional. A bug here can never crash the
         # harvester; the rollout is still useful without the field.

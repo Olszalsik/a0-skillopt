@@ -1863,6 +1863,17 @@ def get_status_snapshot() -> dict[str, Any]:
     except Exception as e:
         governance_status["available"] = False
         governance_status["error"] = str(e)
+    privacy_status: dict[str, Any] = {"available": True}
+    try:
+        try:
+            from usr.plugins.skillopt.helpers import privacy  # type: ignore  # noqa: E402
+        except Exception:
+            from helpers import privacy  # type: ignore  # noqa: E402
+        privacy_status.update(privacy.privacy_settings(merged_config()))
+        privacy_status["applies_to"] = ["new_rollouts", "direct_model_prompts", "official_transcript_bridge"]
+        privacy_status["legacy_rollouts"] = "redacted before direct model calls, bridge reuse, and real replay"
+    except Exception as e:
+        privacy_status = {"available": False, "error": str(e)}
     snap: dict[str, Any] = {
         "rollout_count": len(rollouts),
         "rollouts_path": str(rollouts_dir()),
@@ -1887,6 +1898,7 @@ def get_status_snapshot() -> dict[str, Any]:
         "cycle_history": cycle_history_status,
         # Day-5 item 8: per-skill governance (opt-out + per-skill policy)
         "governance": governance_status,
+        "privacy": privacy_status,
     }
     if last_err:
         snap["last_auto_loop_error"] = last_err

@@ -26,6 +26,16 @@ auto_loop_interval_sec: 1800
 # tiny datasets (SkillOpt needs a few sessions to mine patterns).
 auto_loop_min_rollouts: 10
 
+# =====================================================================
+# ROLLOUT PRIVACY
+# =====================================================================
+# Redact common credential formats from new rollout records and all direct
+# model prompts. Tool arguments/results are excluded by default to reduce
+# collection of sensitive payloads; enable only when these fields are needed.
+privacy_redact_secrets: true
+privacy_include_tool_args: false
+privacy_include_tool_results: false
+
 # Which skill to focus the loop on. Empty = optimize all skills.
 auto_loop_skill_target: ""
 
@@ -104,6 +114,10 @@ replay_held_out_n: 8
 replay_real_executor_enabled: false
 replay_real_per_task_timeout_s: 600
 replay_real_max_tasks: 4
+# Optional descriptive paired A/B report from the official evalkit. This
+# runs only after a real replay produced usable per-task pairs; the report
+# is informational and never changes gate/adoption decisions.
+replay_evalkit_enabled: false
 # v1.8.19 (P3, audit RC4): the MOCK executor is a deterministic keyword
 # relevance heuristic, not a real replay - its numeric lift on real
 # proposals is noise (the Sep-19 real proposal scored 2.08pp and was
@@ -170,18 +184,35 @@ critique_dir: "logs/runs/critiques"
 
 # =====================================================================
 # MODEL DEFAULTS — v1.1.0 tuned to match what A0 actually runs
+#
+# v1.8.28: these keys take a SLOT SENTINEL, never a model name. The
+# sentinel resolves at call time to the active Agent Zero preset's model
+# for that slot, including its provider api_base/api_key, so skillopt
+# never pins a model in code and automatically follows a better model
+# when the preset is upgraded. See helpers/chat_model.py::SLOTS.
+#
+#   "chat"    - the active A0 chat model.    High-value, high-reasoning
+#               work: proposing SKILL.md rewrites.
+#   "utility" - the active A0 utility model. Cheap, high-volume work:
+#               the LLM judge's outcome labelling.
+#
+# Job -> slot mapping is HERE, in config, on purpose. To move a job onto a
+# different model tier, edit this line - no code change. A concrete model
+# name still works and pins that name (deliberate escape hatch).
+#
+# OVERRIDING A SENTINEL IS A PIN. An SKILLOPT_OPTIMIZER_MODEL /
+# SKILLOPT_JUDGE_MODEL env var (or a line in logs/runs/.skillopt-env)
+# REPLACES the sentinel with a fixed name, silently undoing the
+# follow-the-preset behaviour. Prefer editing the keys below.
 # =====================================================================
 
-# Optimizer = the model that proposes skill edits. The default chat
-# sentinel (v1.8.12) follows the active Agent Zero chat model,
-# including its provider api_base/api_key. Set a concrete name to pin.
-# (Override via SKILLOPT_OPTIMIZER_MODEL env or `.skillopt-env`.)
+# Optimizer = the model that proposes skill edits. High reasoning value,
+# so it follows the chat slot.
 optimizer_model: "chat"
 
 # Target = the model A0 actually runs in production (the one that
 # uses the skill). Held-out replay is run against this model to
-# measure real-world impact. The default chat sentinel (v1.8.12)
-# follows the active Agent Zero chat model.
+# measure real-world impact, so it tracks the chat slot.
 target_model: "chat"
 
 # =====================================================================
@@ -271,7 +302,11 @@ ab_harness_min_confidence: 0.6
 # Set this true only if you want the harness as an extra advisory signal
 # (it can still reject a proposal that loses the paired test).
 ab_harness_enabled: false
-judge_model: "chat"  # v1.8.12: the chat sentinel follows the active A0 chat model
+# v1.8.28: the judge is classification, not reasoning - it labels rollout
+# outcomes in bursts, so it follows the UTILITY slot. This is the job ->
+# slot mapping: high-value work on "chat", bulk labelling on "utility".
+# Both track the active A0 preset, so neither is pinned.
+judge_model: "utility"
 # Burst throttle (v1.8.11): env SKILLOPT_JUDGE_THROTTLE_S sets the minimum
 # seconds between consecutive judge LLM calls (default 1.5; 0 disables);
 # guards batch labelling against provider 429 bursts.
@@ -302,21 +337,27 @@ judge_model: "chat"  # v1.8.12: the chat sentinel follows the active A0 chat mod
 #
 # use_official_engine      : prefer the official engine when available
 # official_run_verb        : CLI subcommand to invoke (default "run").
-# official_backend          : --backend. v1.8.26: the accepted set was WRONG
-#                            here - it listed mock|claude|codex|copilot|cursor|
-#                            pi|handoff|azure_openai, of which the plugin
-#                            never passed codex/copilot/cursor/pi/handoff,
-#                            and it omitted auto|openai_compatible|qwen|
-#                            minimax, which it does pass. The authoritative
-#                            list is helpers/setup_env.py::BACKENDS; keep
-#                            this comment in step with it.
+# official_backend          : --backend. v1.8.28: the authoritative accepted
+#                            set is helpers/setup_env.py::BACKENDS, and
+#                            official_adapter now IMPORTS it
+#                            (PASSTHROUGH_BACKENDS) instead of keeping a
+#                            private copy - so the two cannot drift again.
+#                            Passable = BACKENDS minus 'auto' and 'mock'.
 #                            Empty = engine default, which is MOCK, and the
 #                            plugin's own backend_guard REFUSES a mock backend
 #                            for a non-test run - so leaving this empty means
 #                            the engine declines to run. Set it explicitly.
-#                            'azure_openai' resolves through A0_VAR_MAP from
+#                            A value outside the passable set is LOGGED to
+#                            logs/runs/auto_loop.log (naming the valid set)
+#                            instead of being silently dropped.
+#                            Credentials resolve through A0_VAR_MAP from
 #                            AZURE_OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT in
 #                            <project>/usr/.env, so no secret enters this tree.
+#                            NOTE: the backend must be able to SERVE the model
+#                            in official_optimizer_model. Those are separate
+#                            choices - e.g. an ollama_cloud (OpenAI-compatible)
+#                            chat model wants 'openai_compatible', not
+#                            'azure_openai'.
 # official_optimizer_model  : --model (single model; empty = fall back to optimizer_model)
 # official_target_model     : KEPT for compat but NOT mapped (the real CLI
 #                            has no separate target model; the "target" is

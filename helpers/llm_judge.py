@@ -118,10 +118,28 @@ def _parse_judge_response(raw: str) -> dict[str, Any]:
 
 
 def _judge_model(model: str | None) -> str:
-    if model and model != "chat":
+    # v1.8.28: a slot sentinel ('chat' OR 'utility') must be RESOLVED, not
+    # returned as a literal model name. The old `model != "chat"` test would
+    # have handed "utility" straight to the provider as a model id.
+    try:
+        try:
+            from usr.plugins.skillopt.helpers import chat_model as _cm0  # type: ignore
+        except ImportError:
+            from helpers import chat_model as _cm0  # type: ignore
+        _is_slot = _cm0.is_slot
+    except Exception:  # noqa: BLE001
+        def _is_slot(v):
+            return str(v or "").strip() in ("chat", "utility")
+
+    if model and not _is_slot(model):
         return model
+    # v1.8.28: a passed-in slot is a REQUEST, and must be honoured - the old
+    # code dropped it and fell back to optimizer_model, so asking for
+    # "utility" silently ran the chat model. Env still wins (a deliberate pin),
+    # then the requested slot, then the configured default.
+    _req_slot = model if (model and _is_slot(model)) else ""
     env_model = os.environ.get("SKILLOPT_JUDGE_MODEL")
-    raw = env_model or ""
+    raw = env_model or _req_slot or ""
     if not raw:
         _ensure_path()
         # v1.8.1: two-path import - the bare `helpers` resolves to the
@@ -131,8 +149,9 @@ def _judge_model(model: str | None) -> str:
         except ImportError:
             from helpers import direct_optimizer  # type: ignore
         raw = direct_optimizer._default_model()
-    # v1.8.12: resolve the chat sentinel (or empty) to the concrete active
-    # chat model so the recorded judge_model names the model actually used.
+    # v1.8.12/v1.8.28: resolve the slot sentinel (or empty) to the concrete
+    # active model for that slot so the recorded judge_model names the model
+    # actually used.
     if raw:
         try:
             try:
@@ -157,9 +176,10 @@ def _judge_model(model: str | None) -> str:
 # asyncio semaphore cannot gate cross-thread sync callers):
 #   1. Pacing  - _throttle_wait() spaces consecutive HTTP attempts at least
 #                SKILLOPT_JUDGE_THROTTLE_S apart (env, default 1.5; 0
-#                disables). The slot start is RESERVED under a lock, so N
-#                concurrent callers get N consecutive spaced slots (the old
-#                racy read-sleep-write could collapse spacing).
+#                disables). v1.8.28: the lock is held ACROSS the sleep and the
+#                REAL start is stamped, so actual - not merely planned -
+#                attempts stay spaced despite OS timer jitter. N concurrent
+#                callers get N consecutive spaced slots.
 #   2. Limiter - _get_limiter() caps in-flight judge calls at
 #                SKILLOPT_JUDGE_MAX_CONCURRENCY (default 1 = strict
 #                serialization; BoundedSemaphore released in finally).
@@ -197,26 +217,55 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def _monotonic() -> float:
+    '''Seam for tests: the clock pacing stamps with.
+
+    Exists so the reservation logic can be tested DETERMINISTICALLY. Real
+    time.sleep cannot honour a small interval reliably - the Windows timer
+    granularity is ~15.6ms, which is the same order as the sub-20ms
+    intervals this pacing is verified at, so a wall-clock assertion of
+    "gaps >= 15ms" races the scheduler and flakes. Injecting the clock
+    tests the arithmetic instead of the OS timer.
+    '''
+    return time.monotonic()
+
+
 def _throttle_wait() -> float:
     '''Reserve + sleep so consecutive judge HTTP attempts stay >= interval apart.
 
-    v1.8.16: the stamp is the RESERVED slot start (not the wake time),
-    computed under _throttle_lock, so spacing holds under concurrency.
+    v1.8.16 reserved an IDEAL slot under _throttle_lock, released the lock,
+    then slept. That guarantees the *planned* starts are spaced, but the
+    ACTUAL starts are what hit the provider, and those are subject to OS
+    timer/scheduler jitter - on Windows the default timer granularity is
+    ~15.6ms, comparable to a small interval. Waking early/late let real
+    starts collapse toward each other, so under load the plugin could fire
+    HTTP attempts closer together than SKILLOPT_JUDGE_THROTTLE_S. That is
+    exactly the 429 burst pacing exists to prevent.
+
+    v1.8.28: hold the lock ACROSS the sleep and stamp the ACTUAL start time.
+    The wait is now serialized, which is the correct semantic for pacing
+    (consecutive attempts are spaced by construction), while the judge calls
+    themselves still run concurrently afterwards - the parallelism comes
+    from the call duration, not from the wait. Stamping the real start also
+    self-corrects for jitter: an oversleep pushes the next slot out rather
+    than being silently absorbed.
+
     Returns the waited seconds (0 on the first call or when disabled).
     '''
     interval = _judge_throttle_seconds()
-    now = time.monotonic()
     with _throttle_lock:
+        now = _monotonic()
         last = _throttle_state['last']
         if interval <= 0.0 or last is None:
-            _throttle_state['last'] = now
             slot = now
         else:
             slot = max(now, last + interval)
-            _throttle_state['last'] = slot
-    wait = max(0.0, slot - now)
-    if wait > 0.0:
-        _sleep(wait)
+        wait = max(0.0, slot - now)
+        if wait > 0.0:
+            _sleep(wait)
+        # Stamp the REAL start, not the ideal slot, so jitter accumulates
+        # conservatively instead of collapsing the next reservation.
+        _throttle_state['last'] = _monotonic()
     return wait
 
 

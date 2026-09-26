@@ -31,7 +31,7 @@ import sys
 log = logging.getLogger(__name__)
 
 PLUGIN_NAME = "skillopt"
-PLUGIN_VERSION = "1.8.27"
+PLUGIN_VERSION = "1.8.28"
 
 # Base `skillopt` (no extras). The [webui] extra pulls gradio +
 # huggingface_hub >= 1.2 + msal + azure-identity, which conflicts with

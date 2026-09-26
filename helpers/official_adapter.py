@@ -53,7 +53,11 @@ VERIFIED API (v1.6.1, verified against microsoft/skillopt @ HEAD 2026-08-10)
   harvest->mine->replay->gate->stage), `dry-run`, `status`, `adopt`, `harvest`,
   `schedule`, `unschedule`. `run` flags (from _add_common): `--project PATH`,
   `--target-skill-path PATH` (a real SKILL.md path, NOT a skill name),
-  `--backend mock|claude|codex|copilot|cursor|pi|handoff|azure_openai`,
+  `--backend <see setup_env.BACKENDS>` (v1.8.28: the accepted set is
+  helpers/setup_env.py::BACKENDS, which this adapter IMPORTS as
+  PASSTHROUGH_BACKENDS rather than re-declaring. The stale inline list that
+  used to sit here disagreed with BACKENDS in both directions and silently
+  dropped valid values - see _build_run_args. Do not reintroduce a copy),
   `--model NAME` (single model; there is no separate optimizer/target model),
   `--lookback-hours N`, `--max-tasks N`, `--edit-budget N`, `--auto-adopt`,
   `--preferences`, `--json`, `--progress`. The verb is configurable via
@@ -92,6 +96,14 @@ try:
 except Exception:
     from helpers import sleep_runner  # type: ignore  # noqa: F401
 
+# v1.8.28: BACKENDS is the single source of truth for the accepted backend
+# set. Imported (not re-declared) so the CLI mapping and the env-file builder
+# can never drift apart again - that drift silently dropped valid backends.
+try:
+    from usr.plugins.skillopt.helpers import setup_env  # type: ignore
+except Exception:
+    from helpers import setup_env  # type: ignore  # noqa: F401
+
 
 # ----------------------------------------------------------------------- #
 # Availability probe (cached, subprocess-based)
@@ -99,6 +111,107 @@ except Exception:
 
 PROBE_TTL = 60.0  # re-probe at most once a minute
 _probe_cache: dict[str, Any] = {"at": 0.0, "result": None}
+
+# v1.8.28: pinned upstream engine version. Recorded HERE, in the bind-mounted
+# plugin tree, rather than in docker/run/fs/ins/install_A0.sh: only /a0 is
+# bind-mounted, so this file survives a `docker compose up --force-recreate`
+# or an image rebuild, while /opt/venv-a0 does not. Installing the engine
+# from a tracked core Dockerfile to serve an ignored usr/ plugin would also
+# give every other user of the image a dependency they never asked for.
+ENGINE_REQUIREMENT = "skillopt==0.2.0"
+
+# Markers for a completed install attempt, so we retry on the next cycle
+# rather than on every tick (an install attempt is slow and may fail while
+# the network is down).
+_install_state: dict[str, Any] = {"attempted_at": 0.0, "ok": None, "detail": None}
+INSTALL_RETRY_AFTER_S = 900.0  # 15 minutes
+
+
+def _log(msg: str) -> None:
+    """Append to the auto-loop audit log. Never raises."""
+    try:
+        log = sleep_runner.runs_dir() / "auto_loop.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            sleep_runner.rotate_log_if_large(log)
+        except Exception:
+            pass
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S%z')}] {msg}\n")
+    except Exception:
+        pass
+
+
+def ensure_engine(force: bool = False) -> dict[str, Any]:
+    """Install the official engine into the A0 venv if it is missing.
+
+    v1.8.28. Self-healing durability: only /a0 is bind-mounted into the
+    container, so /opt/venv-a0 loses `skillopt` on every rebuild. Baking the
+    install into a tracked Dockerfile would make a core file serve an
+    ignored plugin; re-running it by hand re-introduces exactly the silent
+    revert this removes. Instead the plugin heals itself, because the code
+    that knows the requirement lives in the directory that survives.
+
+    Returns {ok, installed, available, reason, py}. Never raises: a failed
+    install degrades to the direct_optimizer fallback, which is the
+    documented behaviour when the engine is absent.
+    """
+    probe = probe_official(force=force)
+    if probe.get("available"):
+        _install_state["ok"] = True
+        _install_state["detail"] = "already present"
+        return {"ok": True, "installed": False, "available": True,
+                "py": probe.get("py"), "reason": "engine already installed"}
+
+    now = time.time()
+    last = float(_install_state.get("attempted_at") or 0.0)
+    if (not force and _install_state.get("ok") is False
+            and (now - last) < INSTALL_RETRY_AFTER_S):
+        return {"ok": False, "installed": False, "available": False,
+                "py": probe.get("py"),
+                "reason": "install recently failed; will retry in %ds"
+                          % int(INSTALL_RETRY_AFTER_S - (now - last))}
+
+    py = _a0_python()
+    _install_state["attempted_at"] = now
+    _log(f"official engine missing ({probe.get('error') or 'not importable'}); "
+         f"installing {ENGINE_REQUIREMENT} into {py}")
+    try:
+        import subprocess
+        proc = subprocess.run(
+            [py, "-m", "pip", "install", "--disable-pip-version-check", ENGINE_REQUIREMENT],
+            capture_output=True, text=True, timeout=600,
+        )
+    except Exception as e:  # noqa: BLE001
+        _install_state["ok"] = False
+        _install_state["detail"] = f"{type(e).__name__}: {e}"
+        _log(f"engine install FAILED to launch ({type(e).__name__}: {e}); "
+             f"falling back to direct_optimizer")
+        return {"ok": False, "installed": False, "available": False, "py": py,
+                "reason": f"install could not start: {type(e).__name__}: {e}"}
+
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+        detail = " | ".join(t.strip() for t in tail if t.strip())[:300]
+        _install_state["ok"] = False
+        _install_state["detail"] = detail
+        _log(f"engine install FAILED (exit {proc.returncode}): {detail}")
+        return {"ok": False, "installed": False, "available": False, "py": py,
+                "reason": f"pip exited {proc.returncode}: {detail}"}
+
+    # Re-probe from scratch: the cache would still hold the "absent" result.
+    after = probe_official(force=True)
+    if after.get("available"):
+        _install_state["ok"] = True
+        _install_state["detail"] = "installed"
+        _log(f"official engine installed: {ENGINE_REQUIREMENT} -> {after.get('version')}")
+        return {"ok": True, "installed": True, "available": True, "py": py,
+                "reason": "installed " + ENGINE_REQUIREMENT}
+    _install_state["ok"] = False
+    _install_state["detail"] = "installed but still not importable"
+    _log(f"engine install reported success but {after.get('error') or 'still not importable'}")
+    return {"ok": False, "installed": True, "available": False, "py": py,
+            "reason": "installed but still not importable"}
 
 
 def _a0_python() -> str:
@@ -194,13 +307,52 @@ def _str_cfg(cfg: dict[str, Any], key: str) -> str | None:
     return s or None
 
 
+# v1.8.28: derived from setup_env.BACKENDS - the single source of truth for
+# the accepted backend set. Two entries are deliberately not forwarded:
+#   'auto' - means "let the engine choose", which is exactly what omitting
+#            --backend already does, so passing it is redundant at best.
+#   'mock' - must never reach a real run. The deliberate test path is
+#            --allow-mock-backend in scripts/run_sleep_cycle.py, which
+#            bypasses this mapping entirely.
+_BACKEND_EXCLUDE = frozenset({"auto", "mock"})
+PASSTHROUGH_BACKENDS = tuple(b for b in setup_env.BACKENDS if b not in _BACKEND_EXCLUDE)
+
+
+def _log_backend_rejection(backend: str) -> None:
+    """Record a silently-dropped official_backend in the audit log.
+
+    A dropped backend is the exact failure this indirection caused before:
+    the engine falls back to its own default (mock), the plugin's
+    backend_guard refuses, and nothing explains why a correct-looking
+    config did not work. Never raises - logging must not break a cycle.
+    """
+    try:
+        log = sleep_runner.runs_dir() / "auto_loop.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            sleep_runner.rotate_log_if_large(log)
+        except Exception:
+            pass
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(
+                f"[{time.strftime('%Y-%m-%dT%H:%M:%S%z')}] "
+                f"official_backend {backend!r} NOT passed to the engine: it is not "
+                f"in the accepted set (passthrough: {', '.join(PASSTHROUGH_BACKENDS)}). "
+                f"The engine will use its own default (mock) and the backend_guard "
+                f"will refuse. Set official_backend to one of the passthrough values.\n"
+            )
+    except Exception:
+        pass
+
+
 def _build_run_args(cfg: dict[str, Any], target: str | None) -> list[str]:
     """Map A0 config keys to the real `skillopt_sleep run` CLI args.
 
     Verified against microsoft/skillopt @ HEAD (see module docstring):
       --project PATH            (project to evolve; staging lands here)
       --target-skill-path PATH  (a real SKILL.md path, NOT a skill name)
-      --backend mock|claude|codex|copilot|cursor|pi|handoff|azure_openai
+      --backend BACKEND           (accepted set = setup_env.BACKENDS; see
+                                   PASSTHROUGH_BACKENDS - do not re-declare)
       --model NAME              (single model; no separate optimizer/target)
       --lookback-hours N
       --max-tasks N
@@ -227,12 +379,27 @@ def _build_run_args(cfg: dict[str, Any], target: str | None) -> list[str]:
 
     backend = _str_cfg(cfg, "official_backend")
     if backend:
-        # The real CLI rejects unknown backends with argparse error; only
-        # pass values that look like a known choice.
-        known = {"mock", "claude", "codex", "copilot", "cursor", "pi",
-                 "handoff", "azure_openai"}
-        if backend in known:
+        # The real CLI rejects unknown backends with an argparse error, so
+        # only forward a value we know it accepts.
+        #
+        # v1.8.28: helpers/setup_env.BACKENDS is the SINGLE source of truth.
+        # This used to be a private literal set that disagreed with BACKENDS
+        # in BOTH directions: it listed mock|codex|copilot|cursor|pi|handoff,
+        # which the plugin never passes, while OMITTING
+        # openai_compatible|qwen|minimax, which it does. The failure was
+        # silent - the flag was dropped, the engine fell back to its own
+        # default (mock), and the plugin's own backend_guard then refused,
+        # so a correct configuration looked like a refusal.
+        #
+        # 'auto' is excluded because it means "let the engine choose", which
+        # is what omitting the flag already does. 'mock' is excluded so a
+        # mock request can never reach a real run; the deliberate test path
+        # is --allow-mock-backend in scripts/run_sleep_cycle.py, which does
+        # not go through this mapping.
+        if backend in PASSTHROUGH_BACKENDS:
             args += ["--backend", backend]
+        else:
+            _log_backend_rejection(backend)
 
     # Single --model (no separate optimizer/target model in the real CLI).
     model = _str_cfg(cfg, "official_optimizer_model") or _str_cfg(cfg, "optimizer_model")

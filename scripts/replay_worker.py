@@ -333,11 +333,32 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("task file has no `task` text")
         skill_md = Path(args.skill_md).read_text(encoding="utf-8")
 
+        # Held-out rollouts can predate the harvester's privacy controls.
+        # Sanitize both the task sent to the real A0 model and skill text
+        # before constructing the replay context; never fall back to raw
+        # inputs if the privacy helper is unavailable.
+        try:
+            try:
+                from usr.plugins.skillopt.helpers import privacy  # type: ignore
+            except ImportError:
+                from helpers import privacy  # type: ignore
+            privacy_options = privacy.privacy_settings()
+            task_text = privacy.redact_text(
+                task_text, enabled=privacy_options["redact_secrets"]
+            )
+            skill_md = privacy.redact_text(
+                skill_md, enabled=privacy_options["redact_secrets"]
+            )
+        except Exception as exc:
+            raise RuntimeError("privacy controls unavailable; refusing replay") from exc
+
         print(f"[{PLUGIN_NAME}] replay worker: skill={args.skill_name} workdir={workdir}")
         result = asyncio.run(
             _run_monologue(args.skill_name, skill_md, task_text, workdir)
         )
-        response = result.get("response") or ""
+        response = privacy.redact_text(
+            result.get("response") or "", enabled=privacy_options["redact_secrets"]
+        )
 
         score = _score_response(response, task_text)
         outcome = str(score.get("outcome") or "failure")

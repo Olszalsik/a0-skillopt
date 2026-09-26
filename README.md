@@ -150,8 +150,38 @@ When you trust the output, set `auto_adopt: true` in the settings (or POST to `/
 | `critique_dir` | `logs/runs/critiques` | Where per-cycle critiques land. |
 | `optimizer_model` | `chat` | Model that proposes skill edits. The `chat` sentinel (v1.8.12) follows the active Agent Zero chat model. |
 | `target_model` | `chat` | Model A0 runs in production; held-out replay uses it. The `chat` sentinel (v1.8.12) follows the active A0 chat model. |
+| `privacy_redact_secrets` | `true` | Best-effort redaction of common credential patterns in new rollouts and before direct model calls. |
+| `privacy_include_tool_args` | `false` | Store tool arguments in new rollouts. Enable only when needed; values are still redacted when redaction is on. |
+| `privacy_include_tool_results` | `false` | Store tool results in new rollouts. Enable only when needed; values are still redacted when redaction is on. |
+| `replay_evalkit_enabled` | `false` | Attach optional upstream paired statistics to a completed real replay gate when the installed package supports evalkit. Informational only. |
 
 For the full reference with comments, see `default_config.yaml`.
+
+### Rollout data and privacy
+
+SkillOpt stores task text and the final response locally for learning. Tool
+arguments and results are excluded by default. Common API-key, bearer-token,
+private-key, and URL-credential patterns are redacted before new rollout data
+is written, before direct optimizer/judge prompts are sent, before legacy
+rollouts are bridged to the official engine, and before held-out replay calls
+Agent Zero. You can inspect the effective controls in the status payload's
+`privacy` block.
+
+Redaction is best-effort and cannot identify every secret or personal detail.
+Review harvested tasks before enabling a provider-backed cycle. Setting
+`privacy_redact_secrets` to `false` disables these safeguards; avoid doing so
+for sensitive conversations. Previously written rollout files are not
+rewritten automatically, though model-bound paths sanitize them before use.
+
+### Optional upstream evalkit report
+
+When `replay_evalkit_enabled` is on, a completed real replay may attach a
+paired-statistics report to its gate sidecar. SkillOpt probes the installed
+`skillopt_sleep.evalkit` CLI before use, since evalkit is not present in every
+released package. The report reuses scores already collected by the real
+gate, is bounded, and cannot change the gate verdict or adoption decision.
+Unsupported versions and report errors leave the ordinary gate result intact.
+
 ## Judge burst protection (v1.8.16)
 
 `helpers/llm_judge.py` wraps every judge LLM call in a three-layer burst guard:

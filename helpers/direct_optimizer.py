@@ -137,13 +137,16 @@ def _call_llm(prompt: str, model: str, max_tokens: int = 2000, system: str | Non
     api_key = env.get("AZURE_OPENAI_API_KEY", "")
     if not api_key:
         api_key = os.environ.get("OLLAMA_API_KEY") or os.environ.get("API_KEY_OLLAMA_CLOUD") or ""
-    # v1.8.12: the chat sentinel (or an empty model) follows the active
-    # Agent Zero chat model - including its provider api_base/api_key.
+    # v1.8.12/v1.8.28: a slot sentinel ('chat' or 'utility'), or an empty
+    # model, follows the active Agent Zero model for that slot - including
+    # its provider api_base/api_key.
+    _was_slot = False
     try:
         try:
             from usr.plugins.skillopt.helpers import chat_model as _cm  # type: ignore
         except ImportError:
             from helpers import chat_model as _cm  # type: ignore
+        _was_slot = _cm.is_slot(model) or not str(model or "").strip()
         model, _conn = _cm.effective_model(model)
         if _conn:
             if _conn.get("api_base"):
@@ -151,18 +154,32 @@ def _call_llm(prompt: str, model: str, max_tokens: int = 2000, system: str | Non
             if _conn.get("api_key"):
                 api_key = str(_conn["api_key"])
     except Exception as _e:  # noqa: BLE001
-        if not model or model == "chat":
-            raise RuntimeError("chat-model resolution failed: " + str(_e)) from _e
+        if _was_slot:
+            raise RuntimeError("model-slot resolution failed: " + str(_e)) from _e
     if not model:
         raise RuntimeError(
-            "optimizer model resolved to empty - the chat sentinel found "
-            "no active Agent Zero chat model (helpers/chat_model.py)"
+            "optimizer model resolved to empty - the slot sentinel found "
+            "no active Agent Zero model for that slot (helpers/chat_model.py)"
         )
     if not api_key:
         raise RuntimeError(
             "No LLM API key found. Set OLLAMA_API_KEY in the container env, "
             "or set AZURE_OPENAI_API_KEY in the project usr/.env file.",
         )
+    # Older rollout files may predate the harvester's privacy controls. Apply
+    # redaction again at the provider boundary so historical data is not sent
+    # verbatim just because it is already on disk.
+    try:
+        try:
+            from usr.plugins.skillopt.helpers import privacy  # type: ignore
+        except ImportError:
+            from helpers import privacy  # type: ignore
+        privacy_options = privacy.privacy_settings()
+        prompt = privacy.redact_text(prompt, enabled=privacy_options["redact_secrets"])
+        if system:
+            system = privacy.redact_text(system, enabled=privacy_options["redact_secrets"])
+    except Exception as exc:
+        raise RuntimeError("privacy controls unavailable; refusing outbound model call") from exc
     from openai import OpenAI
     client = OpenAI(base_url=base_url, api_key=api_key)
     resp = client.chat.completions.create(

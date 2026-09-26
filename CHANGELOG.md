@@ -4,6 +4,100 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.28] - 2026-09-26
+
+Model selection follows Agent Zero's presets (no pinned model names), and the
+official engine's backend set stops silently dropping valid values. This
+release also adds opt-in rollout privacy controls and an optional upstream
+paired evalkit report for completed real replay gates.
+
+### Added: rollout privacy controls
+
+New rollouts omit tool arguments/results by default and redact common
+credential patterns. Existing rollouts are sanitized again at direct model,
+official bridge, and real replay boundaries. Redaction is best-effort; the
+plugin-local Claude history cache is migrated without rewriting A0's own
+history or external cache overrides.
+
+### Added: optional upstream evalkit report
+
+`replay_evalkit_enabled` attaches paired statistics from the installed
+`skillopt_sleep.evalkit` CLI to completed real-gate sidecars when supported.
+The capability is probed before use and report errors never change the gate
+or adoption outcome.
+
+### Fixed: a model name was pinned in the environment, silently overriding the preset
+
+`usr/.env` and `logs/runs/.skillopt-env` both set
+`SKILLOPT_OPTIMIZER_MODEL=minimax-m3` and `SKILLOPT_JUDGE_MODEL=minimax-m3`.
+Those env vars take precedence over the config sentinels, so the plugin was
+calling **MiniMax while the active Agent Zero model was
+`glm-5.3-flash` (`ollama_cloud`)** — a provider mismatch that presented only
+as poor optimization quality, never as an error. Both are now removed (with a
+comment explaining that setting them is a deliberate pin) and the YAML
+sentinels take effect.
+
+### Added: the `utility` model slot
+
+`helpers/chat_model.py` resolved exactly one sentinel, `'chat'`. The
+`_model_config` preset already carries a `utility` slot that nothing read, so
+the resolver is now slot-parameterised (`resolve_slot_model`,
+`get_slot_connection`, `SLOTS`, `is_slot`, `normalize_slot`) with per-slot
+caching. `resolve_chat_model` / `get_chat_connection` / `_CACHE` are retained
+as the `chat`-slot view, so existing readers are unaffected.
+
+Job → slot mapping, in config rather than code:
+
+| Key | Slot | Why |
+| --- | --- | --- |
+| `optimizer_model` | `chat` | proposing skill rewrites is high-reasoning work |
+| `target_model` | `chat` | held-out replay must match production |
+| `judge_model` | `utility` | outcome labelling is bulk classification |
+
+Both track the active preset, so upgrading the preset upgrades the plugin
+with no code change. `t_v1828_config_has_no_pinned_model` fails the run if a
+concrete model name is hardcoded in `helpers/`.
+
+### Fixed: a slot sentinel could reach the provider as a literal model id
+
+`llm_judge._judge_model` and `direct_optimizer._call_llm` both gated on
+`model != "chat"`. With `judge_model: "utility"` that comparison is true, so
+the string `"utility"` would have been sent as the model name. Both now use
+`chat_model.is_slot()`.
+
+### Fixed: a requested slot was discarded
+
+`_judge_model("utility")` discarded the argument and fell back to
+`optimizer_model`, so asking for the utility slot silently ran the *chat*
+model. A passed-in slot is a request and is now honoured (env still wins, as
+a deliberate pin).
+
+### Fixed: valid `official_backend` values were silently dropped
+
+`official_adapter` gated `--backend` on a private literal that disagreed with
+`setup_env.BACKENDS` in **both** directions: it listed
+`mock|codex|copilot|cursor|pi|handoff` (never passed) and omitted
+`openai_compatible|qwen|minimax` (passed by the env builder). The failure was
+self-concealing — the flag vanished, the engine fell back to its own default
+(`mock`), and the plugin's own `backend_guard` then refused, so a *correct*
+configuration looked like a refusal. Notably `openai_compatible` is the
+backend an OpenAI-compatible chat model needs.
+
+`PASSTHROUGH_BACKENDS` is now derived from `setup_env.BACKENDS` (minus `auto`
+and `mock`) by import, so the two cannot drift again and a new backend
+becomes selectable with no code change. A rejected value is written to
+`logs/runs/auto_loop.log` naming the value *and* the valid set, so the next
+occurrence is self-diagnosing instead of silent.
+
+### Tests
+
++7 (`t_v1828_*`). Two pre-existing platform issues are now documented rather
+than left to fail: the `0600` env-file assertion is POSIX-only (Windows
+`os.chmod` reports `0o666`, so the test asserts intent there), and the v1.8.16
+reservation-pacing test is timing-sensitive and can flake under load.
+
+---
+
 ## [1.8.26] - 2026-09-26
 
 Closes the remaining roadmap items, and fixes two bugs that only became

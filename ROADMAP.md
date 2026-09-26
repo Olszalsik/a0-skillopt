@@ -4,6 +4,52 @@ This document is the engineering roadmap for the SkillOpt self-evolution plugin.
 
 If you are a new contributor: start with the **Day 3** items. They are the highest-leverage missing pieces, all scoped to a few hundred lines of code each.
 
+## Current audit and next work (2026-09-26)
+
+This section reflects the local plugin snapshot reviewed on 2026-09-26. The working tree contains v1.8.28 development changes. The deterministic plugin smoke suite passed all 201 checks on this date; no live A0 runtime or provider-backed optimization cycle was exercised.
+
+1. **Verify the v1.8.28 slot-model routing changes.** `chat_model.py` now resolves `chat` and `utility` slots, and the optimizer, judge, and official adapter were changed to consume them. The matching smoke-test changes are present but were not run during this review. Run the full smoke suite before relying on the new utility-slot path, especially when the active preset has no utility model or the provider key/base URL comes from a preset.
+2. **Decide whether gated-cycle judge labels should persist.** `judge_client.judge_rollouts()` explicitly returns results only in memory, while `llm_judge.label_rollout_file()` atomically writes labels and is used by the standalone labeling script. `run_sleep_cycle.py` uses the stateless helper, so the same rollout may be judged again on future runs. If persistence is desired, make it atomic, retain model/time/confidence metadata, and add coverage for retries and already-labeled records; otherwise keep the stateless behavior and make its recurring cost clear in the UI/docs.
+3. **Configure and validate a real official-engine backend.** The one-shot runner rejects an unset or `mock` backend by default because the mock scorer rejects proposals by construction. A run that deliberately opts into mock mode validates orchestration only; it does not establish an effective optimization cycle. Keep real replay opt-in and gated until a bounded live pilot produces a report that passes the authoritative gate.
+4. **Replace newest-directory attribution for no-task outcomes.** The recorded v1.8.20 behavior can report the newest prior engine directory when the current cycle creates no task directory. Correlate a run with its own start time/run ID and explicit “no task produced” result, so the audit trail cannot attach a stale verdict to the current cycle.
+5. **Refresh external release/hub status only when acting on it.** Older addenda mention PR #512 and release state, but this review did not check GitHub. Do not treat those notes as current; recheck the live repository before release or hub work.
+
+### Review notes
+
+- Confirmed code distinction: `judge_client.judge_rollouts()` is non-persistent; `llm_judge.label_rollout_file()` performs atomic in-place labeling. The open label-repeat item below is therefore still actionable for the gated-cycle path, not a defect in the standalone labeling command.
+- The v1.8.28 model-slot implementation is present across the expected helper/config/version surfaces; the full smoke suite passed, including utility-slot resolution and missing-slot cases.
+- Privacy P0 and optional evalkit reporting passed the deterministic smoke suite, including checks for config readers, legacy data sanitization paths, and missing evalkit support. The suite does not test every possible credential format or a live upstream evalkit installation.
+
+## Official Microsoft SkillOpt comparison (2026-09-26)
+
+Compared the local wrapper with [`microsoft/SkillOpt` on `main`](https://github.com/microsoft/SkillOpt), especially its [CLI reference](https://github.com/microsoft/SkillOpt/blob/main/docs/reference/cli.md), [integration overview](https://github.com/microsoft/SkillOpt/blob/main/plugins/README.md), and [recent changelog](https://github.com/microsoft/SkillOpt/blob/main/CHANGELOG.md). Upstream explicitly warns that `main` has capabilities beyond PyPI 0.2.0, so these are candidates to capability-detect, not unconditional CLI assumptions.
+
+### Already covered locally
+
+- The plugin wraps the official `skillopt_sleep` CLI and reads its structured report; it does not reimplement the official engine's mining/reflection pipeline.
+- `official_adapter.py` already maps `--edit-budget`, `--max-tasks`, `--model`, and `--preferences`. The plugin also has its own per-skill cadence/budget loop and keeps staged proposals behind the local governance and adoption gates.
+- Agent Zero captures its own completed monologues directly. Adding upstream Claude/Codex/Cursor transcript adapters would duplicate the wrong layer; those adapters exist for platforms without A0's native hook.
+- Upstream's user-preference mechanism is already represented by `official_preferences`; do not add a second preference system without evidence that the current pass-through is insufficient.
+
+### Candidate work to bring back
+
+| Priority | Upstream capability or practice | Local gap and proposed adaptation | Guardrail |
+| --- | --- | --- | --- |
+| P0 — partial implementation, verification pending | Explicit transcript data boundaries and secret redaction, described in the [integration data-boundary guidance](https://github.com/microsoft/SkillOpt/blob/main/plugins/README.md#data-boundary) and [CLI reference](https://github.com/microsoft/SkillOpt/blob/main/docs/reference/cli.md). | Added `helpers/privacy.py`; tool args/results now default off, common credential patterns are redacted in new rollouts and direct prompts, the official bridge sanitizes source rollouts and migrates the plugin-local cache, replay sanitizes legacy task/skill inputs, and status/settings expose the active controls. Source rollout files are not rewritten. A retention/expiry control for accumulated rollout data remains to be designed. | Keep authoritative A0 history untouched; only sanitize SkillOpt copies. Redaction remains best-effort. Verification must cover task/response/tool payloads, private keys, bearer/API tokens, URL credentials, old rollout files, cache migration, opt-out behavior, and malformed cache files. |
+| P1 — implemented, verification pending | Fixed-task `evalkit` using paired comparisons and statistical summaries, documented in the [evalkit reference](https://github.com/microsoft/SkillOpt/blob/main/docs/sleep/evalkit.md). | Added an opt-in post-gate report over the already-scored current/proposed pairs. It is stored as a bounded `evalkit` field in the real-gate sidecar; a dedicated independent task manifest and dashboard presentation remain future work. | Capability-probe installed CLI flags; report failures cannot change the gate verdict or adoption decision. This is descriptive evidence from gate data, not an independent confirmation set. |
+| P2 | Native multi-skill fan-out and reviewed subset adoption with per-skill baselines, gate evidence, provenance hashes, and recoverable publication, described in the [upstream changelog](https://github.com/microsoft/SkillOpt/blob/main/CHANGELOG.md). | The local auto-loop already schedules skills individually. Explore the upstream single-invocation fan-out only as an efficiency/transaction improvement, then let an operator select a subset to adopt from a verified manifest. | First capability-detect `--all-skills`/fan-out and its output schema. Preserve A0 governance per target; require independent gate evidence, pinned baselines, hashes, atomic snapshots, and restart-safe adoption. Fall back to today's per-skill loop when unsupported. |
+| P3 | Per-night `evidence.jsonl` for reconstructing harvest, mining, replay, reflection, and gate decisions, listed in the [upstream changelog](https://github.com/microsoft/SkillOpt/blob/main/CHANGELOG.md). | Connect local `cycle_history`, official reports, judge results, and gate/adoption receipts through one stable run ID and append-only evidence stream. This also gives a reliable fix for the stale newest-directory attribution noted above. | Store hashes, bounded metadata, and redacted summaries; don't duplicate raw transcripts or secrets into an audit log. |
+
+### Not recommended as immediate ports
+
+- **Handoff backend:** upstream can pause model calls and resume from user-supplied answer files. Agent Zero already has a configured chat/utility model and direct slot resolution; handoff adds a second interaction state machine. Revisit only if operators need a no-provider/manual approval mode.
+- **Memory evolution:** upstream can stage long-term memory as well as skills. This plugin's existing contract intentionally treats `SKILL.md` as the trainable surface. Any memory target should be a separate opt-in governance domain with its own preview, gate, backup, and rollback; do not silently expand adoption scope.
+- **Other-agent transcript sources/backends:** A0's native turn hook is the appropriate source here. Importing platform-specific sources or CLIs would expand credential and privacy scope without improving A0 capture.
+
+### Compatibility rule
+
+The plugin installs/probes `skillopt_sleep` independently of the source checkout used to inspect upstream. Before adopting any `main`-only flag, report field, fan-out, or `evalkit` capability, probe the installed CLI/version (or its help/schema) and add a mocked compatibility test for supported and unsupported versions. Unknown upstream output must leave proposals staged and must never be interpreted as a passing gate or adoption authorization.
+
 ---
 
 ## Day 3 — DONE (v1.2.0, 2026-07-23)
