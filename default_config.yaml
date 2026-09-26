@@ -302,8 +302,21 @@ judge_model: "chat"  # v1.8.12: the chat sentinel follows the active A0 chat mod
 #
 # use_official_engine      : prefer the official engine when available
 # official_run_verb        : CLI subcommand to invoke (default "run").
-# official_backend          : --backend (mock|claude|codex|copilot|cursor|pi|
-#                            handoff|azure_openai); empty = engine default (mock)
+# official_backend          : --backend. v1.8.26: the accepted set was WRONG
+#                            here - it listed mock|claude|codex|copilot|cursor|
+#                            pi|handoff|azure_openai, of which the plugin
+#                            never passed codex/copilot/cursor/pi/handoff,
+#                            and it omitted auto|openai_compatible|qwen|
+#                            minimax, which it does pass. The authoritative
+#                            list is helpers/setup_env.py::BACKENDS; keep
+#                            this comment in step with it.
+#                            Empty = engine default, which is MOCK, and the
+#                            plugin's own backend_guard REFUSES a mock backend
+#                            for a non-test run - so leaving this empty means
+#                            the engine declines to run. Set it explicitly.
+#                            'azure_openai' resolves through A0_VAR_MAP from
+#                            AZURE_OPENAI_API_KEY / AZURE_OPENAI_ENDPOINT in
+#                            <project>/usr/.env, so no secret enters this tree.
 # official_optimizer_model  : --model (single model; empty = fall back to optimizer_model)
 # official_target_model     : KEPT for compat but NOT mapped (the real CLI
 #                            has no separate target model; the "target" is

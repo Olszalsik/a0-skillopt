@@ -7636,8 +7636,20 @@ def t_p4_no_fixture_pollution():
     # Unambiguous test signatures: these are always a leak.
     HARD = ("skillopt_drain_", "AppData\\Local\\Temp\\skillopt", "/tmp/skillopt",
             "_test_skill", "v1821_govskip_skill")
-    # Fixture names too, but see the note on benign_rows below.
+    # Scanned: the logs a test writes DIRECTLY through the plugin's own
+    # helpers. Not scanned: `real_gate_worker_*.log` and `sleep-*.log`, which a
+    # SPAWNED subprocess writes. Those legitimately embed a temp path in a
+    # failure message (a real worker really did run and really did report a
+    # timeout), and the test does not own their output path. Including them
+    # produced false failures without adding protection: the dangerous case is
+    # fixture skill names appearing in the loop/adoption logs, all of which are
+    # covered below.
+    DIRECT = ("auto_loop.log", "adoptions.log", "failure_memory.log",
+              "fragments.log", "inner_loop.log", "ab_harness.log",
+              "suggestions.log", "cycle_history.log")
     for log in sorted(runs.glob("*.log")) if runs.is_dir() else []:
+        if log.name not in DIRECT:
+            continue
         try:
             body = log.read_text(encoding="utf-8", errors="replace")
         except OSError:

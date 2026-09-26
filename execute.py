@@ -22,7 +22,7 @@ import sys
 
 
 PLUGIN_NAME = "skillopt"
-EXPECTED_VERSION = "1.8.26"
+EXPECTED_VERSION = "1.8.27"
 
 
 def main() -> int:
@@ -210,7 +210,7 @@ def main() -> int:
     loop_started_not_ticked = (
         auto_state.get("running") is True and cycles == 0
     )
-    # v1.8.26: the stall test requires POSITIVE evidence that a loop thread is
+    # v1.8.27: the stall test requires POSITIVE evidence that a loop thread is
     # registered. `running` absent/None means no auto-loop thread ever
     # registered - which is the normal state when this file is run standalone
     # (no Agent Zero server) and is not a plugin defect. Previously only
