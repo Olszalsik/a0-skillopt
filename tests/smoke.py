@@ -210,7 +210,6 @@ def t_v110_files() -> None:
         "tools/skillopt_sleep.py", "tools/skillopt_train.py",
         "tools/skillopt_status.py",
         "extensions/python/agent_init/_50_skillopt_auto_loop.py",
-        "extensions/python/hooks/_post_skill_adopt.py",
         "extensions/python/monologue_end/_60_skillopt_harvest_rollout.py",
         "extensions/python/monologue_start/_40_skillopt_warn.py",
         "webui/config.html", "webui/skillopt-dashboard.js",
@@ -262,6 +261,259 @@ def t_v110_held_out() -> None:
     ok, reason = validate_proposal(proposed, current, min_chars=200, min_improvement_pp=5.0, max_shrink_ratio=0.5, held_out=held)
     assert not ok, f"expected reject, got ok reason={reason!r}"
     assert "held-out" in reason or "held_out" in reason, f"unexpected reason: {reason!r}"
+
+
+@test("v1.8.24: every declared config key has a reader in the plugin source")
+def t_v1824_config_keys_have_readers() -> None:
+    """P2.12. A setting that is declared but never read is a switch the
+    operator can flip that does nothing - and the UI offers no hint. That
+    class of defect shipped before (a `risk_floor_pct` slider bound to a
+    backend with no implementation) and is invisible to any other test.
+
+    Scans every leaf key in default_config.yaml against the plugin's own
+    source. Excluded are the declaration file itself, this test, and the
+    prose docs, since a key named only in a README is documented, not read.
+    """
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner as _sr
+    except Exception:
+        from helpers import sleep_runner as _sr
+
+    import re as _re
+
+    root = Path(PLUGIN_ROOT)
+    defaults = _sr.default_config()
+    assert defaults, "default_config.yaml parsed to nothing"
+
+    def leaves(node, prefix=""):
+        out = []
+        if isinstance(node, dict):
+            for k, v in node.items():
+                name = f"{prefix}{k}"
+                if isinstance(v, dict) and v:
+                    out.extend(leaves(v, name + "."))
+                else:
+                    out.append(name)
+        return out
+
+    keys = sorted(set(leaves(defaults)))
+
+    # Source that can actually read a key. Excluding the docs matters: a key
+    # mentioned only in CHANGELOG.md is not wired.
+    sources = []
+    for path in root.rglob("*"):
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        if path.suffix not in (".py", ".js", ".html", ".md"):
+            continue
+        if path.name in ("default_config.yaml", "smoke.py"):
+            continue
+        if path.suffix == ".md" and path.name in (
+            "README.md", "CHANGELOG.md", "AGENTS.md", "ROADMAP.md",
+            "ROADMAP_AUDIT.md", "INSTALL.md", "SETUP.md", "RELEASE_NOTES.md",
+        ):
+            continue
+        try:
+            sources.append((path, path.read_text(encoding="utf-8", errors="replace")))
+        except OSError:
+            continue
+
+    unread = []
+    for dotted in keys:
+        leaf = dotted.rsplit(".", 1)[-1]
+        # A key may be read by its leaf name (the usual case, since the
+        # nested sections are consumed as separate config entries) or by its
+        # full dotted path.
+        pattern = _re.compile(r"(?<![\w.])" + _re.escape(leaf) + r"(?![\w])")
+        if not any(pattern.search(text) for _p, text in sources):
+            unread.append(dotted)
+
+    # Known-dead keys, each with why. This list is the point of the test, not
+    # an escape hatch: the assertion below is on the SET DIFFERENCE, so adding a
+    # new dead setting fails the suite, while these stay visible instead of
+    # being silently deleted. Remove an entry when the key is wired.
+    KNOWN_DEAD = {
+        "official_target_model": (
+            "the real skillopt_sleep CLI has no such flag; kept so an existing "
+            "config.json does not fail validation"
+        ),
+        "log_level": (
+            "a plugin must not reconfigure root logging - the framework owns "
+            "it. Wire via the framework's logging settings, not this key"
+        ),
+        "skill_target": "superseded by per-skill governance policy.json",
+        "sleep_schedule": (
+            "scheduling belongs to the A0 scheduler's job_loop, which is what "
+            "the hub watchdog extension uses"
+        ),
+        "cycle_history_include_skipped": "writer-side filter not implemented",
+        "cycle_history_min_outcome": "writer-side filter not implemented",
+        "fragment_max_history_per_id": (
+            "per-fragment snapshot pruning not implemented; snapshots are "
+            "unbounded, so fragments/ needs periodic manual cleanup"
+        ),
+        "fragment_snapshot_dir": "snapshot dir is not configurable",
+        "cadence.floor_seconds": "cadence lower bound not enforced",
+        "cadence.ceiling_seconds": "cadence upper bound not enforced",
+    }
+
+    unexpected = [k for k in unread if k not in KNOWN_DEAD]
+    assert not unexpected, (
+        "these config keys are declared but read by nothing: "
+        + ", ".join(unexpected)
+        + " - either wire them or delete them from default_config.yaml"
+    )
+    stale = [k for k in KNOWN_DEAD if k not in unread]
+    assert not stale, (
+        "these keys are in the known-dead allowlist but are now READ - wire "
+        "them properly and drop the allowlist entry: " + ", ".join(stale)
+    )
+    _ok(
+        f"all {len(keys)} declared config keys have a reader "
+        f"({len(KNOWN_DEAD)} documented known-dead)"
+    )
+
+
+@test("v1.8.24: ungated direct-path auto-adopt is refused unless opted in")
+def t_v1824_ungated_direct_adopt_blocked() -> None:
+    """P1.6. "The official package is absent, so fall back" was silently
+    equivalent to "adopt ungated": the mock counterfactual gate is advisory,
+    and a real-gate spawn only happens when the gate is enabled and there are
+    enough held-out rollouts. With neither, only the structural pre-filter
+    stood between a proposal and the live skill - which is how an unloadable
+    skill reached disk on 2026-09-25.
+
+    Official-gated proposals must remain exempt: the upstream monotonic gate is
+    authoritative and already ran.
+    """
+    import shutil as _shutil
+    import tempfile as _tempfile
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner as _sr, auto_loop as _al
+    except Exception:
+        from helpers import sleep_runner as _sr, auto_loop as _al
+
+    tmp = Path(_tempfile.mkdtemp(prefix="skillopt_v1824_ungated_"))
+    try:
+        _gov_setup(tmp)
+        stage = tmp / "staging"
+        stage.mkdir()
+        skills = tmp / "skills"
+        skills.mkdir()
+        name = "v1824_ungated_skill"
+        (tmp / name).mkdir()
+        (tmp / name / ".skillopt.optin").write_text("", encoding="utf-8")
+
+        saved_stage, saved_skills = _sr.staging_dir, _sr.a0_skills_dir
+        saved_log, saved_save = _al._latest_sleep_log, _al._save_state
+        _sr.staging_dir = lambda: stage
+        _sr.a0_skills_dir = lambda: skills
+        _al._latest_sleep_log = lambda: None
+        _al._save_state = lambda s: None
+
+        def opt_in(skill):
+            (tmp / skill).mkdir(exist_ok=True)
+            (tmp / skill / ".skillopt.optin").write_text("", encoding="utf-8")
+
+        try:
+            # Real gate off and no official marker: nothing measured this.
+            opt_in(name)
+            src = _v1822_valid_proposal(name, stage)
+            cfg = {
+                "auto_adopt": True,
+                "gate_min_chars": 50,
+                "ab_harness_enabled": False,
+                "replay_real_gate_enabled": False,
+                "replay_real_executor_enabled": False,
+                "auto_adopt_max_per_tick": 5,
+            }
+            thread = _al.AutoLoopThread(get_config=lambda: cfg)
+            outcome = thread._adopt_one({}, cfg, src)
+            assert outcome == "ungated_blocked", (
+                f"expected the ungated adopt to be refused, got {outcome!r}")
+            assert not (skills / name / "SKILL.md").is_file(), (
+                "an ungated proposal must not write the live skill")
+            assert src.is_file(), (
+                "it must stay in staging so a human can /adopt it")
+
+            # The documented opt-in restores the old behaviour. A fresh
+            # proposal: the first leg already marked this skill as cycled, so
+            # reusing it would be skipped by governance rather than by us.
+            name2 = "v1824_optin_skill"
+            opt_in(name2)
+            src2 = _v1822_valid_proposal(name2, stage)
+            cfg2 = dict(cfg, allow_ungated_direct_adopt=True)
+            thread2 = _al.AutoLoopThread(get_config=lambda: cfg2)
+            outcome2 = thread2._adopt_one({}, cfg2, src2)
+            assert outcome2 == "adopted", (
+                f"opt-in must allow the ungated adopt, got {outcome2!r}")
+            assert (skills / name2 / "SKILL.md").is_file()
+
+            # An official-gated proposal is exempt even with the flag off.
+            name3 = "v1824_official_skill"
+            opt_in(name3)
+            src3 = _v1822_valid_proposal(name3, stage)
+            _sr.write_official_gate_marker(src3, skill_name=name3)
+            thread3 = _al.AutoLoopThread(get_config=lambda: cfg)
+            outcome3 = thread3._adopt_one({}, cfg, src3)
+            assert outcome3 == "adopted", (
+                f"official-gated must bypass this guard, got {outcome3!r}")
+            assert (skills / name3 / "SKILL.md").is_file()
+        finally:
+            _sr.staging_dir, _sr.a0_skills_dir = saved_stage, saved_skills
+            _al._latest_sleep_log, _al._save_state = saved_log, saved_save
+    finally:
+        _shutil.rmtree(tmp, ignore_errors=True)
+        _c3_cleanup_fragments(
+            ["v1824_ungated_skill", "v1824_optin_skill", "v1824_official_skill"]
+        )
+    _ok("ungated direct adopt refused; opt-in and official-gated exempt")
+
+
+@test("v1.8.24: skill-name guard blocks traversal without imposing a charset")
+def t_v1824_skill_name_guard() -> None:
+    """P1.8: 13 sites joined a caller-supplied name onto the skills dir.
+
+    Reachable from the adopt/staged/fragments HTTP endpoints and from staged
+    proposal files, which are LLM-written. The guard must block traversal
+    WITHOUT rejecting the names this plugin's own subsystems use - an earlier
+    revision mirrored the framework's `^[a-z0-9-]+$` and misclassified
+    `skillA` / `v1821_drain_good` / `skillopt_prop_*` as attacks.
+    """
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner as _sr
+    except Exception:
+        from helpers import sleep_runner as _sr
+
+    must_block = [
+        "../../etc", "..", "../scheduled-tasks", "..\\windows",
+        "a/b", "a\\b", "/etc/passwd", "C:\\Windows", "C:",
+        ".", ".hidden", ".git/config", "con", "NUL", "com1", "aux.txt",
+        "", "   ", None, 123, "x" * 65,
+    ]
+    for name in must_block:
+        assert not _sr.is_safe_skill_name(name), f"{name!r} must be rejected"
+        try:
+            _sr.safe_skill_dir(name)
+        except ValueError:
+            pass
+        except Exception as exc:
+            assert False, f"{name!r} raised {type(exc).__name__}, want ValueError"
+        else:
+            assert False, f"{name!r} was NOT blocked"
+
+    must_allow = [
+        "scheduled-tasks", "agent-zero-api-handler-routing", "a", "skill2",
+        "a-b-c-1", "x" * 64, "skillA", "v1821_drain_good", "c3a_adopt",
+        "skillopt_prop__3yc8lj6", "agent-zero.v2",
+    ]
+    base = _sr.a0_skills_dir().resolve()
+    for name in must_allow:
+        assert _sr.is_safe_skill_name(name), f"{name!r} must be allowed"
+        resolved = _sr.safe_skill_dir(name).resolve()
+        assert base in resolved.parents, f"{name!r} resolved outside the skills dir"
+
+    _ok("skill-name guard: traversal blocked, internal names preserved")
 
 
 @test("v1.8.24: validate_proposal enforces the framework skill schema "
@@ -5551,12 +5803,23 @@ def t_hub_contract() -> None:
         from api import hub_status as hs
     import inspect
     assert issubclass(hs.HubStatus, hs.ApiHandler)
-    assert hs.HubStatus.get_methods() == ['GET', 'POST']
-    assert hs.HubStatus.requires_auth() is False
-    assert hs.HubStatus.requires_csrf() is False
+    # v1.8.24 (P0.5): POST removed and auth/CSRF restored. This handler is not
+    # side-effect free - a stale payload makes it spawn
+    # scripts/check_hub_status.py - so serving it anonymously let any network
+    # caller trigger process spawns, rate-limited only by the 3600 s payload
+    # cache. The "read-only public status payload" justification did not hold:
+    # nothing consumed it anonymously.
+    assert hs.HubStatus.get_methods() == ['GET']
+    assert 'POST' not in hs.HubStatus.get_methods()
+    # Inherits the framework's authenticated/CSRF-protected defaults rather
+    # than overriding them to False.
+    assert 'requires_auth' not in vars(hs.HubStatus), \
+        "must not override the framework's auth default"
+    assert 'requires_csrf' not in vars(hs.HubStatus), \
+        "must not override the framework's CSRF default"
     assert hs._STALENESS_S == 3600.0 and hs._REFRESH_TIMEOUT_S == 3.0
     assert inspect.iscoroutinefunction(hs.HubStatus.process)
-    _ok('contract pinned')
+    _ok('contract pinned: GET only, auth + CSRF inherited')
 
 @test('v1.8.13: hub_status fresh payload served without spawn')
 def t_hub_fresh() -> None:

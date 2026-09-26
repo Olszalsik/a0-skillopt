@@ -372,7 +372,7 @@ def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
     try:
         from usr.plugins.skillopt.helpers import fragment_store  # type: ignore
         if skill_used:
-            skill_md = sr.a0_skills_dir() / skill_used / "SKILL.md"
+            skill_md = sr.safe_skill_md(skill_used)
             if skill_md.is_file():
                 ids = fragment_store.active_fragment_ids(skill_md)
                 if ids:

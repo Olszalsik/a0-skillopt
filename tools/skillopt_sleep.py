@@ -135,7 +135,7 @@ class SkilloptSleep(Tool):
         staged.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         src = staged[0]
         skill_name = src.stem if src.suffix == ".md" else "unknown"
-        target = sleep_runner.a0_skills_dir() / skill_name / "SKILL.md"
+        target = sleep_runner.safe_skill_md(skill_name)
         target.parent.mkdir(parents=True, exist_ok=True)
         proposed = src.read_text(encoding="utf-8")
         current = ""

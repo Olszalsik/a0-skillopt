@@ -4,6 +4,115 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.25] - 2026-09-26
+
+Finishes the P0/P1/P2 remediation roadmap that followed the 1.8.24 incident.
+Every item below is either a security fix or a guard that makes a previously
+silent defect fail loudly.
+
+### Security: an unauthenticated subprocess spawn (P0.5)
+
+`api/hub_status.py` advertised `GET|POST` with `requires_auth() -> False` and
+`requires_csrf() -> False`. The handler is not side-effect free: a stale or
+missing payload makes it spawn `scripts/check_hub_status.py`, so an anonymous
+caller could trigger process spawns on a network-reachable instance, rate
+limited only by the 3600 s payload cache. The "read-only public status
+payload" justification did not hold - nothing consumed it anonymously (the
+WebUI dashboard never called it, and the background watchdog reads the file
+directly).
+
+POST is removed and the framework's auth + CSRF defaults are inherited, so
+requiring CSRF is now free. No handler in the plugin relaxes auth any more.
+
+### Security: path traversal via the skill name (P1.8)
+
+Thirteen sites joined a caller-supplied skill name straight onto the skills
+directory, reachable from the adopt/staged/fragments HTTP endpoints and from
+staged proposal files, which are LLM-written. New
+`sleep_runner.is_safe_skill_name` / `safe_skill_dir` / `safe_skill_md` make
+traversal unrepresentable and re-check that the resolved path is still inside
+the skills directory after normalisation.
+
+The guard is deliberately **not** the framework's `^[a-z0-9-]+$` charset. That
+is a naming policy for authored skills; enforcing it here rejected names this
+plugin's own subsystems use (`skillA`, `v1821_drain_good`,
+`skillopt_prop_*`). An earlier revision did exactly that and broke 27 tests.
+What the guard rejects is only what can escape: separators, `..`, dot-prefixes,
+drive-relative forms, NUL, and Windows reserved device names.
+
+`governance._skill_dir` validates the name with the shared predicate but joins
+it onto its OWN base. Delegating the join to `safe_skill_dir` pointed every
+governance test at the *production* skills tree, because that module's sandbox
+is `_TEST_SKILLS_DIR` rather than the `SKILLOPT_SKILLS_DIR` env override -
+reintroducing the v1.8.19 P4 test-isolation defect.
+
+### Correctness: an ungated direct-path adoption (P1.6)
+
+"The official package is absent, so fall back" was silently equivalent to
+"adopt ungated": the mock counterfactual gate is advisory, and a real-gate
+spawn only happens when the gate is enabled and there are enough held-out
+rollouts. With neither, only the structural pre-filter stood between a
+proposal and the live skill.
+
+New `allow_ungated_direct_adopt` (default **false**) refuses such a
+proposal, leaves it in staging for human review, and logs how to opt in.
+Official-gated proposals are exempt - the upstream monotonic gate is
+authoritative and already ran. Manual `/adopt` is unaffected.
+
+### Correctness: a dead extension (P1.7)
+
+`extensions/python/hooks/_post_skill_adopt.py` targeted `hooks`, which is not
+an extension point in this framework, and was a module-level function rather
+than an `Extension` subclass, so the loader could never have found it. It is
+deleted, along with its `execute.py` and smoke-suite manifest entries. The
+`skillopt_train` tool's `validate` verb had told the agent the validation gate
+"is implemented in the post-adopt hook"; it now names the real gate.
+
+### Correctness: nested config sections were unreachable (P2.11)
+
+`default_config()` used a flat hand-rolled parser, so a bare `budget:`,
+`cadence:` or `governance:` header was stored as the **empty string**.
+`cfg.get("budget", {}).get(...)` then raised `AttributeError` - and because
+the surrounding `except` fell through, the daily budget cap was silently
+disabled in production. `default_config()` now uses `yaml.safe_load` when
+PyYAML is importable (it ships with Agent Zero) and keeps the flat parser only
+as a no-dependency fallback, which now omits section headers rather than
+fabricating `""` for them.
+
+### Diagnostics: the health check's stall test (P2.12)
+
+`execute.py` reported a false "HEALTH CHECK FAILED" whenever rollouts exceeded
+the threshold and no cycle had run, including when run standalone on a machine
+where Agent Zero is not running. The stall test now requires positive evidence
+that a loop thread is registered; a genuine running-but-stalled loop still
+fails. A companion smoke test asserts every key declared in
+`default_config.yaml` is read by the plugin's own source, with an explicit
+allowlist for keys known to be dead and a reason each.
+
+### Documentation (P2.10)
+
+`AGENTS.md` rewritten as a DOX document: 54,402 -> 11,196 bytes. The
+version-by-version history was already in `CHANGELOG.md`. Two phantom modules
+(`helpers/audit_log.py`, `helpers/config_loader.py` - the real ones are
+`api/audit_log.py` and `api/config.py`) and every hardcoded test count are
+gone, so the doc can no longer rot. The fail-open/fail-closed gate matrix, the
+single-writer state discipline, the Windows `os.kill` and zombie-liveness
+traps, and the `py_compile`-cannot-catch-a-trailing-comma lesson were kept.
+
+### Tests
+
+186 cases, 185 passing. The one failure is the pre-existing
+`v1.8.5 SECURITY: apply ... atomic 0600` test, which asserts POSIX permission
+bits and cannot pass on Windows. `v1.8.16` (judge throttle pacing) is
+timing-sensitive and flakes independently of these changes.
+
+Five new cases: the framework-schema gate, the harvest decision matrix, the
+skill-name guard, the ungated-adopt refusal, and the declared-key-has-a-reader
+check. The hub_status contract test was **inverted**: it pinned
+`requires_auth() is False`, so it asserted the vulnerable behaviour.
+
+---
+
 ## [1.8.24] - 2026-09-26
 
 ### Fix: a partial upgrade of the install could not adopt an unloadable skill

@@ -131,7 +131,26 @@ replay_real_gate_enabled: true
 # resolved FAIL-OPEN: the proposal is adopted with a loud
 # real_gate_stale note (quarantining would permanently destroy good
 # proposals on a transient executor outage). Default 4h.
+#
+# v1.8.24: that fail-open applies to a MISSING verdict only. A sidecar that
+# reached status "done" with verdict.ok=false is a completed measurement that
+# did not clear the bar, and is now QUARANTINED. See the harvest decision
+# matrix in helpers/auto_loop.py::_harvest_real_gate.
 replay_real_gate_stale_after_s: 14400
+
+# v1.8.24 (P1.6). A direct-path proposal (the official skillopt_sleep engine
+# absent, so nothing upstream-gated it) reaches the adopt point with NO
+# authoritative measurement whenever the real gate is off, the spawn failed,
+# or there were too few held-out rollouts - and the mock counterfactual gate
+# is advisory. That combination silently made "the dependency is missing"
+# equivalent to "adopt anything that passes the structural pre-filter", which
+# is how an unloadable skill reached disk on 2026-09-25.
+#
+# false (default): such a proposal is quarantined with a loud reason and left
+#   for human review in the dashboard. Manual /adopt still works.
+# true: accept ungated direct rewrites. A deliberate opt-in to losing the
+#   gate, not a side effect of a missing package.
+allow_ungated_direct_adopt: false
 # v1.8.22: one real gate spawns 2 x replay_real_max_tasks full A0
 # monologues. Recorded once per gate spawn into the per-skill
 # BudgetTracker (cents-only); 0 disables the bookkeeping.

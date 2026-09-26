@@ -132,7 +132,7 @@ def main() -> int:
         if not isinstance(held_out, list):
             raise RuntimeError('tasks file is not a json list')
 
-        live_path = sleep_runner.a0_skills_dir() / skill / 'SKILL.md'
+        live_path = sleep_runner.safe_skill_md(skill)
         if not live_path.is_file():
             raise RuntimeError(f'live SKILL.md missing: {live_path}')
         current_md = live_path.read_text(encoding='utf-8')

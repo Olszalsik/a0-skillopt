@@ -22,7 +22,7 @@ import sys
 
 
 PLUGIN_NAME = "skillopt"
-EXPECTED_VERSION = "1.8.24"
+EXPECTED_VERSION = "1.8.25"
 
 
 def main() -> int:
@@ -74,7 +74,6 @@ def main() -> int:
         "extensions/webui/sidebar-end/skillopt-card.html",
         "extensions/python/banners/_10_skillopt_status.py",
         "extensions/python/agent_init/_50_skillopt_auto_loop.py",
-        "extensions/python/hooks/_post_skill_adopt.py",
         "extensions/python/monologue_end/_60_skillopt_harvest_rollout.py",
         "extensions/python/monologue_start/_40_skillopt_warn.py",
         "agents/skillopt_trainer/agent.yaml",
@@ -211,10 +210,20 @@ def main() -> int:
     loop_started_not_ticked = (
         auto_state.get("running") is True and cycles == 0
     )
+    # v1.8.25: the stall test requires POSITIVE evidence that a loop thread is
+    # registered. `running` absent/None means no auto-loop thread ever
+    # registered - which is the normal state when this file is run standalone
+    # (no Agent Zero server) and is not a plugin defect. Previously only
+    # `running is True` was exempted, so a standalone `python execute.py` on a
+    # machine where A0 is not running reported a false "HEALTH CHECK FAILED"
+    # whenever rollouts happened to be over the threshold. A genuine stall -
+    # thread registered, enough rollouts, still no cycle - still fails.
+    loop_registered = auto_state.get("running") is not None
     loop_stalled = (
         auto_enabled
         and rollout_count >= threshold
         and cycles == 0
+        and loop_registered
         and not loop_started_not_ticked
     )
     if loop_started_not_ticked and rollout_count >= threshold:
@@ -222,11 +231,21 @@ def main() -> int:
         print(f"[{PLUGIN_NAME}] WARN: auto_loop is enabled and rollouts={rollout_count} >= threshold={threshold},")
         print(f"[{PLUGIN_NAME}]   but cycles_run={cycles}. The loop has started and should fire on its first tick;")
         print(f"[{PLUGIN_NAME}]   re-run this check after auto_loop_interval_sec has elapsed.")
+    elif (
+        auto_enabled
+        and rollout_count >= threshold
+        and cycles == 0
+        and not loop_registered
+    ):
+        print()
+        print(f"[{PLUGIN_NAME}] WARN: rollouts={rollout_count} >= threshold={threshold} but cycles_run=0 and")
+        print(f"[{PLUGIN_NAME}]   no auto-loop thread is registered. Expected when Agent Zero is not")
+        print(f"[{PLUGIN_NAME}]   running (this check was run standalone). Start A0 and re-run to confirm cycling.")
     if loop_stalled:
         print()
         print(f"[{PLUGIN_NAME}] HEALTH CHECK FAILED.")
-        print(f"[{PLUGIN_NAME}]   reason: auto_loop is enabled, rollouts={rollout_count} >= threshold={threshold},")
-        print(f"[{PLUGIN_NAME}]   but cycles_run={cycles}. The loop never fired.")
+        print(f"[{PLUGIN_NAME}]   reason: auto_loop is enabled and REGISTERED, rollouts={rollout_count} >= threshold={threshold},")
+        print(f"[{PLUGIN_NAME}]   but cycles_run={cycles}. The loop is running and never fired.")
         print(f"[{PLUGIN_NAME}]   inspect logs/runs/auto_loop.log and .auto_loop_last_error.json")
         return 5
 

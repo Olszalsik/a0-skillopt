@@ -91,11 +91,20 @@ class SkilloptTrain(Tool):
         )
 
     def _validate(self) -> Response:
+        # v1.8.24: this used to point at extensions/python/hooks/
+        # _post_skill_adopt.py, which was dead - `hooks` is not an extension
+        # point in this framework, and the file was a module-level function
+        # rather than an Extension subclass, so the loader could never have
+        # found it. The gate is not a hook: it is sleep_runner.validate_proposal,
+        # called by every adopt path. Deleted with the file.
         return Response(
             message=(
-                "Validation gate is implemented in the post-adopt hook "
-                "(extensions/python/hooks/_post_skill_adopt.py) and runs "
-                "automatically when you call `skillopt_sleep verb=adopt`."
+                "Validation is not a hook. It is `sleep_runner.validate_proposal`, "
+                "called by every adopt path (the auto-loop drain, "
+                "`skillopt_sleep verb=adopt`, and `POST /adopt`). It checks the "
+                "framework skill schema first, then the structural stages, and "
+                "the harvest applies the real-gate verdict: a completed negative "
+                "verdict quarantines, and only a missing verdict fails open."
             ),
             break_loop=False,
         )

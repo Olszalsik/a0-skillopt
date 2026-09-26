@@ -23,7 +23,7 @@ def _resolve_skill_path(skill_name: str) -> Path | None:
     """Resolve a skill name to its SKILL.md path. None if missing."""
     if not skill_name:
         return None
-    p = sleep_runner.a0_skills_dir() / skill_name / "SKILL.md"
+    p = sleep_runner.safe_skill_md(skill_name)
     return p if p.is_file() else None
 
 

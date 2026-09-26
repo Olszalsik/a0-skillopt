@@ -638,7 +638,7 @@ class AutoLoopThread(threading.Thread):
             # Read the current SKILL.md so the targeted prompt is
             # self-contained. Fall back to empty if missing.
             try:
-                current_text = (sleep_runner.a0_skills_dir() / skill / "SKILL.md").read_text(
+                current_text = (sleep_runner.safe_skill_md(skill)).read_text(
                     encoding="utf-8", errors="replace",
                 )
             except Exception:
@@ -1050,7 +1050,7 @@ class AutoLoopThread(threading.Thread):
         state["real_gate"] = None
         _save_state(state)
 
-        target = sleep_runner.a0_skills_dir() / skill_name / "SKILL.md"
+        target = sleep_runner.safe_skill_md(skill_name)
         target.parent.mkdir(parents=True, exist_ok=True)
         audit = sleep_runner.runs_dir() / "adoptions.log"
         audit.parent.mkdir(parents=True, exist_ok=True)
@@ -1231,7 +1231,7 @@ class AutoLoopThread(threading.Thread):
         if rg is not None:
             return self._harvest_real_gate(state, cfg, src, skill_name, rg)
 
-        target = sleep_runner.a0_skills_dir() / skill_name / "SKILL.md"
+        target = sleep_runner.safe_skill_md(skill_name)
         target.parent.mkdir(parents=True, exist_ok=True)
         proposed = src.read_text(encoding="utf-8")
         current = ""
@@ -1339,6 +1339,38 @@ class AutoLoopThread(threading.Thread):
                     self._log("ab_harness: never ran for this skill (no rollouts yet)")
             except Exception as e:
                 self._log(f"ab_harness status read failed: {e}")
+
+        # v1.8.24 (P1.6): refuse an UNGATED direct-path adoption.
+        #
+        # Reaching the write below on the direct (non-official-gated) path means
+        # no authoritative measurement exists: either the real gate is off, or
+        # the spawn failed, or there were too few held-out rollouts. The mock
+        # counterfactual gate is advisory by default, so at this moment only the
+        # structural pre-filter stands between the proposal and the live skill.
+        # "The official package is absent, so fall back" was therefore silently
+        # equivalent to "adopt ungated" - which is how an unloadable skill
+        # reached disk on 2026-09-25.
+        #
+        # Fail closed. An operator who genuinely wants this sets
+        # `allow_ungated_direct_adopt: true`: a deliberate opt-in to running
+        # without a gate, not a side effect of a missing dependency.
+        #
+        # Official-gated proposals are exempt - the upstream monotonic held-out
+        # gate is authoritative and already ran, so official_gated=True *is* a
+        # measurement having happened. Auto-loop only: a human reviewing the
+        # dashboard and calling /adopt is the intended escape hatch and must
+        # keep working.
+        if ok and not official_gated and not bool(
+            cfg.get("allow_ungated_direct_adopt", False)
+        ):
+            self._log(
+                f"ungated direct adopt REFUSED for {skill_name}: nothing gated "
+                f"this proposal (official engine absent, and no real replay "
+                f"verdict). Left in staging for review. Set "
+                f"allow_ungated_direct_adopt: true to accept ungated rewrites, "
+                f"or install skillopt for the authoritative gate."
+            )
+            return "ungated_blocked"
 
         if ok:
             # v1.8.24 (P0): snapshot + atomic replace, same reason as the

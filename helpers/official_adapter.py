@@ -131,7 +131,7 @@ def _resolve_skill_path(target: str | None) -> str | None:
     """
     if not target:
         return None
-    p = sleep_runner.a0_skills_dir() / target / "SKILL.md"
+    p = sleep_runner.safe_skill_md(target)
     return str(p) if p.is_file() else None
 
 

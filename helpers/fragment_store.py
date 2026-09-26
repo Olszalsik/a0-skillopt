@@ -536,7 +536,7 @@ def restore_default_snapshot(skill_name: str) -> dict[str, Any]:
                         "error": f"no _default snapshot for skill {skill_name!r}"}
             snap = vers[-1]
         restored = snap.read_text(encoding="utf-8")
-        target = sleep_runner.a0_skills_dir() / skill_name / "SKILL.md"
+        target = sleep_runner.safe_skill_md(skill_name)
         # Snapshot the current (pre-rollback) bytes first so the rollback
         # is reversible. snapshot_default moves the existing pre_adopt
         # aside and writes `current` as the new pre_adopt.

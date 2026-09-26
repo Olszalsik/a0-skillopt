@@ -111,19 +111,129 @@ def a0_skills_dir() -> Path:
     return plugin_root().parent.parent / "skills"
 
 
-def default_config() -> dict[str, Any]:
-    """Parse the bundled default_config.yaml as a dict (no PyYAML -> light parse)."""
-    p = plugin_root() / "default_config.yaml"
+# Path-safety rules, NOT the framework's naming policy.
+#
+# An earlier revision of this function mirrored helpers/skills.py::_NAME_RE
+# (`^[a-z0-9-]+$`) on the assumption that a skill name is a single legal
+# charset. That is the wrong rule for the wrong reason: the charset is a
+# policy for *authored* skills, and enforcing it here rejected names this
+# plugin's own subsystems legitimately use (governance fixtures, generated
+# `skillopt_prop_*` proposal ids, `skillA`). A guard that misclassifies valid
+# internal input as an attack gets routed around, and then protects nothing.
+#
+# What matters here is only: can this string escape the skills directory?
+# None of the following can, so all are allowed - letters of any case, digits,
+# hyphen, underscore, and interior dots. Everything that *could* escape is
+# rejected below.
+_UNSAFE_NAME_CHARS = ("/", "\\", ":", "\x00")
+_WINDOWS_RESERVED = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)]
+)
+_SKILL_NAME_MAX = 64
+
+
+def is_safe_skill_name(skill_name: Any) -> bool:
+    """True when `skill_name` cannot escape the skills directory.
+
+    Rejects, because each is a traversal or a filesystem hazard:
+      * empty / whitespace-only
+      * any of `/ \\ :` or NUL - separators, drive-relative paths, and the
+        stream terminator
+      * `.` and `..`, and any name starting with `.` (dotfiles, and the
+        parent-directory family)
+      * Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9),
+        with or without an extension
+      * anything longer than 64 characters
+    """
+    if not isinstance(skill_name, str):
+        return False
+    name = skill_name.strip()
+    if not name or len(name) > _SKILL_NAME_MAX:
+        return False
+    if any(ch in name for ch in _UNSAFE_NAME_CHARS):
+        return False
+    if name.startswith("."):
+        return False
+    if name.split(".")[0].lower() in _WINDOWS_RESERVED:
+        return False
+    return True
+
+
+def safe_skill_dir(skill_name: Any) -> Path:
+    """Resolve `skill_name` to its skills subdirectory, or raise ValueError.
+
+    v1.8.24 (P1.8). Thirteen call sites joined a caller-supplied skill name
+    straight onto the skills directory (`a0_skills_dir() / skill_name`). None
+    validated it, so a name containing `..` or a separator escaped the skills
+    tree - reachable from the adopt/staged/fragments HTTP endpoints and from
+    staged proposal files, which are written by an LLM.
+
+    Two layers, because either alone is incomplete:
+
+    1. `is_safe_skill_name` makes traversal unrepresentable - no separator and
+       no dot-prefix means there is no `..` to follow and no way to name a
+       sibling directory;
+    2. the resolved path must still be inside the skills dir after
+       normalisation. That catches whatever layer 1 does not, e.g. a
+       symlinked skill directory, or a case-insensitive filesystem resolving
+       `..` differently.
+
+    Raises rather than returning None so a caller cannot forget to check.
+    Every loop caller is already inside a try/except that must not kill the
+    auto-loop thread, and the API endpoints translate the ValueError into a
+    client error.
+    """
+    if not is_safe_skill_name(skill_name):
+        raise ValueError(
+            f"unsafe skill name: {skill_name!r} "
+            f"(no path separators, no leading '.', max {_SKILL_NAME_MAX} chars, "
+            f"not a reserved device name)"
+        )
+    base = a0_skills_dir().resolve()
+    target = (base / skill_name.strip()).resolve()
+    if target != base and base not in target.parents:
+        raise ValueError(f"skill name escapes the skills directory: {skill_name!r}")
+    return a0_skills_dir() / skill_name.strip()
+
+
+def safe_skill_md(skill_name: Any) -> Path:
+    """`safe_skill_dir(skill_name) / "SKILL.md"` — the full document path."""
+    return safe_skill_dir(skill_name) / "SKILL.md"
+
+
+def _light_parse_yaml(text: str) -> dict[str, Any]:
+    """Flat `key: value` fallback for hosts without PyYAML.
+
+    v1.8.24 (P2.11): a bare section header (`budget:`, `cadence:`,
+    `governance:`) used to be stored as the EMPTY STRING, so a consumer doing
+    `cfg.get("budget", {}).get(...)` raised AttributeError - which is how the
+    daily budget cap was silently disabled in production (the except fell
+    through). A section header now stores nothing, so the consumer's default
+    applies and `.get()` is safe.
+
+    This fallback cannot represent nesting at all. It exists so the plugin
+    still loads on a PyYAML-less host; the nested sections are simply absent
+    there, and their consumers must tolerate that. When PyYAML is present -
+    which is the normal case - `default_config()` uses the real parser and the
+    nested sections work.
+    """
     out: dict[str, Any] = {}
-    if not p.is_file():
-        return out
-    for raw in p.read_text(encoding="utf-8").splitlines():
+    for raw in text.splitlines():
         line = raw.split("#", 1)[0].rstrip()
         if not line or ":" not in line:
+            continue
+        if line[:1].isspace():
+            # An indented line is nested content this parser cannot represent.
             continue
         key, _, val = line.partition(":")
         key = key.strip()
         val = val.strip()
+        if not val:
+            # Section header: no scalar to store. Storing "" here is what made
+            # `cfg.get("budget", {})` return a str.
+            continue
         if val.lower() in ("true", "false"):
             out[key] = val.lower() == "true"
         elif val.startswith('"') and val.endswith('"'):
@@ -137,6 +247,36 @@ def default_config() -> dict[str, Any]:
                 except ValueError:
                     out[key] = val
     return out
+
+
+def default_config() -> dict[str, Any]:
+    """Parse the bundled default_config.yaml as a dict.
+
+    v1.8.24 (P2.11): uses PyYAML when it is importable, so the nested
+    `budget:` / `cadence:` / `governance:` sections arrive as dicts instead of
+    the empty strings the flat fallback produced. The flat parser remains as a
+    no-dependency fallback; PyYAML ships with Agent Zero, so the nested path is
+    the normal one.
+
+    The returned mapping is a fresh dict on every call - callers mutate it
+    (e.g. `cfg["x"] = y` in tests), so a shared module-level cache would leak
+    state between callers.
+    """
+    p = plugin_root() / "default_config.yaml"
+    if not p.is_file():
+        return {}
+    text = p.read_text(encoding="utf-8")
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return _light_parse_yaml(text)
+    try:
+        parsed = yaml.safe_load(text)
+    except Exception:
+        # A malformed YAML file must not take the loop down; the light parser
+        # is strictly more forgiving.
+        return _light_parse_yaml(text)
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def _framework_registry_config() -> dict[str, Any]:
@@ -471,7 +611,7 @@ def adopt_write_skill(skill_name: str, proposed: str) -> dict[str, Any]:
     ok=False WITHOUT writing - a snapshot we could not take must not be
     followed by an overwrite, because that is the unrecoverable case.
     """
-    target = a0_skills_dir() / skill_name / "SKILL.md"
+    target = safe_skill_md(skill_name)
     current = ""
     if target.is_file():
         try:

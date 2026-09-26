@@ -137,19 +137,27 @@ async def _run_refresh() -> str | None:
 
 
 class HubStatus(ApiHandler):
-    """GET|POST the SkillOpt hub merge / indexing status payload."""
+    """GET the SkillOpt hub merge / indexing status payload."""
 
     @classmethod
     def get_methods(cls) -> list[str]:
-        return ["GET", "POST"]  # GET is the documented contract for this route
+        # v1.8.24: GET only. POST was advertised but never used, and it was the
+        # reason auth and CSRF had to be switched off for the whole route.
+        return ["GET"]
 
-    @classmethod
-    def requires_auth(cls) -> bool:
-        return False  # read-only, non-sensitive public status payload
-
-    @classmethod
-    def requires_csrf(cls) -> bool:
-        return False  # no state change; plain external GETs must work
+    # v1.8.24: auth and CSRF are restored to the framework defaults.
+    #
+    # This handler is not side-effect free. A stale or missing payload makes it
+    # spawn `scripts/check_hub_status.py` as a subprocess, so an unauthenticated
+    # caller could trigger process spawns on a network-reachable A0 instance,
+    # rate-limited only by the 3600 s payload cache. The "read-only public
+    # status payload" justification did not hold: nothing consumed this
+    # anonymously (the WebUI dashboard never called it, and the background
+    # watchdog reads the same file directly rather than the endpoint), so
+    # relaxing the guards protected nothing and exposed the spawn path.
+    #
+    # Dropping POST removes the state-changing verb, so requiring CSRF is now
+    # free: the framework derives requires_csrf() from requires_auth().
 
     async def process(self, input_data, request):  # type: ignore[no-untyped-def]
         try:

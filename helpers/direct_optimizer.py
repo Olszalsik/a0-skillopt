@@ -67,7 +67,7 @@ A0_SKILLS_DIR = None  # deprecated (v1.8.1): use sleep_runner.a0_skills_dir()
 
 
 def _read_skill_doc(skill_name: str) -> str:
-    p = sleep_runner.a0_skills_dir() / skill_name / "SKILL.md"
+    p = sleep_runner.safe_skill_md(skill_name)
     if p.is_file():
         return p.read_text(encoding="utf-8")
     return ""

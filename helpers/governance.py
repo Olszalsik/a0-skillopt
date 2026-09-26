@@ -122,11 +122,49 @@ def _a0_skills_dir() -> Path:
         return _fallback_skills_dir(here)
 
 
+def _is_safe_skill_name(skill_name: Any) -> bool:
+    """Shared name-safety predicate, resolved the same two-path way as the
+    other cross-module helpers here. Only the PREDICATE is shared: it needs no
+    path knowledge, so it cannot disagree with a caller about which base
+    directory is in play."""
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
+    except Exception:
+        try:
+            from helpers import sleep_runner  # type: ignore
+        except Exception:
+            # Last resort: reject rather than guess, since guessing is the
+            # failure mode that lets a traversal through.
+            return False
+    try:
+        return bool(sleep_runner.is_safe_skill_name(skill_name))
+    except Exception:
+        return False
+
+
 def _skill_dir(skill_name: str) -> Path:
-    """Return <a0>/usr/skills/<name>/. Auto-created only in test mode."""
-    if not skill_name:
-        return _a0_skills_dir() / "_invalid_"
-    p = _a0_skills_dir() / skill_name
+    """Return <a0>/usr/skills/<name>/. Auto-created only in test mode.
+
+    v1.8.24 (P1.8): validates the NAME with the shared predicate, then joins it
+    onto this module's OWN base rather than delegating the join to
+    `sleep_runner.safe_skill_dir`.
+
+    That split matters. `safe_skill_dir` joins onto `a0_skills_dir()`, which
+    honours the `SKILLOPT_SKILLS_DIR` env override - but this module's test
+    sandbox is `_TEST_SKILLS_DIR`, a different override. Delegating the join
+    therefore pointed every governance test at the PRODUCTION skills tree:
+    per-skill `policy.json` lookups missed (so the global default won and the
+    reason came back `mode_opt_out_no_marker` instead of the real one) and
+    marker writes targeted production. That is the P4 test-isolation class the
+    plugin fixed in 1.8.19, reintroduced.
+
+    A predicate needs no path knowledge, so it is shared; the join stays local.
+    """
+    base = _a0_skills_dir()
+    if not _is_safe_skill_name(skill_name):
+        p = base / "_invalid_"
+    else:
+        p = base / str(skill_name).strip()
     if _TEST_SKILLS_DIR is not None:
         p.mkdir(parents=True, exist_ok=True)
     return p

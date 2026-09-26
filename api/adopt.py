@@ -87,7 +87,7 @@ class Adopt(ApiHandler):
                 "error": "no staged proposals — run a sleep cycle first",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-        target = sleep_runner.a0_skills_dir() / skill_name / "SKILL.md"
+        target = sleep_runner.safe_skill_md(skill_name)
         target.parent.mkdir(parents=True, exist_ok=True)
         proposed = src.read_text(encoding="utf-8")
         current = ""
