@@ -8090,6 +8090,41 @@ def t_evalkit_report_capability_and_failure_isolation() -> None:
     _ok("evalkit probes installed options and degrades safely when unavailable")
 
 
+@test("rollout retention is opt-in, age-bounded, and limited to top-level JSON")
+def t_rollout_retention_expiry_boundary() -> None:
+    import tempfile
+    from helpers import sleep_runner
+
+    with tempfile.TemporaryDirectory(prefix="skillopt_retention_") as tmp:
+        root = Path(tmp)
+        old_file = root / "old.json"
+        fresh_file = root / "fresh.json"
+        unrelated = root / "old.txt"
+        nested_dir = root / "nested"
+        nested_dir.mkdir()
+        nested_old = nested_dir / "old.json"
+        for path in (old_file, fresh_file, unrelated, nested_old):
+            path.write_text("{}", encoding="utf-8")
+        now = 2_000_000_000.0
+        import os as _os
+        _os.utime(old_file, (now - 3 * 86400, now - 3 * 86400))
+        _os.utime(fresh_file, (now - 3600, now - 3600))
+        _os.utime(unrelated, (now - 3 * 86400, now - 3 * 86400))
+        _os.utime(nested_old, (now - 3 * 86400, now - 3 * 86400))
+
+        disabled = sleep_runner.enforce_rollout_retention(
+            {"rollout_retention_days": 0}, now=now, root=root)
+        assert disabled == {"enabled": 0, "deleted": 0, "errors": 0}
+        assert old_file.exists()
+
+        enabled = sleep_runner.enforce_rollout_retention(
+            {"rollout_retention_days": 2}, now=now, root=root)
+        assert enabled == {"enabled": 1, "deleted": 1, "errors": 0}, enabled
+        assert not old_file.exists()
+        assert fresh_file.exists() and unrelated.exists() and nested_old.exists()
+    _ok("retention leaves data untouched when off and only expires old rollout JSON")
+
+
 @test("v1.8.19 P4: no test-fixture pollution in production run state (runs LAST)")
 def t_p4_no_fixture_pollution():
     """Guard against the RC7 leak class: the suite must never leave

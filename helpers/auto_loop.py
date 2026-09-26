@@ -189,7 +189,26 @@ class AutoLoopThread(threading.Thread):
 
     def _tick(self, cfg: dict[str, Any], state: dict[str, Any]) -> None:
         """One iteration: maybe launch a Sleep cycle, maybe auto-adopt."""
-        # 1. Count rollouts
+        # 1. Apply opt-in rollout retention before counting. The trigger is
+        # count-based, so keep its persisted baseline aligned when old files
+        # are removed; otherwise a lower count could suppress future cycles.
+        try:
+            retention = sleep_runner.enforce_rollout_retention(cfg)
+            removed = int(retention.get("deleted", 0))
+            if removed:
+                base_before_prune = int(state.get("last_rollout_count_at_cycle", 0) or 0)
+                state["last_rollout_count_at_cycle"] = max(0, base_before_prune - removed)
+                self._log(
+                    f"auto-loop: rollout retention removed {removed} expired file(s); "
+                    f"baseline {base_before_prune} -> {state['last_rollout_count_at_cycle']}"
+                )
+            if retention.get("errors"):
+                self._log(f"auto-loop: rollout retention had {retention['errors']} file error(s)")
+        except Exception as e:
+            # A cleanup problem cannot block harvesting or optimization.
+            self._log(f"auto-loop: rollout retention failed: {e}")
+
+        # Count rollouts after any expiry cleanup.
         rollout_count = len(sleep_runner.list_rollouts())
         # v1.8.18 (P1, audit RC2): count rollouts accumulated SINCE THE LAST
         # CYCLE (persisted in state), not since the previous tick. The old

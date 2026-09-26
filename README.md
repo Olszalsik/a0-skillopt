@@ -153,6 +153,7 @@ When you trust the output, set `auto_adopt: true` in the settings (or POST to `/
 | `privacy_redact_secrets` | `true` | Best-effort redaction of common credential patterns in new rollouts and before direct model calls. |
 | `privacy_include_tool_args` | `false` | Store tool arguments in new rollouts. Enable only when needed; values are still redacted when redaction is on. |
 | `privacy_include_tool_results` | `false` | Store tool results in new rollouts. Enable only when needed; values are still redacted when redaction is on. |
+| `rollout_retention_days` | `0` | Delete rollout JSON files older than this many days during an auto-loop tick. `0` disables expiry. |
 | `replay_evalkit_enabled` | `false` | Attach optional upstream paired statistics to a completed real replay gate when the installed package supports evalkit. Informational only. |
 
 For the full reference with comments, see `default_config.yaml`.
@@ -172,6 +173,9 @@ Review harvested tasks before enabling a provider-backed cycle. Setting
 `privacy_redact_secrets` to `false` disables these safeguards; avoid doing so
 for sensitive conversations. Previously written rollout files are not
 rewritten automatically, though model-bound paths sanitize them before use.
+Set `rollout_retention_days` to a positive whole number to delete old
+`logs/rollouts/*.json` files during auto-loop ticks; `0` keeps them. This
+cleanup does not prune the separate bridge cache or run history.
 
 ### Optional upstream evalkit report
 

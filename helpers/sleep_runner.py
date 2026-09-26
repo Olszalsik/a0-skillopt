@@ -373,6 +373,46 @@ def list_rollouts() -> list[Path]:
     return sorted(p for p in rollouts_dir().glob("*.json") if p.is_file())
 
 
+def enforce_rollout_retention(
+    config: dict[str, Any] | None = None, *, now: float | None = None,
+    root: str | os.PathLike[str] | None = None,
+) -> dict[str, int]:
+    """Delete expired rollout JSON files when a positive age limit is set.
+
+    Retention is opt-in (`rollout_retention_days: 0` disables deletion).
+    Only regular, top-level JSON files in the rollout directory are eligible;
+    staged tasks, bridge caches, run history, and arbitrary nested files are
+    outside this cleanup boundary. File mtime is used so legacy records with
+    no trustworthy timestamp receive the same expiry behavior.
+    `root` and `now` are injectable for isolated deterministic tests.
+    """
+    cfg = config if isinstance(config, dict) else merged_config()
+    try:
+        days = int(cfg.get("rollout_retention_days", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        days = 0
+    if days <= 0:
+        return {"enabled": 0, "deleted": 0, "errors": 0}
+    current_time = time.time() if now is None else float(now)
+    cutoff = current_time - days * 86400
+    directory = Path(root) if root is not None else rollouts_dir()
+    deleted = errors = 0
+    try:
+        candidates = list(directory.glob("*.json"))
+    except OSError:
+        return {"enabled": 1, "deleted": 0, "errors": 1}
+    for path in candidates:
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                deleted += 1
+        except OSError:
+            errors += 1
+    return {"enabled": 1, "deleted": deleted, "errors": errors}
+
+
 def _load_held_out(skill_name: str) -> list[dict[str, Any]]:
     """Return the most recent rollouts attributed to `skill_name`, newest
     first, capped at `replay_held_out_n` (default 8). These are the
@@ -1869,7 +1909,14 @@ def get_status_snapshot() -> dict[str, Any]:
             from usr.plugins.skillopt.helpers import privacy  # type: ignore  # noqa: E402
         except Exception:
             from helpers import privacy  # type: ignore  # noqa: E402
-        privacy_status.update(privacy.privacy_settings(merged_config()))
+        privacy_cfg = merged_config()
+        privacy_status.update(privacy.privacy_settings(privacy_cfg))
+        try:
+            privacy_status["rollout_retention_days"] = max(
+                0, int(privacy_cfg.get("rollout_retention_days", 0) or 0)
+            )
+        except (TypeError, ValueError, OverflowError):
+            privacy_status["rollout_retention_days"] = 0
         privacy_status["applies_to"] = ["new_rollouts", "direct_model_prompts", "official_transcript_bridge"]
         privacy_status["legacy_rollouts"] = "redacted before direct model calls, bridge reuse, and real replay"
     except Exception as e:

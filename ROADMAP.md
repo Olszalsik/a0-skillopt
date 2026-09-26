@@ -6,9 +6,9 @@ If you are a new contributor: start with the **Day 3** items. They are the highe
 
 ## Current audit and next work (2026-09-26)
 
-This section reflects the local plugin snapshot reviewed on 2026-09-26. The working tree contains v1.8.28 development changes. The deterministic plugin smoke suite passed all 201 checks on this date; no live A0 runtime or provider-backed optimization cycle was exercised.
+This section reflects the local plugin snapshot reviewed on 2026-09-26. The deterministic plugin smoke suite passed all 202 checks after v1.8.29 retention work; no live A0 runtime or provider-backed optimization cycle was exercised.
 
-1. **Verify the v1.8.28 slot-model routing changes.** `chat_model.py` now resolves `chat` and `utility` slots, and the optimizer, judge, and official adapter were changed to consume them. The matching smoke-test changes are present but were not run during this review. Run the full smoke suite before relying on the new utility-slot path, especially when the active preset has no utility model or the provider key/base URL comes from a preset.
+1. **Live-check the v1.8.28 slot-model routing changes.** `chat_model.py` resolves `chat` and `utility` slots, and the optimizer, judge, and official adapter consume them. Deterministic coverage passes for utility-slot resolution and a missing slot; a live provider-backed pilot is still needed to validate preset credentials and `api_base` end to end.
 2. **Decide whether gated-cycle judge labels should persist.** `judge_client.judge_rollouts()` explicitly returns results only in memory, while `llm_judge.label_rollout_file()` atomically writes labels and is used by the standalone labeling script. `run_sleep_cycle.py` uses the stateless helper, so the same rollout may be judged again on future runs. If persistence is desired, make it atomic, retain model/time/confidence metadata, and add coverage for retries and already-labeled records; otherwise keep the stateless behavior and make its recurring cost clear in the UI/docs.
 3. **Configure and validate a real official-engine backend.** The one-shot runner rejects an unset or `mock` backend by default because the mock scorer rejects proposals by construction. A run that deliberately opts into mock mode validates orchestration only; it does not establish an effective optimization cycle. Keep real replay opt-in and gated until a bounded live pilot produces a report that passes the authoritative gate.
 4. **Replace newest-directory attribution for no-task outcomes.** The recorded v1.8.20 behavior can report the newest prior engine directory when the current cycle creates no task directory. Correlate a run with its own start time/run ID and explicit “no task produced” result, so the audit trail cannot attach a stale verdict to the current cycle.
@@ -17,8 +17,66 @@ This section reflects the local plugin snapshot reviewed on 2026-09-26. The work
 ### Review notes
 
 - Confirmed code distinction: `judge_client.judge_rollouts()` is non-persistent; `llm_judge.label_rollout_file()` performs atomic in-place labeling. The open label-repeat item below is therefore still actionable for the gated-cycle path, not a defect in the standalone labeling command.
-- The v1.8.28 model-slot implementation is present across the expected helper/config/version surfaces; the full smoke suite passed, including utility-slot resolution and missing-slot cases.
-- Privacy P0 and optional evalkit reporting passed the deterministic smoke suite, including checks for config readers, legacy data sanitization paths, and missing evalkit support. The suite does not test every possible credential format or a live upstream evalkit installation.
+- The v1.8.28 model-slot implementation is present across the expected helper/config/version surfaces; smoke coverage passes for utility-slot resolution and missing-slot cases.
+- Privacy P0, opt-in rollout expiry, and optional evalkit reporting passed deterministic smoke checks, including config readers, old-data sanitization paths, expiry boundaries, and missing evalkit support. The suite does not test every credential format or a live upstream evalkit installation.
+
+## Post-audit status and next work (2026-09-26, post v1.8.29)
+
+This supersedes nothing above; it records what the v1.8.28 pass actually
+changed and what remains. The deterministic smoke suite passes **202/202**
+on this date. No live A0 runtime or provider-backed optimization cycle was
+exercised — `docker ps -a` is empty in this checkout, so every container
+verification step below is still pending.
+
+### Landed in v1.8.28
+
+1. **Model selection is by slot, never by name.** `chat` / `utility`
+   sentinels resolve against the active `_model_config` preset, so a better
+   preset upgrades the plugin with no code change. The stale
+   `SKILLOPT_OPTIMIZER_MODEL=minimax-m3` pin — which was calling a model that
+   was not the active one — is removed from `usr/.env` and `.skillopt-env`.
+   `judge_model` now follows `utility` (bulk classification);
+   `optimizer_model` / `target_model` follow `chat` (reasoning).
+2. **`official_backend` passthrough derives from `setup_env.BACKENDS`.** The
+   private allowlist disagreed in both directions and silently dropped
+   `openai_compatible` — the backend an OpenAI-compatible chat model needs.
+   Rejected values are now logged, not swallowed.
+3. **Self-healing engine install (`ensure_engine`).** Only `/a0` is
+   bind-mounted, so a rebuild empties `/opt/venv-a0` and used to revert to
+   `direct_optimizer` with no error. The plugin now re-installs the pinned
+   `skillopt==0.2.0` itself. Deliberately **not** baked into
+   `docker/run/fs/ins/install_A0.sh`: that is a tracked core file serving an
+   ignored plugin, and it would add a dependency to every user's image.
+4. **Judge pacing bug (not just a flaky test).** `_throttle_wait()`
+   reserved an *ideal* slot, released the lock, then slept — so the *actual*
+   HTTP starts, which are what hit the provider, could land closer together
+   than `SKILLOPT_JUDGE_THROTTLE_S` under OS timer jitter (~15.6ms on
+   Windows). It now holds the lock across the sleep and stamps the real
+   start. Two tests that asserted `min(gap) >= 15ms` on wall-clock were
+   un-flakeable by construction; they now assert serialized pacing, with the
+   exact spacing invariant pinned deterministically via a `_monotonic` seam.
+
+### Next, in order
+
+| # | Item | Why it is next | Blocked by |
+| --- | --- | --- | --- |
+| 1 | **Bring the container up and verify v1.8.28 end-to-end.** Confirm `ensure_engine` installs the engine, that `openai_compatible` is accepted, and that `last_engine` becomes `official`. Everything below assumes a live runtime. | Nothing else can be validated without it; `docker ps -a` is empty. | — |
+| 2 | **Choose `official_backend` to match the resolved model.** The active chat model is `ollama_cloud/glm-5.3-flash` (OpenAI-compatible), so `openai_compatible` is the candidate. Note `AZURE_OPENAI_ENDPOINT` in `usr/.env` is actually `https://ollama.com/v1`, not Azure — the naming is misleading and the earlier `azure_openai` recommendation was wrong on the evidence. | Backend and model are separate choices; a mismatch fails at request time, not config time. | #1 |
+| 3 | **Bounded live pilot with `allow_ungated_direct_adopt: false`.** One opted-in skill, official-gated proposals only. The 13 observed cycles were all on the direct path, so the official path has no production evidence at all. | Establishes whether the research-grade engine actually helps here. | #2 |
+| 4 | **Replace newest-directory attribution for no-task outcomes** (audit item 4). | Pre-existing: a cycle that creates no task directory can report the newest *prior* engine directory, attaching a stale verdict to the current cycle. Audit-trail integrity. | — |
+| 5 | **Decide judge-label persistence** (audit item 2). `judge_client.judge_rollouts()` is stateless, so a rollout can be re-judged every run. | Cost/benefit call, not a defect; make it explicit either way. | — |
+| 6 | **Rollout retention/expiry control.** `helpers/privacy.py` redacts on write but accumulated rollout data never expires. | P0 privacy follow-through. | — |
+| 7 | **Multi-skill fan-out + subset adoption** (P2 table below). | Efficiency, only after the single-skill path is proven live. | #3 |
+| 8 | **Independent evalkit task manifest + dashboard presentation** (P1 table below). | Current evalkit report is descriptive evidence from gate data, not an independent confirmation set. | #3 |
+
+### Explicitly not planned
+
+- **Re-declaring the backend set anywhere.** `PASSTHROUGH_BACKENDS` is
+  derived by import; a literal copy is the bug that was just fixed.
+- **Baking plugin dependencies into tracked Docker files.** Plugin-owned
+  runtime needs belong to the bind-mounted plugin tree.
+- **Pinning a model name in config or code.** A concrete name remains a
+  supported escape hatch, but it is a *pin* and is documented as such.
 
 ## Official Microsoft SkillOpt comparison (2026-09-26)
 
@@ -35,7 +93,7 @@ Compared the local wrapper with [`microsoft/SkillOpt` on `main`](https://github.
 
 | Priority | Upstream capability or practice | Local gap and proposed adaptation | Guardrail |
 | --- | --- | --- | --- |
-| P0 — partial implementation, verification pending | Explicit transcript data boundaries and secret redaction, described in the [integration data-boundary guidance](https://github.com/microsoft/SkillOpt/blob/main/plugins/README.md#data-boundary) and [CLI reference](https://github.com/microsoft/SkillOpt/blob/main/docs/reference/cli.md). | Added `helpers/privacy.py`; tool args/results now default off, common credential patterns are redacted in new rollouts and direct prompts, the official bridge sanitizes source rollouts and migrates the plugin-local cache, replay sanitizes legacy task/skill inputs, and status/settings expose the active controls. Source rollout files are not rewritten. A retention/expiry control for accumulated rollout data remains to be designed. | Keep authoritative A0 history untouched; only sanitize SkillOpt copies. Redaction remains best-effort. Verification must cover task/response/tool payloads, private keys, bearer/API tokens, URL credentials, old rollout files, cache migration, opt-out behavior, and malformed cache files. |
+| P0 — implemented; deterministic verification passed | Explicit transcript data boundaries, secret redaction, and data expiry, described in the [integration data-boundary guidance](https://github.com/microsoft/SkillOpt/blob/main/plugins/README.md#data-boundary) and [CLI reference](https://github.com/microsoft/SkillOpt/blob/main/docs/reference/cli.md). | `helpers/privacy.py` excludes tool args/results by default and redacts common credential patterns; provider, bridge, and replay boundaries sanitize legacy inputs. `rollout_retention_days` adds opt-in expiry for top-level rollout JSON (`0` disables). | Keep authoritative A0 history untouched; only sanitize SkillOpt copies. Redaction remains best-effort. Retention does not clean bridge caches or run history. A live bridge/host-cache verification remains open. |
 | P1 — implemented, verification pending | Fixed-task `evalkit` using paired comparisons and statistical summaries, documented in the [evalkit reference](https://github.com/microsoft/SkillOpt/blob/main/docs/sleep/evalkit.md). | Added an opt-in post-gate report over the already-scored current/proposed pairs. It is stored as a bounded `evalkit` field in the real-gate sidecar; a dedicated independent task manifest and dashboard presentation remain future work. | Capability-probe installed CLI flags; report failures cannot change the gate verdict or adoption decision. This is descriptive evidence from gate data, not an independent confirmation set. |
 | P2 | Native multi-skill fan-out and reviewed subset adoption with per-skill baselines, gate evidence, provenance hashes, and recoverable publication, described in the [upstream changelog](https://github.com/microsoft/SkillOpt/blob/main/CHANGELOG.md). | The local auto-loop already schedules skills individually. Explore the upstream single-invocation fan-out only as an efficiency/transaction improvement, then let an operator select a subset to adopt from a verified manifest. | First capability-detect `--all-skills`/fan-out and its output schema. Preserve A0 governance per target; require independent gate evidence, pinned baselines, hashes, atomic snapshots, and restart-safe adoption. Fall back to today's per-skill loop when unsupported. |
 | P3 | Per-night `evidence.jsonl` for reconstructing harvest, mining, replay, reflection, and gate decisions, listed in the [upstream changelog](https://github.com/microsoft/SkillOpt/blob/main/CHANGELOG.md). | Connect local `cycle_history`, official reports, judge results, and gate/adoption receipts through one stable run ID and append-only evidence stream. This also gives a reliable fix for the stale newest-directory attribution noted above. | Store hashes, bounded metadata, and redacted summaries; don't duplicate raw transcripts or secrets into an audit log. |

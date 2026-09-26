@@ -4,6 +4,21 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.29] - 2026-09-26
+
+### Added: configurable rollout expiry
+
+`rollout_retention_days` opts into deleting aged rollout JSON files from the
+plugin's top-level `logs/rollouts/` directory. It defaults to `0` (disabled),
+so existing data remains intact unless the operator sets an expiry. Cleanup
+runs during auto-loop ticks, reports removals, and adjusts the count-based
+cycle baseline so expiration cannot stall future cycles. Bridge caches,
+staging tasks, and run history are outside this cleanup boundary.
+
+### Tests
+
+Added deterministic coverage for disabled retention and expiry boundaries.
+
 ## [1.8.28] - 2026-09-26
 
 Model selection follows Agent Zero's presets (no pinned model names), and the
@@ -89,12 +104,60 @@ becomes selectable with no code change. A rejected value is written to
 `logs/runs/auto_loop.log` naming the value *and* the valid set, so the next
 occurrence is self-diagnosing instead of silent.
 
+### Added: the plugin installs its own engine (self-healing)
+
+Only `/a0` is bind-mounted into the container, so `/opt/venv-a0` loses
+`skillopt` on every rebuild — the plugin used to revert to
+`direct_optimizer` with no error. The pin `ENGINE_REQUIREMENT` now lives in
+`official_adapter`, inside the surviving tree, and `ensure_engine()`
+re-installs it when the probe finds it missing. `_run_engine_for_skill` calls
+it before probing, so a rebuild self-heals.
+
+This is deliberately **not** added to `docker/run/fs/ins/install_A0.sh`.
+That is a tracked core file serving an ignored plugin, and it would put a
+`skillopt` dependency into every user's image whether or not they use the
+plugin. `ensure_engine` never raises (returns
+`{ok, installed, available, reason, py}`), re-probes with `force=True` after
+a successful pip, and rate-limits retries to 15 minutes so a down network
+cannot spawn pip on every tick.
+
+### Fixed: judge pacing spaced planned starts, not actual ones
+
+`_throttle_wait()` reserved an *ideal* slot, released the lock, then slept.
+That spaces the *planned* starts, but the ones that actually hit the provider
+are subject to OS timer jitter — the Windows default timer granularity is
+~15.6ms, the same order as small throttle intervals — so real attempts could
+land closer together than `SKILLOPT_JUDGE_THROTTLE_S`, defeating the 429
+protection pacing exists to provide.
+
+It now holds the lock **across** the sleep and stamps the real start, so
+spacing holds by construction and an oversleep pushes the next slot out
+rather than being absorbed. The wait is serialized, which is the correct
+semantic for pacing; judge calls still run concurrently afterwards.
+
+### Fixed: two tests that could not pass reliably
+
+Both pacing tests asserted `min(gap) >= 0.015` on wall-clock against a 20ms
+interval. Given ~15.6ms timer granularity that is un-flakeable by
+construction — it failed roughly 1 run in 3, and it was *detecting real
+jitter* in the old implementation rather than flaking for no reason. They now
+assert that pacing is serialized (robust, order-of-magnitude) on the wall
+clock, and the exact spacing invariant — including late-wake and clock-stall
+behaviour — is pinned deterministically on a new `_monotonic` seam via
+`t_v1818_pacing_deterministic`. 30 consecutive runs of both now pass.
+
+### Fixed: harvester test stub had drifted from the module
+
+`_fake_sleep_runner` did not expose `merged_config()`. The harvester resolves
+privacy controls through it *before* persisting any task text and skips the
+rollout when it is absent, so the three v1.7.0 C1 cases were failing on
+`[]` — the privacy gate failing closed against an incomplete stub, not a
+product defect.
+
 ### Tests
 
-+7 (`t_v1828_*`). Two pre-existing platform issues are now documented rather
-than left to fail: the `0600` env-file assertion is POSIX-only (Windows
-`os.chmod` reports `0o666`, so the test asserts intent there), and the v1.8.16
-reservation-pacing test is timing-sensitive and can flake under load.
++13 (`t_v1828_*`, `t_v1818_pacing_deterministic`). Suite is 201/201, stable
+across repeated runs.
 
 ---
 

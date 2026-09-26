@@ -206,10 +206,15 @@
       Include tool results in new rollouts
     </label>
     <small style="display: block; margin-top: 8px; opacity: 0.7;">Arguments and results are excluded by default. When enabled, common credential patterns are still redacted if redaction is on. Existing rollout files are not rewritten.</small>
+    <label style="display: block; margin: 10px 0 0 0;">Delete rollouts older than (days; 0 disables)
+      <input type="number" min="0" max="36500" step="1" x-model.number="cfg.rollout_retention_days" style="width: 7em;" />
+    </label>
+    <small style="display: block; opacity: 0.8;">Expiry removes only top-level JSON files in SkillOpt's logs/rollouts directory during an auto-loop tick. It does not clean bridge caches or run history.</small>
     <small x-show="privacyStatus.available" style="display: block; margin-top: 8px;">
       Effective: redaction <strong x-text="privacyStatus.redact_secrets ? 'on' : 'off'"></strong>;
       args <strong x-text="privacyStatus.include_tool_args ? 'included' : 'excluded'"></strong>;
-      results <strong x-text="privacyStatus.include_tool_results ? 'included' : 'excluded'"></strong>.
+      results <strong x-text="privacyStatus.include_tool_results ? 'included' : 'excluded'"></strong>;
+      retention <strong x-text="privacyStatus.rollout_retention_days || 0"></strong> days.
     </small>
   </div>
 
@@ -254,6 +259,7 @@ function skilloptSettings() {
       privacy_redact_secrets: true,
       privacy_include_tool_args: false,
       privacy_include_tool_results: false,
+      rollout_retention_days: 0,
       replay_evalkit_enabled: false,
     },
     skills: [],

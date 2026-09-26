@@ -35,6 +35,9 @@ auto_loop_min_rollouts: 10
 privacy_redact_secrets: true
 privacy_include_tool_args: false
 privacy_include_tool_results: false
+# Rollouts contain task and response text. Opt into expiry in whole days;
+# zero leaves files untouched. Only logs/rollouts/*.json is eligible.
+rollout_retention_days: 0
 
 # Which skill to focus the loop on. Empty = optimize all skills.
 auto_loop_skill_target: ""
