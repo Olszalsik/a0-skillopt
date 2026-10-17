@@ -16,6 +16,22 @@
  * Backwards-compat: every existing method (status/sleep/adopt/config/
  * setConfig/waitForCycle) is preserved exactly. The vanilla-JS + fetch
  * pattern is unchanged. No external deps, no new globals.
+ *
+ * v1.8.34: informed approval + dual mode on the DASHBOARD surface too.
+ * Previously this file's `renderStagedProposals` mapped a /staged response
+ * down to skill/proposal_id/size/lift/gate_reason and DROPPED everything
+ * else - so while the settings page grew an intent badge, a rationale and a
+ * diff, this surface stayed a name-and-byte-count card. Two approval
+ * surfaces, one of them still blind, is the exact problem the feature set
+ * out to remove. Added, all pure and defensive:
+ *   - proposal(id, full)                    -> POST /proposal
+ *   - mode({mode|pause|adoptedToday})       -> POST /mode
+ *   - approveGovernance(skill, ok, id)      -> POST /governance_approve
+ *                                              (binds the decision to a
+ *                                              proposal, not just a skill)
+ *   - renderProposalSummary(summary)        -> flattened summary primitives
+ *   - renderPendingApproval(map)            -> per-skill pending proposal
+ *   - renderEvolutionMode(result, loop)     -> Evolution mode card values
  */
 
 (function () {
@@ -96,14 +112,80 @@
      *     n_held_out, gate_reason, last_outcome, diff_summary).
      *   - adoptProposal(id)             -> POST /adopt  : adopt a specific
      *     staged proposal by its stem (falls back to latest when id empty).
-     *   - reject(id, reason)             -> POST /reject : record a human
-     *     reject decision (audit only; does not delete the staged file).
+ *   - reject(id, reason)             -> POST /reject : record a human
+ *     reject decision AND move the proposal out of the pending queue into
+ *     staging/rejected/ - the document is preserved, not deleted. Audit-only
+ *     was true only until v1.8.36; before that the drain could re-adopt the
+ *     rejected document. Since v1.8.46 a partial failure reports ok:false,
+ *     because the proposal may still be adoptable and the operator must be
+ *     told rather than left to assume otherwise.
      *   - rollback(skill)               -> POST /rollback: restore the
      *     most recent whole-file _default snapshot for <skill>.
      *   - renderStagedProposals(result)  -> pure fn: shape a /staged
      *     response into rows the WebUI config page can render.
      */
     staged() { return call('/staged'); },
+
+    /**
+     * v1.8.34: a human decision that names the proposal it was made about.
+     * `proposal_id` is what lets the surface tell a PENDING decision from a
+     * DECIDED one and stop re-prompting forever; omitting it still works
+     * (the ledger row then names only the skill) but the card can only show
+     * a skill name.
+     */
+    approveGovernance(skill, approved, proposalId) {
+      const body = {
+        skill: String(skill || ''),
+        // v1.8.48 (audit U7): pass the value through UNTOUCHED.
+        // `api/governance_approve.py` exists precisely to accept an explicit
+        // denial ("false"/"no"/"off"/"0"), because the F10 defect was
+        // `bool("false") is True`. `!!approved` performed that same coercion
+        // one layer earlier, so `governanceApprove('x', 'false')` sent
+        // `approved: true` - an approval for a caller who asked to refuse.
+        // One coercion dialect in the plugin: the server's.
+        approved,
+        decided_by: 'user',
+      };
+      if (proposalId) body.proposal_id = String(proposalId);
+      return call('/governance_approve', { body });
+    },
+
+    /**
+     * v1.8.34: one staged proposal's full summary + the uncapped diff.
+     * `full: true` re-renders the diff at the hard ceiling; the list view
+     * stays bounded so a queue of proposals remains cheap to fetch.
+     * `proposal_id` is a proposal STEM, never a path - the route resolves it
+     * by equality against the staged queue and rejects anything else.
+     */
+    proposal(proposalId, full) {
+      const body = { proposal_id: String(proposalId || '') };
+      if (full) body.full = true;
+      return call('/proposal', { body });
+    },
+
+    /**
+     * v1.8.34: the operating mode. Read with no args; write with
+     * {mode: 'manual'|'autonomous'} or {pause: true|false} for the
+     * `.autonomous_pause` kill switch. The response carries the RESOLVED
+     * answer plus `source`, so a consumer can show where the mode came from
+     * (canonical key vs legacy alias vs shipped default) instead of the mode
+     * appearing to change on its own.
+     */
+    mode(opts) {
+      const o = opts || {};
+      const body = {};
+      if (o.mode) body.mode = String(o.mode);
+      // v1.8.50 (audit G2): the kill-switch value is passed through untouched.
+    // `!!o.pause` meant a caller writing `pause: 'false'` PAUSED autonomy - the
+    // F10 coercion class one layer below the route that now rejects it. One
+    // dialect, owned by the server.
+    if (o.pause !== undefined && o.pause !== null) body.pause = o.pause;
+      if (o.adoptedToday !== undefined && o.adoptedToday !== null) {
+        body.adopted_today = Number(o.adoptedToday) || 0;
+      }
+      return call('/mode', { body });
+    },
+
     adoptProposal(proposalId) {
       const body = proposalId ? { proposal_id: String(proposalId) } : {};
       return call('/adopt', { body });
@@ -134,7 +216,9 @@
       return call('/governance_approve', {
         body: {
           skill: String(skill || ''),
-          approved: !!approved,
+          // v1.8.48 (audit U7): see `approveGovernance` - no client-side
+          // `!!`, so an explicit denial stays a denial.
+          approved,
           decided_by: String(decidedBy || 'user'),
         },
       });
@@ -331,6 +415,13 @@
      * config.html "Staged proposals" cards render (skill, proposal_id,
      * lift_pp, n_held_out, gate_reason, last_outcome, size) plus the
      * Approve/Reject/Rollback actions the UI binds to.
+     *
+     * v1.8.34: this row previously DROPPED the proposal summary, so the
+     * sidebar card stayed a name-and-byte-count surface while the settings
+     * page grew an informed one - two approval surfaces, one of them still
+     * blind. `summary` and the `pending_approval` map are now carried
+     * through, and `renderProposalSummary` below flattens the summary into
+     * the primitives a `data-*` attribute template can bind.
      */
     renderStagedProposals(stagedResult) {
       const fetchedAt = new Date().toISOString();
@@ -351,14 +442,173 @@
         gate_reason: String((p && p.gate_reason) || ''),
         last_outcome: String((p && p.last_outcome) || ''),
         diff_summary: String((p && p.diff_summary) || ''),
+        // v1.8.34: the informed-approval payload. `summary` is null when the
+        // proposal predates the sidecar AND summaries are disabled; callers
+        // must handle that rather than assume an object.
+        summary: (p && p.summary && typeof p.summary === 'object')
+          ? this.renderProposalSummary(p.summary)
+          : null,
       }));
       return {
         'data-staged': rows,
         'data-staged-count': rows.length,
+        'data-staged-pending': this.renderPendingApproval(
+          stagedResult.pending_approval),
         'data-fetched-at': fetchedAt,
       };
     },
+
+    /**
+     * v1.8.34: flatten a ProposalSummary into render-ready primitives.
+     *
+     * Pure and defensive by design. `intent` is ADVISORY - nothing in the
+     * validation gate reads it - so an unknown or missing category must
+     * render as `unknown`, never throw and never be treated as a verdict.
+     * Everything is defaulted, because a reviewer must never see a blank
+     * card where the evidence should be.
+     */
+    renderProposalSummary(summary) {
+      const s = (summary && typeof summary === 'object') ? summary : {};
+      const intent = (s.intent && typeof s.intent === 'object') ? s.intent : {};
+      const diff = (s.diff && typeof s.diff === 'object') ? s.diff : {};
+      const ev = (s.evidence && typeof s.evidence === 'object') ? s.evidence : {};
+      const art = (s.artifacts && typeof s.artifacts === 'object')
+        ? s.artifacts : {};
+      const realGate = (ev.real_gate && typeof ev.real_gate === 'object')
+        ? ev.real_gate : null;
+      const category = typeof intent.category === 'string' && intent.category
+        ? intent.category : 'unknown';
+      let confidence = Number(intent.confidence);
+      if (!isFinite(confidence) || confidence < 0 || confidence > 1) confidence = 0;
+      return {
+        available: s.available === true,
+        schema: String(s.schema || ''),
+        skill: String(s.skill || ''),
+        proposal_id: String(s.proposal_id || ''),
+        summary: String(s.summary || ''),
+        rationale: Array.isArray(s.rationale)
+          ? s.rationale.filter((b) => typeof b === 'string' && b.trim())
+          : [],
+        warnings: Array.isArray(s.warnings)
+          ? s.warnings.filter((w) => typeof w === 'string' && w.trim())
+          : [],
+        intent_category: category,
+        intent_confidence: confidence,
+        intent_source: String(intent.source || 'absent'),
+        intent_headline: String(intent.headline || ''),
+        added_lines: Number(diff.added_lines) || 0,
+        removed_lines: Number(diff.removed_lines) || 0,
+        hunk_count: Number(diff.hunk_count) || 0,
+        diff_available: diff.available === true,
+        diff_truncated: diff.truncated === true,
+        diff_text: String(diff.text || ''),
+        gate_outcome: String(ev.gate_outcome || 'absent'),
+        official_gated: ev.official_gated === true,
+        lift_pp: (ev.lift_pp != null) ? Number(ev.lift_pp) : null,
+        n_held_out: (ev.n_held_out != null) ? Number(ev.n_held_out) : null,
+        real_gate_status: realGate ? String(realGate.status || '') : '',
+        real_gate_accepted: realGate ? realGate.accepted === true : null,
+        proposal_path: String(art.proposal_rel || art.proposal_path || ''),
+        // A one-line headline a compact card can show without the full block.
+        headline: String(s.summary || intent.headline || ''),
+      };
+    },
+
+    /**
+     * v1.8.34: shape the /staged `pending_approval` map (or a per-skill
+     * `pending_proposal`) into one row per skill. This is what lets a
+     * governance surface name the document its Approve button refers to -
+     * the gap that made "Approve" indistinguishable from approving an unseen
+     * document.
+     */
+    renderPendingApproval(pendingApproval) {
+      const out = {};
+      if (!pendingApproval || typeof pendingApproval !== 'object') return out;
+      for (const skill of Object.keys(pendingApproval)) {
+        const entry = pendingApproval[skill];
+        if (!entry || typeof entry !== 'object') continue;
+        out[skill] = {
+          skill: String(skill),
+          proposal_id: String(entry.proposal_id || ''),
+          // 'pending' until a decision naming this proposal exists.
+          decision: String(entry.decision || 'pending'),
+          decided_by: String(entry.decided_by || ''),
+          decided_at: String(entry.decided_at || ''),
+          staged_at: Number(entry.staged_at) || 0,
+          summary: (entry.summary && typeof entry.summary === 'object')
+            ? this.renderProposalSummary(entry.summary)
+            : null,
+        };
+      }
+      return out;
+    },
+
+    /**
+     * v1.8.34: shape a /mode response into render-ready values for the
+     * Evolution mode card. `source` is preserved verbatim because "manual"
+     * chosen by the operator and "manual" arrived at because a legacy alias
+     * was invalid are different facts, and an operator debugging a mode that
+     * will not change needs to see which one they are looking at.
+     */
+    renderEvolutionMode(modeResult, loopState) {
+      const m = (modeResult && typeof modeResult === 'object') ? modeResult : {};
+      const rails = (m.rails && typeof m.rails === 'object') ? m.rails : {};
+      const adoptedToday = (m.adopted_today != null)
+        ? Number(m.adopted_today)
+        : Number((loopState && loopState.autonomous_adoptions_today) || 0);
+      const cap = Number(rails.max_adoptions_per_day != null
+        ? rails.max_adoptions_per_day : m.max_per_day);
+      return {
+        ok: m.ok === true,
+        mode: String(m.mode || 'manual'),
+        autonomous: m.autonomous === true,
+        // The kill switch outranks every config source, so a consumer must
+        // be able to render "paused" without inspecting the mode string.
+        killed: m.killed === true,
+        source: String(m.source || 'unavailable'),
+        error: String(m.error || ''),
+        valid_modes: Array.isArray(m.valid_modes) && m.valid_modes.length
+          ? m.valid_modes.map(String) : ['manual', 'autonomous'],
+        adopted_today: isFinite(adoptedToday) ? adoptedToday : 0,
+        max_per_day: isFinite(cap) ? cap : null,
+        max_per_skill_per_day: Number(rails.max_adoptions_per_skill_per_day
+          != null ? rails.max_adoptions_per_skill_per_day
+          : m.max_per_skill_per_day) || null,
+        require_post_adopt_check: rails.require_post_adopt_check
+          !== false && m.require_post_adopt_check !== false,
+        min_evidence_rollouts: Number(rails.min_evidence_rollouts
+          != null ? rails.min_evidence_rollouts
+          : m.min_evidence_rollouts) || 0,
+        audit: rails.audit !== false && m.audit !== false,
+        // True only when the mode came from something other than the shipped
+        // default, i.e. the operator (or their legacy config) chose it.
+        explicit: ['evolution_mode', 'auto_adopt_legacy']
+          .indexOf(String(m.source || '')) !== -1,
+      };
+    },
   };
+
+  // v1.8.34: actually EXPOSE the namespace.
+  //
+  // This assignment was missing. `const SkillOptDashboard` above is scoped to
+  // this IIFE, so the object was unreachable from any other script: the
+  // header comment promised "a small `window.SkillOptDashboard` namespace
+  // that the WebUI config page and the sidebar card can hook into", but
+  // `window.SkillOptDashboard` was `undefined`. Nothing broke visibly only
+  // because no consumer referenced it yet - which is exactly how the whole
+  // documented extension point stayed dead. Any page that had tried to call
+  // `SkillOptDashboard.staged()` or `renderStagedProposals()` got a
+  // TypeError.
+  //
+  // Assigned to `window` rather than `globalThis` so it works on the older
+  // browsers this WebUI still supports, and guarded so a re-injected script
+  // (the extension loader can run it twice) does not throw on a const-like
+  // global.
+  try {
+    window.SkillOptDashboard = SkillOptDashboard;
+  } catch (e) {
+    /* no window (non-browser context) - nothing to expose to */
+  }
 
   // Convenience: log availability on load (helps debugging in DevTools)
   console.log('[skillopt] dashboard loaded; API at ' + ENDPOINT_BASE);

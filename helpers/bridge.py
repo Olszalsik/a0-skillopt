@@ -31,8 +31,13 @@ import datetime as _dt
 import json
 import os
 import re
+import threading
 import time
 import uuid
+
+# v1.8.48 (audit P3): serialises the index read-modify-write and the
+# `history.jsonl` appends. See `bridge_rollouts_to_claude_history`.
+_BRIDGE_LOCK = threading.RLock()
 from pathlib import Path
 
 try:
@@ -253,58 +258,88 @@ def bridge_rollouts_to_claude_history() -> dict:
 
     Idempotent via .bridge_index.json. Returns a small status dict.
     """
+    # v1.8.50 (audit G1): the redaction pass runs INSIDE the same critical
+    # section as the append (see the `with _BRIDGE_LOCK:` below). It reads
+    # and rewrites the very files this function extends - `history.jsonl` and
+    # the per-session transcripts - and it used to run outside the lock while
+    # two callers could already run: after the v1.8.48 lock, the index
+    # transaction and this rewrite were two independent critical sections, so
+    # a redaction pass could truncate and rewrite a transcript between another
+    # caller's index read and its append. A rewrite of a file other code
+    # appends to is a persistence boundary, so it belongs in the same mutual
+    # exclusion as the append.
     root = _bridge_root()
-    cache_files_redacted = _sanitize_local_bridge_cache(
-        root, enabled=privacy_settings_for_bridge()
-    )
     history_path = root / "history.jsonl"
     projects_dir = root / "projects"
     history_path.parent.mkdir(parents=True, exist_ok=True)
     projects_dir.mkdir(parents=True, exist_ok=True)
 
     bridge_index_path = sleep_runner.runs_dir() / ".bridge_index.json"
-    index: set = set()
-    if bridge_index_path.is_file():
-        try:
-            index = set(json.loads(bridge_index_path.read_text(encoding="utf-8")))
-        except Exception:
-            index = set()
-
-    rollouts_d = sleep_runner.rollouts_dir()
-    new_history: list = []
-    new_sessions: dict = {}  # session_path -> list of records
-    skipped = 0
-    for rp in rollouts_d.glob("*.json"):
-        rid = rp.stem
-        if rid in index:
-            skipped += 1
-            continue
-        try:
-            rollout = json.loads(rp.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        history_record, session_records, session_id, project_path = (
-            _rollout_to_records(rollout)
+    # v1.8.48 (audit P3): the index read-modify-write below is UNLOCKED, and
+    # this function is reachable from the auto-loop thread, an HTTP handler
+    # (`POST /sleep`) and the agent tool. Two concurrent runs both read
+    # index {1,2}, both append their own rows to `history.jsonl`, and the
+    # second `os.replace` drops the first run's index rows - a lost update
+    # that re-bridges those rollouts next time and duplicates transcript rows
+    # no reader can distinguish from real history. v1.8.47 made the write
+    # atomic; only a lock makes the whole sequence safe. The sibling index
+    # already had one (`_APPROVALS_INDEX_LOCK`); this one did not.
+    with _BRIDGE_LOCK:
+        # v1.8.50 (audit G1): redaction first, inside the same critical
+        # section as the index transaction and the appends below - see the
+        # note above.
+        cache_files_redacted = _sanitize_local_bridge_cache(
+            root, enabled=privacy_settings_for_bridge()
         )
-        new_history.append(history_record)
-        slug = _project_slug(project_path)
-        session_path = projects_dir / slug / (session_id + ".jsonl")
-        session_path.parent.mkdir(parents=True, exist_ok=True)
-        new_sessions.setdefault(str(session_path), []).extend(session_records)
-        index.add(rid)
+        index: set = set()
+        if bridge_index_path.is_file():
+            try:
+                index = set(json.loads(bridge_index_path.read_text(encoding="utf-8")))
+            except Exception:
+                index = set()
 
-    if new_history:
-        with open(history_path, "a", encoding="utf-8") as f:
-            for rec in new_history:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        for session_path, records in new_sessions.items():
-            with open(session_path, "a", encoding="utf-8") as f:
-                for rec in records:
+        rollouts_d = sleep_runner.rollouts_dir()
+        new_history: list = []
+        new_sessions: dict = {}  # session_path -> list of records
+        skipped = 0
+        for rp in rollouts_d.glob("*.json"):
+            rid = rp.stem
+            if rid in index:
+                skipped += 1
+                continue
+            try:
+                rollout = json.loads(rp.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            history_record, session_records, session_id, project_path = (
+                _rollout_to_records(rollout)
+            )
+            new_history.append(history_record)
+            slug = _project_slug(project_path)
+            session_path = projects_dir / slug / (session_id + ".jsonl")
+            session_path.parent.mkdir(parents=True, exist_ok=True)
+            new_sessions.setdefault(str(session_path), []).extend(session_records)
+            index.add(rid)
+
+        if new_history:
+            with open(history_path, "a", encoding="utf-8") as f:
+                for rec in new_history:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            for session_path, records in new_sessions.items():
+                with open(session_path, "a", encoding="utf-8") as f:
+                    for rec in records:
+                        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    bridge_index_path.write_text(
-        json.dumps(sorted(index), ensure_ascii=False), encoding="utf-8"
-    )
+        # v1.8.47 (re-audit R28): write the index ATOMICALLY. A torn write is
+        # swallowed above into an EMPTY index, after which every rollout looks
+        # new and duplicate rows are appended to `history.jsonl` - duplication
+        # that no reader can distinguish from real history, and that silently
+        # re-bridges rollouts the operator already processed.
+        _idx_tmp = bridge_index_path.with_suffix(".json.tmp")
+        _idx_tmp.write_text(
+            json.dumps(sorted(index), ensure_ascii=False), encoding="utf-8"
+        )
+        os.replace(str(_idx_tmp), str(bridge_index_path))
     return {
         "rollouts_written": len(new_history),
         "rollouts_skipped_already_bridged": skipped,

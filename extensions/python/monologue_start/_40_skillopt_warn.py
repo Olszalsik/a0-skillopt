@@ -91,7 +91,7 @@ def execute(*args, banners=None, **kwargs):  # type: ignore[no-untyped-def]
         ),
         "icon": "alert-triangle",
         "cta_text": "Open Settings",
-        "cta_action": "open-plugin-config:skillopt",
+        "cta_action": "open-modal:/usr/plugins/skillopt/webui/config.html",
         "dismissible": True,
         "source": "backend",
     })

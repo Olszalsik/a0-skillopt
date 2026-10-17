@@ -12,9 +12,13 @@ Public API (all pure functions, no classes):
 - count_new_rollouts(skill_name, since_ts) -> int
 - _state_dir() -> Path
 
-Backwards-compat: if the v1.1.0 single `logs/runs/.auto_loop_state.json`
-exists AND skill_name == "_default", migrate it (read + write to new path +
-delete old). One-shot migration.
+v1.8.49 (audit X7): there is NO legacy-state migration any more, and this
+docstring used to promise one three lines above the note that removed it.
+The target file, `logs/runs/.auto_loop_state.json`, is the auto-loop's LIVE
+single-writer state, so "migrating" it meant writing a second file and then
+DELETING the one the loop thread owns (audit G10). A reader who trusted this
+summary would reintroduce exactly that. Do not restore it: there is nothing
+left to migrate.
 
 ROADMAP engineering principles honored:
 1. Preserves the gate (this is operational, not a gate change).
@@ -37,8 +41,10 @@ DEFAULT_TARGET = 20
 DEFAULT_FLOOR_S = 60
 DEFAULT_CEILING_S = 3600
 
-# The v1.1.0 single-state-file path (backwards-compat)
-_LEGACY_STATE_PATH = ".auto_loop_state.json"
+# v1.8.48 (audit G10): `_LEGACY_STATE_PATH` was deleted, not just unused.
+# Its value, ".auto_loop_state.json", is the auto-loop's LIVE single-writer
+# state file; keeping the constant around invites a future caller to
+# "restore" a migration that would delete it.
 _NEW_STATE_PREFIX = "auto_loop_state_"
 _NEW_STATE_SUFFIX = ".json"
 
@@ -117,29 +123,19 @@ def compute_next_run(
 def load_per_skill_state(skill_name: str) -> dict[str, Any]:
     """Read state for a skill, or return defaults.
 
-    If the v1.1.0 legacy single-state file exists AND skill_name == "_default",
-    migrate it on first read.
+    v1.8.48 (audit G10): the v1.1.0 "legacy single-state file" migration was
+    REMOVED rather than repaired. `_LEGACY_STATE_PATH` is
+    `.auto_loop_state.json` - the same name the auto-loop took over for its
+    own live, SINGLE-WRITER state (`LOOP_STATE_FILENAME`). So a skill literally
+    named `_default` (a name `is_safe_skill_name` accepts) made this read the
+    live loop state, copy six unrelated keys, write a second file, and then
+    UNLINK the file the loop thread owns: a second writer plus a delete. The
+    documented consequence of losing it is an immediate unscheduled cycle
+    (counters reset, `last_rollout_count_at_cycle` zeroed) and a restarted
+    daily autonomous cap. Migrating away from a file that is no longer legacy
+    is the only safe action: there is nothing left to migrate.
     """
     state = _default_state()
-    # Backwards-compat migration (one-shot)
-    if (skill_name or "").strip().lower() == "_default":
-        legacy = _state_dir() / _LEGACY_STATE_PATH
-        if legacy.is_file():
-            try:
-                with legacy.open("r", encoding="utf-8") as fp:
-                    loaded = json.load(fp)
-                if isinstance(loaded, dict):
-                    state.update({k: loaded.get(k, v) for k, v in state.items()})
-                # Write to new path, then remove legacy
-                save_per_skill_state("_default", state)
-                try:
-                    legacy.unlink()
-                except OSError:
-                    pass
-            except (OSError, json.JSONDecodeError):
-                # Corrupt legacy file: ignore, fall through to defaults
-                pass
-    # New path
     p = _state_path(skill_name)
     if p.is_file():
         try:

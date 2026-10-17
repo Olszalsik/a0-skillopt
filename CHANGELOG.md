@@ -4,6 +4,1703 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.52] - 2026-10-17
+
+Suite-hermeticity follow-up. Running the suite on a **live install** (the v1.8.51
+verification method) had exposed the remaining way operator state reaches the tests:
+`config.json` itself. Suite now **360 cases** — 358 existing + 2 hermeticity cases —
+**all passing both with a production `config.json` in the tree and without one**
+(CI conditions).
+
+### High: 13 governance tests read the live install's `config.json` (C1)
+
+`governance._default_policy()` read `<plugin_root>/config.json` directly, so on a live
+install the operator's `default_policy` (`mode`, `require_human_approval`,
+`min_interval_seconds`, `daily_budget_cents`) bled into every rail the suite exercises:
+13 adoption/governance cases read `skipped` / `require_human_approval_pending` while the
+identical suite stayed green in **CI — which only passed the suite because CI has no
+`config.json`**. The suite was hermetic on every path *except the one file the WebUI
+also writes*; a suite red/green on a live install depended on operator intent, not on
+plugin behaviour — the "passes in CI, fails in the real install" class inverted.
+
+`governance.py` gains the same test-isolation hook every other state module already
+carries (the `inner_loop.state_dir` / `fragment_store.set_plugin_root_for_tests`
+pattern): a module-level `default_policy_config_path` override, read by
+`_default_policy_config_path()`. **Live code never sets it.** A side benefit: the
+resolver now goes through `_sleep_runner()` (both-import-names aware) instead of a
+namespace-only inline import that degraded to built-ins via exception on a bare run.
+
+### High: a live `config.json` also filled the `/mode` wipe-guard precondition (C2)
+
+`t_v1834_mode_route_no_config_wipe` simulates an unreadable defaults source and asserts
+the degraded `_read_disk()` result lacks `governance`. On a live install the production
+`config.json` — read through `api/config.py`'s real `CONFIG_PATH` — filled exactly that
+void, failing the precondition while nothing in the code under test had changed. The
+test now points `CONFIG_PATH` at a nonexistent tmp path for the degraded leg, the same
+per-test control the write leg above it already had.
+
+### Tests
+- Suite-wide sandbox in `main()`: `governance.default_policy_config_path` → nonexistent
+  tmp path (bit-for-bit CI conditions: no config file), restored + tmp tree removed on
+  the way out, WARN banner if install unavailable.
+- `t_v1852_default_policy_seam`: fixtures through the seam — merged over built-ins,
+  keys the fixture omits keep built-ins, malformed / missing / non-dict default_policy
+  degrade to built-ins rather than raising or merging garbage.
+- `t_v1852_suite_config_hermeticity`: the guard that fails if `main()`'s sandbox is
+  lost and the install's `config.json` leaks values no built-in default matches.
+- Also carried from the 2026-10-17 CI run #48 post-mortem: `SKILLOPT_JUDGE_THROTHLE_S`
+  → `SKILLOPT_JUDGE_THROTTLE_S` in `t_v1818_pacing_deterministic` — the typo made the
+  injected-clock case silently run against the 1.5 s default instead of its intended
+  0.02 s interval, and leaked the junk env key for the rest of the run (masked, since
+  its assertions only demanded ≥ 0.02 s).
+
+### Verification
+Run on a container-local copy of the live tree, both directions: **360/360 with the
+production `config.json` present, 360/360 without it.** The 13 previously failing
+governance cases and the C2 precondition now pass with the real file in place; CI runs
+of the same suite (no config file) are unaffected.
+
+## [1.8.51] - 2026-10-05
+
+
+Sweep follow-up. Removing the 16 inert 0-byte `_default.pre_adopt.md` files surfaced two
+defects that only a **live-tree** run could show. Suite unchanged at **354 cases, all
+passing — now verified in the real install, not just a scratch tree.**
+
+### High: the suite wrote into production `fragments/` (S1)
+
+`fragments/` was the last state path the suite wrote into directly: `fragment_store.
+_plugin_root()` was hardcoded to the plugin directory, and `_purge_skill_fragments()`
+even `rmtree`'d the real `fragments/SKILL/` between tests. So a suite run on a live
+install created fixture skill directories and wrote 0-byte `_default.pre_adopt.md` files —
+**it recreated exactly what the sweep had just removed.** `staging/` and `logs/runs/` were
+already sandboxed; this was the third path nobody had closed.
+
+`fragment_store.set_plugin_root_for_tests()` now redirects the snapshot tree, and the
+suite points it at a temp directory for the whole run, printing the path and restoring it
+on the way out. Verified by file count across a live run: `fragments/` 563 files before,
+563 after, zero temp directories left behind.
+
+### High: three cases were machine-dependent (S2)
+
+The policy-scope cases (`T9`, `T9b`, `X5`) passed in the scratch tree and **failed in the
+live install**: stage 0 (the A/B harness) ran first and rejected with
+`ab_harness_rejected`, so the stage under test was never reached — and the harness reads
+its *own* settings, so `merged_config()['ab_harness_enabled'] == False` does not stop it.
+
+Every case that drives `validate_proposal` at a stage later than 0 now passes
+`ab_harness_enabled=False`. A case that reaches a stage only when an unrelated earlier
+stage happens to pass is not a test of that stage; this is the "passes on my machine"
+class, and the only reason it survived three audit passes is that the suite had been run
+in a scratch tree the whole time.
+
+### Verification
+
+354/354 in the **live** tree. Zero-byte `_default.pre_adopt.md`: 16 → 13 (recreated by
+the pre-sandbox run) → **0**, and still 0 after a subsequent suite run. Non-zero
+`pre_adopt` (8) and all 533 `_default.v*.md` snapshots verified byte-identical by hash
+manifest across the sweep.
+
+---
+
+## [1.8.50] - 2026-10-05
+
+Fifth-pass audit remediation: an independent audit of the gating/authorisation path and
+the data/provider path at v1.8.49. **11 findings fixed**, 2 more verified real and
+deliberately left alone with the reasoning recorded. Suite 347 -> **354**.
+
+### Critical: the fragment API applied nothing (F8)
+
+`write_fragment` documented that it rewrites `SKILL.md`. It wrote the new text to
+`<id>.current.md` — a file with **exactly one writer and no reader anywhere in the tree** —
+left the body untouched, and returned `ok: True`. Since `read_fragments` recomputes text
+from the body, every reader saw the OLD text.
+
+So a fragment edit was a silent no-op, and `rollback_fragment` — its only caller — reported
+a successful recovery that changed nothing. Worse, an existing test *pinned* it: the case
+asserted that `.current.md` exists **and** that the body is not rewritten, describing this
+as a deliberate "minimal implementation". A documented non-implementation is still a
+non-implementation.
+
+It now splices the fragment's selector span into the body and writes through
+`adopt_write_skill`. It refuses — by name — what it cannot do: a selector that matches
+nothing, an edit identical to what is already there, and any path outside the configured
+skills dir (which would need a second, unsanctioned writer). And it re-emits the
+frontmatter **verbatim**, because re-rendering it through `yaml.safe_dump` reformatted the
+operator's metadata and made a rollback unable to restore the file byte-for-byte — the
+difference was introduced by the restore itself.
+
+### High: all skills shared one rollback directory (F7)
+
+Per-fragment snapshots were keyed on `Path(SKILL.md).stem` — which is `SKILL` for **every**
+skill. Two skills computed their version numbers from each other's history and overwrote
+the same `<id>.v<N>.md`, and `/fragments/rollback` could restore one skill's bytes into
+another. Keyed on the skill name, and the hardcoded `"fragments"` root now honours
+`fragment_snapshot_dir` — the same key the status route reports.
+
+### High: one valueless YAML key killed the loop (G3)
+
+`_run` coerced the sleep interval *after* the `try` that keeps the thread alive.
+`auto_loop_interval_sec:` (valueless → `None`) made `int(None)` raise `TypeError`, escape
+`_run` entirely, and kill the only thread that ticks the plugin — nothing could run again
+for the life of the process. The arithmetic now sits inside the guard.
+
+### The rest
+
+- **G1** the bridge's redaction pass rewrote the transcript files *outside* the lock added
+  in v1.8.48, reopening the very race it closed.
+- **G4** the pre-persist redaction flag was computed in two places and read nowhere; the
+  staged document a reviewer reads may not be the model's output. Carried on the result,
+  logged by the drain.
+- **G2** `bool(data.get("pause"))` and `!!o.pause` — the F10 coercion bug's third and fourth
+  copy, on the switch that freezes autonomy: the string `"false"` paused it. Both now defer
+  to `api/config.py`'s vetted coercion.
+- **F4** the tool's single-flight probe swallowed its exception and failed OPEN while the
+  route defers on the same fault — and the permissive one is the path an agent drives
+  automatically.
+- **F5** the drain created `usr/skills/<name>/` before the validation gate; the same line
+  v1.8.48 removed from the tool.
+- **F10** a post-adopt **rollback** was audited and logged as `adopted`, so the trail
+  answered "yes" to "is the live skill the one the gate approved?". Now
+  `adopted_rolled_back`, with every consumer testing a prefix.
+- **G9** the grace window had a ceiling but no floor: a future `started_ts` yields a
+  negative age, which satisfied `<= GRACE` for as long as the skew lasts.
+
+### Left alone, on purpose
+
+**F1/F2** (stage 0.5 is unreachable, and would run *instead of* the whole-file gate) and
+**F3** (the three adopt paths pass different `official_gated` values) are verified real,
+but fixing them blind would either enable a rail with known gaps or make the route *skip*
+a gate on provenance it has not verified. Both are gate-design changes; the reasoning is
+in `AGENTS.md` so a later pass does not undo the decision.
+
+### Verification
+
+354/354 green; **43 mutations, 0 survivors**. Three new cases here were decorative first
+and are worth naming: comparing a mkdir against the *governance* gate (which runs earlier,
+so a mkdir in between passed), a substring assertion satisfied by the corrected comment
+that quotes the old expression, and a `Pass`-in-handler check that only fired when the
+handler contained *nothing else*. Plus one harness lesson: a byte-length-identical
+mutation can be masked by a stale `.pyc`, so the mutation runner clears `__pycache__`
+before every run.
+
+---
+
+## [1.8.49] - 2026-10-05
+
+Fourth-pass remediation: a **regression audit of v1.8.48**. One auditor was given the full
+change list plus ten targeted questions about the new code and asked to find what the
+previous release broke or left behind. **7 findings, all fixed.** Suite 339 -> **347**.
+
+The first three audit passes found silent no-ops. This one found something sharper: **a fix
+that inverted its own intent**, and a **recovery path that could destroy the thing it
+recovers**. Eight of the auditor's ten questions came back clean — the new locks have no
+lock-order inversion and no re-entry, `adopt_write_skill`'s gate covers every branch,
+`_version_of`'s four callers all pass a shape it can parse.
+
+### Critical: `/rollback` could empty a live skill (X1)
+
+`restore_default_snapshot` restores whichever `_default.pre_adopt.md` it finds. For a skill
+the plugin created from nothing, that file is legitimately **0 bytes** — which is the state
+`adopt_write_skill` itself produces (`current = ""` when the live file does not exist). A
+0-byte file *is* a file, so it shadowed every real `_default.vN.md`: the operator clicked
+`rollback(skill)`, got `{"ok": true, "bytes": 0}`, and the live skill was emptied. The
+route then logged a successful `rolled_back` cycle entry.
+
+**16 such snapshots already existed on this install.** The refusal now lives in the choke
+point (a blank document never reaches a live file, whatever the caller), with
+`restore_default_snapshot` also treating a 0-byte pre_adopt as absent.
+
+### High: the interval rail got MORE permissive, because a docstring lied (X2/X3)
+
+v1.8.48 fixed the `min_interval_seconds` rail to search every log generation, iterating
+"newest first". The helper it calls, `_log_generations()`, has documented **"oldest first"**
+since it was written — while returning `[base, .1]`, where `base` is the NEWEST generation
+(rotation moves the old content into `.1` and replaces the live file with an empty one). So
+`reversed(...)` walked the oldest first and returned the **oldest** eligible decision. An
+older `last_ts` makes `(now - last_ts)` *larger*, so the rail waved through exactly the
+window it exists to close.
+
+The fix is not clever, it is verified: the helper now returns the order it always claimed,
+and the test asserts the chosen row **arithmetically** — the newest decision is inside a
+1 h interval and the oldest is outside it, so the choice demonstrably changes the answer.
+The same root cause made the dashboard's `last_decisions` stale for one rotation window per
+skill.
+
+### Medium: the new single-flight rule could defer adoption forever (X4)
+
+v1.8.48 made an unrecorded pid mean "in flight", closing the spawn window between writing
+the placeholder sidecar and `Popen` returning. Correct — and unbounded. `Popen` returns a pid
+without validating the target, so a worker that dies instantly (import error, renamed script)
+never rewrites its sidecar and leaves `status: pending, pid: 0` in place. Nothing else
+removes it: the orphan reaper requires the proposal to be gone first, and the harvest timeout
+is autonomous-only. The scan is directory-wide, so in **manual** mode one such sidecar
+deferred **every adopt for every skill, forever** — the F8 "defers forever" shape in a new
+place. Bounded now by `PENDING_PID_GRACE_S`, and an unknown *age* counts as stale rather than
+as evidence of a running worker.
+
+### The rest, briefly
+
+- **X5** `allowed_fragments` was silently skipped on every whole-file skill: `read_fragments`
+  yields only the implicit `_default`, and the old `if _named:` turned the operator's
+  strongest scope constraint into a no-op. It defers now, and the refusal says how to opt out
+  — a rail that can only ever say no gets removed.
+- **X6** `_record_error` copied `_save_state`'s atomic shape but not its guarded `fsync`, so
+  an fsync failure discarded the newest error record and left an older one rendering.
+- **X7** `cadence`'s module docstring still promised the v1.1.0 migration three lines above
+  the note that removed it.
+
+### Verification
+
+347/347 green; 33 mutations, 0 survivors. Two new cases here were decorative on the first
+draft and are worth recording: `fsync_guards` was satisfied by the function's *own* outer
+`try` (the fix must be checked by walking to the **nearest enclosing handler**), and one
+assertion sat behind `if live_file.is_file():`, which on this machine asserted nothing. Both
+now use AST parent-walks and temp-tree fixtures.
+
+---
+
+Third-pass audit remediation, **Phase 7**. A third independent audit over the whole plugin
+at v1.8.47 — six auditors on disjoint scopes, every candidate verified against the quoted
+lines. **25 findings, all fixed.** Suite 306 -> **339**.
+
+The common shape is unchanged from the first two passes and, if anything, sharper: again
+**every finding was a component not doing what the code around it assumed**. But this pass
+found two things the earlier ones did not — a **guard that was structurally incapable of
+firing**, and **eight test bodies that had silently stopped running**.
+
+### Critical: the "refuse when the snapshot fails" guard could never fire (T1)
+
+`adopt_write_skill` wrapped `fragment_store.snapshot_default` in `try/except Exception`
+and reported `"snapshotted": True`. But `snapshot_default` is documented **never raises** —
+it returns `{ok: False, error}`. So the guard could not fire, the result was discarded, and
+a snapshot that failed for a mundane reason (read-only mount, ENOSPC, permissions) fell
+straight through to the live write and announced success. That is the unrecoverable case:
+`/rollback` would have had no target. It now tests the result, and refuses.
+
+The reason this survived two prior audits is worth recording: the guard *looked* correct.
+An audit that asks "is there a try around the snapshot?" gets the wrong answer, and the
+existing test stubbed `adopt_write_skill` itself — the function the defect lives in.
+
+### Critical: the rollback wrote a live `SKILL.md` with `Path.write_text` (T2)
+
+`restore_default_snapshot` wrote the live skill directly, named in the contract as the
+v1.8.24 P0 defect that must not reappear on any path, and discarded the result of its own
+reversibility snapshot. It now delegates to `adopt_write_skill`, so adopt and rollback
+share one choke point. Alongside it: that function imported `sleep_runner` namespace-only
+with no fallback (G11), so `/rollback` returned `{ok: False}` from its catch-all outside
+the A0 runtime — a recovery path that silently did nothing.
+
+### High: informed approval could not tell a rejected replay from an accepted one (T4)
+
+`proposal_view` read `accepted` and the judged-pair count off the **top level** of the
+real-gate sidecar, while the only writer nests them under `verdict`. Both values were
+`None`, forever — so both approval surfaces rendered an accepted replay identically to a
+rejected one. The defect lived precisely where this plugin's evidence model is supposed to
+be strongest.
+
+### High: a `NameError` could escape the engine runner (T5)
+
+`official_adapter` called `logging.getLogger` inside a handler for a *non-fatal* redaction
+fault, without importing `logging`. The `NameError` propagated out of
+`run_official_sleep_cycle`, skipping the gate marker, the summary and — in the drain — the
+whole tick. Asserted from now on by an AST check, which no comment can satisfy.
+
+### High: one malformed policy value disarmed two rails (T9)
+
+The three policy-scope constraints shared a single `try`. A non-numeric
+`max_verbosity_delta_ratio: "0.1x"` — copied verbatim from the operator's policy file —
+raised, the handler logged at DEBUG, and `forbid_patterns` **and** `allowed_fragments` never
+ran. The two strongest operator constraints, silently inert, on a path to a live
+`SKILL.md`. Each constraint now evaluates independently and each refusal names the key that
+failed.
+
+### High: eight test bodies had silently stopped running (T8)
+
+A scripted edit once consumed eight `@test` decorators. The functions stayed defined, the
+file compiled, the suite stayed green — and eight assertions stopped running, including
+`drain_suggestions` and `cadence.list_skills_with_state`, which have no other coverage. Two
+names were registered twice, so a label could not be traced to its body. `Local Contracts`
+now requires every `t_*` definition to be registered exactly once, and the suite asserts it
+of itself.
+
+Reviving one of the eight immediately surfaced a stale 1970-era fixture, and the mutation
+check found that **five of the 26 new cases were decorative on their first draft** — they
+asserted on a helper the readers did not use, on a function's *source* where the
+**docstring quotes the fix**, and on a substring the *comment* also contains. All five were
+rewritten with AST-based structural assertions. That is the standing lesson of this file,
+now confirmed a third time: a test that reimplements or paraphrases the logic under test is
+worse than no test, because it is green while the code is broken.
+
+### The rest, briefly
+
+- **T3** the harvest path's redaction record sat behind a `return` and was duplicated three
+  times, so the path an unattended install takes most often recorded nothing. **G4** and
+  that record are a pair: `redaction-notice` was missing from `MACHINE_DECIDED_BY`, so the
+  drain's own machine row satisfied the human-approval gate.
+- **T6/T7** an unrecorded pid now reads as in flight (the window between the pending
+  sidecar and `Popen` was one in which single-flight reported "no gate"), and the
+  pid-recording write checks its result.
+- **G1/G2/G3/P3** two inert settings, three lexicographic snapshot readers (one of which
+  overwrote a live rollback target), and two unlocked whole-file rewrites. Atomic-replace
+  is not a substitute for mutual exclusion.
+- **G5/G7/G6** two governance readers opened the live log generation alone, so every 5 MB
+  rotation blanked the dashboard and briefly disarmed the `min_interval_seconds` rail.
+- **P1/P2** the inner-loop no-op privacy guard could never fire, and `judge_model` was
+  declared but unread — every label ran on the chat slot while the operator's setting did
+  nothing.
+- **U3-U10** an inert settings control, three callers that discarded the writer's result,
+  a `!!` that re-introduced an already-fixed coercion bug one layer below the route that
+  fixes it, and two `or <default>` collapses that turned "stop unattended writes" back into
+  the default.
+- **C4** the real-gate worker declared `--tasks-file` required by its own contract and never
+  read it, so an unreadable sidecar produced the documented fail-OPEN adopt with the
+  correct path sitting in argv.
+- **A2/A4/A8/A10/A11, G10, P7, U5** an unpersisted state, an unrestarted inner loop, a
+  cadence module that unlinked the auto-loop's live state file, a reload lever two
+  docstrings promised and the code did not have, and a few more.
+
+### Verification
+
+339/339 green. All 25 fixes mutation-verified: each defect reintroduced individually makes
+the suite fail. Run without touching a live install by copying the tree to a scratch
+project root (`usr/plugins/skillopt` + `webui` + `usr/.env`); see `AGENTS.md` Verification
+for why two cases depend on that root.
+
+---
+
+## [1.8.47] - 2026-10-04
+
+Second-audit remediation, **Phase 6f: the last eight findings (R25-R32)**. With these,
+**the second audit is fully closed: all 32 fixed**, and both audits together account for
+**60**. Suite 204 -> **306**.
+
+Individually these were the smallest findings of the two passes. Together they are why a
+reader of this plugin could not trust what the comments said - which is its own kind of
+defect.
+
+### Fixed: the route carried a SECOND decision reader (R25)
+
+`api/governance_status.py` had its own hand-rolled ledger reader that disagreed with the
+gate in three ways simultaneously: it read the **live log only** (blind at the 5 MB
+rotation while `_human_approved` still saw the approval), applied **no**
+`MACHINE_DECIDED_BY` filter (an `autonomous` row reached the operator labelled as a human
+decision), and took the **last line** rather than newest-by-timestamp. Two readers of one
+ledger is precisely how R8 happened, so the route now delegates to
+`governance._last_human_decision` and reads no ledger of its own.
+
+### Fixed: the "never raises" sanitizer removed nothing when it failed (R26)
+
+`sanitize_rollout_records` satisfied its never-raises contract by appending the **RAW
+record** when `sanitize_rollout` raised - persisting exactly what the function exists to
+remove. The fallback is now a **redacted shell**: field names and list positions survive
+(the held-out gate compares pairs by index and reads fields by name), every free-text value
+is dropped, and numeric counters are kept because they carry no text.
+
+### Fixed: the A/B judge's HTTP egress posted rollout text raw (R29)
+
+`_llm_judge_via_http` sent `task` + `last_response` unsanitised, which made
+`inner_loop`'s claim that *"every other provider boundary sanitizes and fails closed"*
+false. It now sanitizes, and **refuses** the call when the privacy helper is unavailable
+rather than sending raw text. Dormant either way - but dormant by configuration, not by
+design.
+
+### Fixed: the training tool could run twice and leaked a handle (R27)
+
+`skillopt_train kind=run` spawns an hours-long detached process. It recorded no state, so
+nothing stopped a second concurrent run (both writing the same artifacts), and it kept its
+copy of the log handle open forever - one leaked descriptor per run, and on Windows an
+open handle also blocks rotation of that log. Now single-flight by **pid liveness**
+(`sleep_runner.is_running`, not `os.kill(pid, 0)`, which is Ctrl+C on Windows), with the
+handle closed after the spawn and the pid recorded atomically.
+
+### Fixed: the bridge index was written non-atomically (R28)
+
+A torn `.bridge_index.json` is swallowed by its reader into an **empty** index, after which
+every rollout looks unprocessed and duplicate rows are appended to `history.jsonl` -
+duplication no reader can distinguish from real history. Now temp-write + `os.replace`.
+
+### Fixed: the record of the run that did NOT execute was discarded (R31)
+
+`run_sleep_cycle.py`'s `backend_guard` refusal is precisely the line that must not be
+lost - and it emitted while `_LOG_PATH` was still `None`, so `emit()` wrote nothing. The
+path is now bound **before** the guard.
+
+### Fixed: a fallback that claimed a safety property it did not have (R32)
+
+`sleep_runner._deep_copy`'s docstring said returning the original object "is strictly
+safer than returning a shared structure". It **is** a shared structure, so on a deepcopy
+failure a caller mutating the result would corrupt the cached config parse for the life of
+the process. The fallback now rebuilds dicts, lists and tuples and shares only
+immutables, which cannot be mutated in place.
+
+### Fixed: the dashboard documented a contract that had changed (R30)
+
+`skillopt-dashboard.js` still described `/reject` as *"audit only; does not delete the
+staged file"* - stale since v1.8.36, when a rejection began quarantining the proposal. A
+maintainer trusting that comment would have reintroduced F2. It now states where the
+document goes, when the behaviour changed, and that a partial failure reports `ok:false`.
+
+### Tests
+
+298 -> 306, eight new cases. **All 8 mutations detected.**
+
+Three of my own tests needed tightening first, and all three failed the same way - they
+asserted a string *exists* rather than that a guard still *gates*:
+
+- R27 survived `if prev_pid:` -> `if False:` because three separate substring checks all
+  still passed.
+- R32's test asserted the false docstring claim was absent, but the corrected
+  docstring **quotes** it while explaining the bug - a substring check cannot tell a claim
+  from its refutation.
+- R29's "privacy unavailable" simulation failed twice because the smoke harness mirrors
+  `usr.plugins.skillopt.helpers.*` onto the bare namespace, so the import resolves
+  through a **package attribute** and never consults `sys.modules`. Removing the attribute
+  was required, not just setting `sys.modules[name] = None`.
+
+Every one of those would have shipped the regression, and none was visible by reading.
+
+---
+## [1.8.46] - 2026-10-04
+
+Second-audit remediation, **Phase 6e: privacy completion**. Fixes **R13, R14, R15, R16,
+R17, R24**. The last six, and the only ones with a confidentiality dimension. All six were
+the same shape: **a control that looked present and did not.**
+
+### Fixed: the inner-loop egress sanitized a key the payload does not have (R14)
+
+`_llm_suggest_via_http` called `sanitize_rollout_records(payload["rollouts"])` — but
+`_build_rollout_payload` emits `{task, trajectory, last_response, ...}` and has **no
+`rollouts` key**. So the call received `None`, its result was discarded, and **nothing was
+sanitized**; `trajectory` is a *list*, which the per-field `isinstance(v, str)` filter
+skipped anyway. The endpoint is one config value from being live, so enabling it would
+have started shipping credentials. Both payload shapes are now handled by
+`_sanitize_payload`, and a **no-op guard** refuses the request when sanitisation provably
+changed nothing on a payload that held a credential shape — the silent no-op was the
+failure, so it must now be loud.
+
+That guard first tried to re-probe the *output* for a credential shape and matched its own
+`[REDACTED]` marker (`API_KEY=[REDACTED]`), refusing to send whenever a task merely
+mentioned a key. It now compares the body to the payload instead, which detects the no-op
+without false positives.
+
+### Fixed: model output is now redacted BEFORE it is persisted (R16)
+
+Redaction happened only at the live write, so the **unredacted** bytes were already in
+`staging/<skill>.md`, copied verbatim into `staging/adopted/*.md`, and embedded in the
+summary sidecar's diff — the live-write redaction never removed them. Both staging writers
+(`direct_optimizer`, `official_adapter`) now redact before writing, and the copy is
+annotated so a redaction failure cannot be reported as a copy failure.
+
+### Fixed: `adopt_write_skill`'s `redacted` flag was read by nobody (R15)
+
+The writer computed it, its own docstring claimed *"the audit row can record it"*, and no
+caller looked. A live skill altered by redaction left no trace in any ledger. The drain
+now logs it, records `output_redacted` on the audit row, and writes a
+`decided_by="redaction-notice"` ledger row; the HTTP route surfaces `redacted`.
+
+### Fixed: the real-gate tasks file could be written unsanitized, silently (R13)
+
+An unimportable privacy helper, or a sanitisation that raised, logged and **continued** —
+writing raw rollout records to `logs/runs/*.tasks.json`, which the worker then re-reads
+into a live agent context. Both failure paths now **skip the real gate** rather than
+persist unsanitised records, matching `bridge.py`, which raises. The misleading comment
+("sanitisation only rewrites text fields") is corrected: at the shipped defaults it
+**pops** each trajectory step's `args`/`result`, so the frozen records are structurally
+lighter than the source rollouts.
+
+### Fixed: index compaction could drop a concurrent append (R17)
+
+`_compact_approvals_index` did read → rewrite → `os.replace` with no lock while three
+writers append to that file (two routes + the drain thread). A row appended between the
+read and the replace was **dropped silently** — the exact failure M2 was filed for,
+reintroduced in the file created to fix it. Append and compaction now share one
+`_APPROVALS_INDEX_LOCK`, and the compaction temp file is cleaned up on failure.
+
+### Fixed: `setup_env` destroyed an unmatched plaintext credential (R24)
+
+`_provenance_ref` fell back to `${KEY}` when no visible source matched, which resolves to
+nothing. A legacy `.skillopt-env` holding the only copy of a **working** credential was
+rewritten into a dangling reference, the credential was destroyed, and the next LLM call
+failed with *"No LLM API key found"*. There is no self-reference fallback now: an
+unmatched plaintext value is **preserved** and reported as `unresolved`. A matched source
+still converts as before.
+
+**This deliberately narrows a v1.8.5 security assertion**, and the trade is explicit: the
+property that matters is not "no plaintext on disk" (the plugin did not put it there — a
+legacy hand-edit did) but **"the plugin does not break a working credential"**. Rewriting
+it to a dangling reference is not the plugin's call to destroy a secret it cannot
+re-create.
+
+### Tests
+
+292 → 298. **7 of 9 mutations detected**; the 2 skipped failed on the *mutation
+script's* anchors, not on the tests.
+
+Mutation testing earned its place twice more. The R13 test asserted a substring existed,
+but there are two skip branches and removing one left the other's text — and my first
+fix searched the whole remainder, so it found the other branch's wording. It is now a
+**bounded** window. The R16 test asserted `redact_text(` appeared before the staging write,
+which survives `if False:`; it now pins the guard and the call as one sequence. Both were
+loose tests that would have shipped the regression, and neither was visible by reading.
+
+---
+
+## [1.8.45] - 2026-10-04
+
+Second-audit remediation, **Phase 6d: ledger and state consistency**. Fixes **R8-R12, R18,
+R20, R21, R22**. Nine findings, seven modules, one theme: **state that disagrees with
+itself.** A budget recorded against one cap and checked against another; a card that knew
+an approval the gate could not see; an audit row asserting a passing adoption for a write
+that never happened; a rollout retired because nobody asked the question.
+
+### Fixed: the proposal-decision map read only the live log (R8)
+
+After the 5 MB rotation this is exactly the card/gate disagreement `Local Contracts`
+warns about: `_human_approved` (which reads the index and the generations) knew an
+approval existed while `find_pending_proposal` reported the proposal `"pending"`, so the
+Governance card re-prompted for a change already decided. It also called `_runs_dir()` —
+which ends in a `mkdir` — *outside* its `try`, contradicting its own "Never raises"
+(the F8 pattern, third occurrence). It now reuses `_iter_governance_rows()` and
+`_read_approvals_index()`, so the two readers see the same history.
+
+### Fixed: the ledger was re-read once per governed skill (R20)
+
+`find_pending_proposal` called the scan per skill and the scan read the whole ledger, so
+the dashboard was **O(skills x ledger)** per refresh — 21 full reads at 21 decision rows,
+growing with install age. Memoised with a 2 s TTL plus a generation counter bumped on
+every append, so N lookups cost one scan while a decision made a moment ago is still
+visible immediately. Measured: **25 lookups -> 1 scan**, and a write forces a re-scan.
+
+### Fixed: a budget recorded against one cap and checked against another (R9, R10)
+
+`governance`'s budget check called the factory with **no `cfg`**, so `budget.enabled` was
+inert there and `reset_hour_utc` fell back to the module default (00:00) while the drain
+used the operator's value — two different daily windows for one skill, plus an HTTP thread
+becoming a reader/writer of the budget state file.
+
+And a **tenth** bare `BudgetTracker(...)` had survived at the real-gate spend site, so the
+real gate accumulated against the module default while the drain checked the operator's —
+the exact regression the v1.8.37 F13 fix removed from nine sites, reappearing where the
+fix did not look. Three further sites built one directly for status reads when the gate was
+disabled; `tracker_from_config(..., default_when_disabled=True)` now covers those too, so
+**"only the factory constructs a tracker" is literally true** and an assertion enforces it.
+
+### Fixed: the audit trail claimed adoptions that never happened (R11)
+
+The drain wrote `passed: <gate verdict>` **before** the write, and every later refusal —
+failed snapshot, ungated-direct refusal, autonomous deferral — returned without correcting
+it. So the trail asserted a *passing adoption* for a write that never landed.
+`api/adopt.py` already wrote a correction row; the drain did not.
+
+Every exit now goes through one `_audit(outcome)` writer, recording
+`outcome` ∈ `proposed | adopted | rejected | refused | deferred | ungated_blocked`, with
+the gate's own verdict kept in a separate `gate_passed` key. The row template carries
+**no** `passed` key at all, because `_audit` is the only writer and always overwrites it —
+a dead field there would become a live false statement the moment that overwrite was
+removed. Mutation testing found this twice before it was pinned.
+
+### Fixed: the agent adopt tool discarded its `skill` argument (R12)
+
+`skillopt_sleep verb=adopt skill="foo"` called `_adopt()` with no argument and adopted
+`staged[0]` — silently adopting a **different** skill than the one named. Audit M5 fixed
+exactly this on the HTTP route; the agent path is the copy where no human is reading a
+diff. It now resolves by stem equality and **errors** on no match, matching
+`api/adopt.py`.
+
+### Fixed: `/reject` reported success over two silent partial failures (R18)
+
+If the quarantine failed **and** the ledger write failed, the document stayed queued with no
+rail armed — and the route returned `ok: true`. Same defect F10 fixed for the opt-in marker.
+It now reports the combined outcome and names what is still true ("the proposal was NOT
+moved out of the queue", "the rejection rail is inert"). A half-done reject is not a reject.
+
+### Fixed: a transport error retired a rollout forever (R21)
+
+`inner_loop` treated an unreachable endpoint as a completed judgement: it enqueued an
+**empty** suggestion, and an empty suggestion is exactly how "the model had no useful
+idea" is represented. So the rollout was marked done and its contribution to the training
+signal was **permanently** retired — with no retry and no counter distinguishing the two
+cases. Errors now consume the shared `_bump_skip` budget and are retried on a later tick;
+a genuine decline still enqueues a no-op and still retires. An endpoint outage now costs
+retries, not data.
+
+### Fixed: a failed reward-model load was retried on every finished chat (R22)
+
+`_load_attempted` was assigned in three places and read **nowhere**, and it was set only on
+the *last* line of `_try_load_model` — so both failure paths returned without recording the
+attempt. `_ensure_model_loaded()` therefore re-ran the full checkpoint load for every
+finished chat when the directory was present but unloadable, holding `_lock` on the
+harvester's latency path. The flag is now read as a retry guard and set **before** any exit.
+
+### Tests
+
+284 → 292, eight new cases. **All 11 mutations detected**, including the two that only
+exposed themselves after a *second* pass: an assertion on `rows[-1]` alone could not see a
+provisional row that a later row corrected, and a text search flagged the docstring
+*describing* the `_runs_dir` bug as the bug (the same trap as `OpenAI(` appearing in the
+R5 comment). Both are now AST- or all-rows-based.
+
+## [1.8.44] - 2026-10-04
+
+Second-audit remediation, **Phase 6c: the LLM boundary**. Fixes **R5, R6, R7, R19,
+R23**. All five are the same shape: *the call we make to a provider does not do what the
+code around it assumes.*
+
+### Fixed: one unresponsive endpoint could hold the judge queue for ~2 hours (R5)
+
+`direct_optimizer._call_llm` built its client as `OpenAI(base_url=..., api_key=...)`,
+inheriting the SDK's **600 s read timeout and 2 internal retries**. That call runs inside
+`llm_judge._judge_llm_call`, which holds `BoundedSemaphore(1)` — so one non-responding
+endpoint stopped every other judge caller. `judge_client.judge_rollouts` is a synchronous
+loop called inline by `run_sleep_cycle.py`, so a single cycle could hang for the entire
+backlog.
+
+Now bounded by `llm_call_timeout_s` (new, default 60; also `SKILLOPT_LLM_TIMEOUT_S`;
+clamped to `(0, 600]` because a non-positive timeout means "block forever" to httpx).
+`max_retries=0` **on purpose** — `llm_judge` owns the retry policy and owns it better
+(pacing-aware, bounded, 429-aware); the SDK retrying underneath it produced un-paced
+nested attempts, which is the 429 storm the burst-protection layers exist to prevent.
+`ping_judge` already passed a timeout and `max_retries=1`; this was the production call it
+claims to mirror exactly.
+
+### Fixed: the judge's escalation ladder could not run (R6)
+
+`judge_client.judge_rollout` only escalates when the first call produced no label, and it
+reads `base.get("model")` to decide **whom** to re-ask with a bigger token budget. Neither
+of `judge_outcome`'s two failure shapes carried `model`, so `judge_name` was always `''`,
+the ladder collapsed to `[('', 6000)]`, and every rollout that failed because the judge
+exhausted `max_tokens=300` on hidden tokens was re-asked of the **chat-slot model** — the
+most expensive model in the preset — with the label's provenance misreporting which model
+actually judged it. Both failure shapes now name the model that was tried.
+
+Separately, the escalation ladder called `direct_optimizer._call_llm` **directly**,
+skipping the in-flight limiter, the `SKILLOPT_JUDGE_THROTTLE_S` pacing and the retry
+policy — while `judge_rollouts` looped it over up to `limit` rollouts on one thread. An
+un-paced 429 storm arriving by the path meant to *rescue* a failed labelling. The
+escalation now routes through `llm_judge.judge_call`, and the first attempt and the
+escalated attempts share one guarded path (`_guarded_call`) so they cannot drift.
+
+### Fixed: the A/B harness scored both arms identically (R7)
+
+`_replay_under_skill` preferred `rollout["fragments_active_text"]` over its `skill_text`
+**argument** — and `run_ab` passes `current_text` and `proposed_text` as that argument.
+The harvester sets that field for any skill without a `fragments:` list, and
+`read_fragments` returns an implicit `_default` fragment whose text is the **whole
+`SKILL.md`** for exactly those skills.
+
+So for essentially every rollout of every ordinary skill both arms received byte-identical
+input, `score_a == score_b`, the judge returned `tie` at confidence 0.5, `lift_pp` was
+`0.0`, and `validate_proposal` took the `ab_harness_rejected` branch with a reason string
+that reads like a real measurement. **Enabling `ab_harness_enabled` blocked ALL skill
+evolution.**
+
+The arm's own text is now authoritative, with the fragment snapshot kept as the fallback
+for an arm that has none (a rollout captured before the skill existed). A harness that
+scores both arms identically is not a conservative harness — it is a broken one. Worth
+noting: the judge already scaled confidence with the score gap, so once the arms genuinely
+differ the default judge can clear `min_confidence`; the flat `0.5` was only ever the tie
+case.
+
+### Fixed: the intent refinement's documented timeout did not exist (R19)
+
+`refine_intent_with_llm` accepted a `timeout_s` that nothing read, and `hook(prompt)` is a
+synchronous call into an HTTP helper — so a hanging hook hung the **staging write path**
+indefinitely. The hook now runs on a worker thread with a hard deadline; an over-running
+hook is abandoned (a daemon thread cannot be cancelled) and the heuristic stands.
+Abandoned hooks are capped by a module-level slot limit so they cannot accumulate.
+`intent_llm_timeout_s` is also now **declared** in `default_config.yaml` — it was read by
+the code but unsettable, which is how the name-grep reader test could not see it.
+
+### Fixed: `calibrate_judge` reported on the stub while claiming the judge (R23)
+
+The docstring said *"Uses the production LLM judge by default"* while **both** no-flag
+branches returned `ab_harness._default_judge_fn` — the deterministic keyword stub. So
+`python scripts/calibrate_judge.py` printed `OK: judge is calibrated (kappa …)` about the
+**stub**, with nothing to tell an operator otherwise.
+
+Three fixes: `_make_judge` now returns `(callable, description)` and the report names the
+judge under test, with a stub run labelled `HARNESS OK` and stating plainly that nothing
+was measured about the production judge; **arm A is now sent** (`human_label` is a
+comparison *between* the arms, and the judge only ever saw B); and the scores are derived
+from the response lengths instead of being a constant `+0.2`, which had made
+`score_b - score_a` always positive so the stub answered `win` for **every** pair and the
+reported kappa was a function of the human-label distribution alone. Offline-by-default is
+a legitimate choice — it just has to be visible.
+
+### Tests
+
+277 → 284. **All five mutations detected** — reintroducing each defect individually makes
+the suite fail:
+
+| Mutation | Caught by |
+| --- | --- |
+| no timeout on the client | *"constructed without a timeout"* |
+| `model` dropped from the judge exception path | *"the exception path does not carry `model`"* |
+| fragment snapshot overrides arm text | *"the proposed arm was scored on …CURRENT-ARM"* |
+| hook called inline (timeout unused) | *"a hanging hook blocked for 30.0s despite timeout_s=1"* |
+| arm A dropped from the calibration payload | *"arm A is still never sent to the judge"* |
+
+Two of these were caught only because the mutation harness exists: the R7 and R23 tests
+initially matched the wrong thing — an `OpenAI(` inside the very comment explaining the
+fix, and a branch slice that cut off before the return it was asserting on. Both were
+test defects, not product defects, and both are recorded as the kind of thing a negative
+test gets wrong when nobody checks it against a real failure.
+
+## [1.8.43] - 2026-10-04
+
+Second-audit remediation, **Phase 6b: stale authorisation decisions**. Fixes **R3** and
+**R4**. Both are the same class as R2 — an **absent or stale answer read permissively**
+on the path to a live file.
+
+### Fixed: a mode write was invisible for up to 5 seconds (R3)
+
+`sleep_runner._framework_registry_config()` memoises the framework plugin-config read for
+5 s. That TTL is safe for reads and unsafe for writes, because `plugins.clear_plugin_cache()`
+drops the **framework's** cache, not **this plugin's** memo. Two consequences:
+
+- `POST /mode` builds its response from the config it just wrote and passes it to
+  `resolve_evolution_mode(cfg)` — which prefers the registry whenever the registry yields
+  anything. So the response reported the **pre-write** mode, and `webui/config.html`
+  rendered that stale value straight after the operator toggled it.
+- Worse, in the **authorisation** direction: the drain reads the mode through the same
+  memo. After the operator switched **autonomy off**, the drain could keep resolving
+  `autonomous` for up to the TTL and write a live `SKILL.md`. A stale permissive answer on
+  a decision that authorises writes.
+
+`sleep_runner.invalidate_framework_config_cache()` is new, and **both** write paths
+(`api/mode.py` and `api/config.py`) now call it alongside `clear_plugin_cache`. The
+remaining window is an external hand-edit of `config.json`, which is bounded by the same
+TTL — and `.autonomous_pause` remains the immediate, cache-independent lever, because it is
+a file-existence check.
+
+### Fixed: an unreadable ledger silently DISARMED the rejection rail (R4)
+
+`_human_rejected_current_proposal` ended `except Exception: return True  # Undecidable =>
+restrictive`, but both of its helpers swallowed every exception and returned `None`, so
+nothing inside the rail's `try` could raise — **the restrictive branch was dead code**.
+"No decision recorded" and "the ledger could not be read" were the same value, and the rail
+read both as "nothing to enforce". An unreadable `approvals_index.jsonl` therefore
+disarmed the human-rejection rail, and the drain adopted a document a human had
+explicitly refused — with no log line and no reason string.
+
+Readers are now **tri-state**: `_last_human_decision`, `_read_approvals_index` and
+`_newest_staged_mtime` return a module-level `_UNREADABLE` sentinel when they cannot
+evaluate, distinct from `None`/`[]` meaning genuinely absent. `_UNREADABLE` is
+restrictive; absence is not. The tri-state exists precisely so the two are separable: a
+fresh install has no ledger at all, and if that read as a fault **every** skill would be
+permanently blocked and evolution could never start. Both directions are asserted.
+
+A generator cannot return a value, so `_iter_governance_rows` reports a read fault through
+a module flag (`_LOG_READ_FAILED`) that `_last_human_decision` reads and resets.
+
+### Tests: mutation testing found two decorative tests
+
+Both R4 tests initially **stubbed `_read_approvals_index` to return `_UNREADABLE`** — the
+function under test — so restoring the buggy conflation left the suite green. Rewritten to
+drive the **real** readers through a real `builtins.open` / `Path.is_file` failure.
+
+A second mutation pass found the coverage was still incomplete: the row-reading `except`
+was exercised but the `is_file()` guard's `except` was not, so reverting *that* branch to
+`return []` also left the suite green. It now needs an odd filesystem state to reach, but
+R4's claim is that **no** unevaluable branch may read permissively, so it is asserted.
+
+**Both mutations are now detected.** (R3's mutation — dropping the memo invalidation —
+was detected on the first attempt.)
+
+A third `@test` decorator was lost to a bulk edit during this work: the function was
+defined but never registered, so the one test that drove the row-reading `except` did not
+run. That is the **third** time a scripted replacement ate a decorator in this file. The
+rule is now in `AGENTS.md`: *never rewrite a test block by script without asserting the
+registered count.*
+
+### Tests
+
+272 → 277.
+
+## [1.8.42] - 2026-10-04
+
+Second-audit remediation, **Phase 6a (continued): the drain's own pre-write gate**. Fixes
+**R2**. Evidence in `AGENTS.md` → *Open findings register — RE-AUDIT*; phasing in
+`REMEDIATION_ROADMAP.md` → Phase 6a.
+
+### Fixed: the drain's only pre-write governance gate still failed OPEN (R2)
+
+`auto_loop._adopt_one` logged `"governance: … check failed; falling through"` and
+continued into `validate_proposal` → `adopt_write_skill` → a live
+`usr/skills/<n>/SKILL.md`. `_auto_adopt` calls `_adopt_one` **directly** and never routes
+through `_skill_eligible_for_cycle`, so this was the *only* governance evaluation on the
+drain's path to a live file. A raising check — an unreadable ledger, a `mkdir` on a full
+disk, an ImportError — therefore disabled optout, immutable, pause, cadence, budget **and**
+the human-rejection rail for that proposal, and the drain promoted a live skill for a skill
+the operator had opted out of.
+
+v1.8.35's F8 fix corrected the **sibling** gate (`_skill_eligible_for_cycle`) and the F8
+test drove **that sibling**, so the fix looked complete and was not. This is the same shape
+as R1, one function along: *a partial fix, covered at the wrong site.*
+
+`_adopt_one` now fails **closed** and returns `"skipped"` — the correct outcome rather than
+a new one, because a governance that cannot be evaluated is a **deferral**: the proposal
+STAYS in staging and may become eligible next tick. It is not a rejection and must never be
+a write. The deferral is both logged with `DEFER` and passed to `_record_error`, so the
+dashboard shows it; `_record_error` is called as a **module-level** function, because the
+v1.8.35 fix used `self.` and would have raised `AttributeError` inside its own except
+handler.
+
+### Tests: the coverage goes where the code is
+
+The R2 tests drive **`_adopt_one` itself**. A test of the sibling would have kept passing
+after R2 was reintroduced — which is exactly what happened for a release. They stub
+`validate_proposal` so a refusal can only come from governance, assert the negative that
+matters (**no `adopt_write_skill` call**), and include a control case proving the same
+function *does* write when governance permits, so "always defer" cannot pass either.
+
+**Verified load-bearing by mutation:** restoring `pass  # fall through` makes the suite fail
+with *"_adopt_one wrote ['r2skill'] even though the governance check RAISED"*.
+
+A structural guard (`t_v1842_all_write_paths_are_gated`) now asserts, **per function**, that
+everything reaching `adopt_write_skill` has a governance evaluation ahead of it — with two
+documented exemptions, each carrying its reason: `_harvest_real_gate` (governance ran at
+spawn time; the verdict sidecar is the record) and `adopt_write_skill` itself (the sanctioned
+low-level writer, correctly ungated — which is precisely why every *caller* must gate).
+
+That check had to be written carefully to be worth anything: it strips each function's
+docstring first, because several functions *mention* `adopt_write_skill()` in prose and an
+earlier draft matched the prose, reporting a false positive on the agent tool.
+
+`allow_ungated_direct_adopt` is also noted: `_adopt_one` refuses an ungated direct adoption
+unless the operator opts in (v1.8.24 P1.6), which is a separate correct refusal — the R2
+control case opts in explicitly so the only gate under test is governance.
+
+### Tests
+
+268 → 272.
+
+## [1.8.41] - 2026-10-04
+
+Second-audit remediation, **Phase 6a: the authorisation path**. Fixes **R1**, the only
+finding where one click by one person reaches a live file with every rail disabled.
+`REMEDIATION_ROADMAP.md` → Phase 6; evidence in `AGENTS.md` → *Open findings register —
+RE-AUDIT*.
+
+### Fixed: the human Approve button bypassed every governance rail (R1)
+
+`api/adopt.py` contained **zero** references to `governance`. It called
+`validate_proposal`, `adopt_write_skill` and four helpers — but
+`check_skill_eligible` is the *only* implementation of `.skillopt.optout`,
+`mode: immutable`, `.skillopt.pause_until`, `min_interval_seconds`,
+`daily_budget_cents` and the v1.8.36 rejection rail. Clicking **Approve** on the
+Staged card therefore wrote a live `usr/skills/<n>/SKILL.md` for a skill the operator
+had opted out of, paused or marked immutable — **or whose proposal a human had
+explicitly rejected**, since `/governance_approve {approved:false}` records the denial
+without quarantining, leaving the document staged and still adoptable.
+
+This was the one surface with no agent and no second pair of eyes, which made it the
+worst possible place for the gate to be missing.
+
+The route now runs the chain before `validate_proposal`, with
+`auto_adopt=resolve_evolution_mode()["autonomous"]` resolved by **no argument** so the
+operator's persisted config is authoritative — byte-identical to the other two paths.
+It fails **closed** in both directions: an unimportable governance module and a raising
+check both refuse.
+
+### Fixed: one gate, one implementation
+
+R1's root cause was **two hand-written spellings** of the same gate. The agent tool got
+a chain in v1.8.36; the route was never given one, and nothing ever diffed them. The
+chain is now a single helper, `_check_governance()`, in `api/adopt.py`, and
+`tools/skillopt_sleep.py` **delegates to it** — so the human path and the agent path
+cannot drift apart again. A test asserts the delegation, because "they both call
+`check_skill_eligible`" is not the same guarantee as "they call the same thing".
+
+### Fixed: a false claim in the test suite
+
+`t_v1836_all_adopt_paths_agree` was *named* "all adopt paths agree", its `_ok` line read
+`"drain, route and tool all refuse what the rails forbid"`, and its comment said
+*"The HTTP route refuses."* The body asserted only that a proposal was still staged —
+under a comment conceding **"the route does not call governance"**. It passed because
+the thin fixture failed `validate_proposal` first.
+
+That comment was written during v1.8.36, when the missing gate was found and
+rationalised instead of fixed. **A test whose assertions do not match its name is worse
+than no test, because it manufactures confidence in a guarantee that does not exist** —
+and it is how R1 survived a full remediation cycle plus a self-audit.
+
+The test is rewritten to drive all three paths against the same rails, to stub
+`validate_proposal` so a refusal can only come from governance, to assert the negative
+that matters (**no live `SKILL.md` afterwards**), and to include a **control case**
+proving the same route *does* adopt when governance permits — so "always refuse" cannot
+pass either.
+
+**Verified load-bearing by mutation:** disabling `_check_governance` makes it fail with
+*"the ROUTE adopted a skill blocked by `opted_out_via_marker`*. The previous version
+passed with the gate absent.
+
+### Also in this release
+
+- **`target.parent.mkdir` removed from the route.** `adopt_write_skill` already creates
+  the parent, so doing it in the handler was redundant *and* a side effect ahead of the
+  gate: a refused adopt left an empty `usr/skills/<name>/` behind.
+- **The real-gate single-flight check no longer swallows.** It was a fail-*open*
+  wrapper (`except Exception: pass`) around the check that prevents two writers for one
+  proposal. A pending replay now defers with a reason; an unevaluable check refuses.
+- **The gate's outcome is reported honestly.** `governance: "refused"` with the rail's
+  reason is distinct from `governance: "unavailable"` for an unevaluable gate. The first
+  draft conflated them and told the operator "unavailable" for an ordinary refusal.
+- **Five route-mechanics tests now opt their fixture skill in** (`_adopt_opt_in`). They
+  test proposal_id resolution, atomic writes, snapshot refusal and single-flight — none
+  is a test about governance. Stubbing the gate out instead would have recreated the
+  very failure being fixed.
+
+### Tests
+
+268 → 268 (one test rewritten and strengthened; six fixture opt-ins added).
+
+## [1.8.40] - 2026-10-04
+
+Self-audit of the audit remediation. No behavioural change to the plugin; this release
+exists because the strongest criticism available after shipping five phases of fixes is
+"but who checked the fixes?", and the answer was "the tests the same work wrote".
+
+### The remediation applied to itself
+
+The 2026-10-04 audit used four techniques, three of them **structural** rather than
+grep-based. Re-running them against this work's own ~1,500 lines:
+
+| Check | Result |
+| --- | --- |
+| Bare `helpers.*` imports with no namespace attempt (the F11 class) | 0 |
+| Writes to `runs/` or a live `SKILL.md` without temp+replace (F3/F6) | 0 |
+| `except: pass` immediately after a state write (the F8 class) | 0 |
+| Config keys whose **name** is read but whose **value** never arrives (F13) | 0 defects, 1 blind spot |
+| Tests that assert a literal they just wrote, or reimplement the logic | 1 of 59 |
+| Existing contracts (markup, JS, route inventory, documented keys, versions) | 0 broken |
+
+### Fixed: the F1 auto-loop test asserted on a COPY of the logic
+
+`t_v1835_autoloop_resolves_mode_from_merged` reimplemented the drain gate
+(`def canary(cfg, autonomous)`) and asserted on the transcription. That is exactly the
+weakness that let F1 ship in the first place: the real gate was wrong while this test
+passed, because the test never called it.
+
+It now drives the **real** `AutoLoopThread._tick`, patching only its I/O edges
+(`enforce_rollout_retention`, `list_rollouts`, `_log`) and observing whether
+`_auto_adopt` was invoked — which *is* the resolved mode, because that call is the
+gate's only effect at step 3. `_auto_adopt` is recorded rather than run, so no adoption
+occurs: the assertion is about the decision, not the write.
+
+### Fixed: the config-reader test asks the wrong question, permanently
+
+`t_v1824_config_keys_have_readers` greps a key's NAME, which passes for a key that only
+appears in a helper's own signature — precisely how `budget.daily_cap_cents` stayed
+inert under a green suite. The audit said F13 "requires fixing the test, not just the
+wiring"; this completes that.
+
+`t_v1839_config_values_reach_consumers` asks the question that matters: set a
+**distinctive** value and assert it **arrives**. Every setting added in v1.8.34-1.8.39
+is covered, including the ones read through a loop (`budget` via a tuple, the
+`governance.autonomous_*` rails via an `"autonomous_" + key` prefix) whose full dotted
+name never appears in the source at all. A behavioural test also removes the accidental
+coupling: the name-grep test passed for those rails only because `autonomous_config()`
+happens to reuse the same short names in its internal dict.
+
+### Tests
+
+267 → 268. The self-audit also caught a tautology introduced while writing the new
+test itself (`assert X is not None or True`), which is precisely the failure mode the
+audit was looking for — and a dropped `@test` decorator that had silently unregistered a
+test while the suite still reported green.
+
+## [1.8.39] - 2026-10-04
+
+Audit remediation, **Phase 5: privacy, resources, performance** — and the **close of the
+audit**: all 28 findings from the 2026-10-04 read-only audit are now fixed, across
+v1.8.35 - v1.8.39. See `REMEDIATION_ROADMAP.md` for the phasing and `AGENTS.md` for the
+standing invariants each fix produced.
+
+| Phase | Version | Findings | Theme |
+| --- | --- | --- | --- |
+| 1 | 1.8.35 | F1, F5-F9 | Safety rails and the autonomy contract |
+| 2 | 1.8.36 | F2, F3, F10, M5-M8 | The human approval path is authoritative |
+| 3 | 1.8.37 | F4, F11-F14 | Inert configuration and latent dispatch |
+| 4 | 1.8.38 | M1-M4 | Ledger durability and path safety |
+| 5 | 1.8.39 | M9-M14 | Privacy, resources, performance |
+
+Suite: 204 → **267** deterministic cases.
+
+### Fixed: MODEL OUTPUT was never redacted (M9)
+
+`privacy.py` sanitized rollout **input** at every provider and replay boundary, and fails
+closed there. The model's **returned** text was never sanitized, so it flowed
+`_extract_skill_text` → staging → approval → live `SKILL.md` verbatim. A credential
+echoed back from a prompt became part of a live skill document, and from there part of the
+system prompt on every later load.
+
+`adopt_write_skill()` is the single choke point every adopt path goes through (the HTTP
+route, the agent tool, both drain paths), so redacting there covers all of them at once.
+It is deliberately the **last** gate rather than the only one — redaction is best-effort by
+contract and must not be the sole defence. The result now carries `redacted: True/False`
+on **every** return path, so the audit row can record that a document was changed on the
+way in.
+
+Two persistence/egress paths also carried raw rollout text:
+
+- the **real-gate tasks file** froze whole rollout records to `logs/runs/*.tasks.json` and
+  the worker re-read them on every replay, so an unsanitized credential captured before the
+  privacy controls existed was written to disk and then re-injected into a live agent
+  context. Sanitized at the persistence boundary now (order and length preserved — the
+  held-out gate compares by index).
+- `inner_loop._llm_suggest_via_http` posted raw rollout text to an arbitrary configured
+  endpoint — dormant only because `inner_loop_llm_endpoint` defaults to empty, which is a
+  config accident rather than a control. It now sanitizes **and fails closed**: with the
+  privacy helper unavailable the request is not sent.
+
+### Fixed: the redactor missed the most common credential form (M10)
+
+`_ASSIGNMENT_RE` led with `\b`, and `_` is a **word character** — so there was no boundary
+in `AZURE_OPENAI_API_KEY=<secret>` and the entire alternative failed to match. Only the
+literal `sk-` / `ghp_` patterns rescued the best-known cases, so the single most common
+credential shape on the planet slipped through a redactor that read as comprehensive.
+Replaced with `(?<![A-Za-z0-9])`, which permits a preceding underscore while still
+refusing a match mid-run.
+
+Also closed: non-HTTP URL credentials (`postgres://`, `mongodb://`, `redis://` — including
+the empty-username `redis://:password@host`), DSA/PGP/ENCRYPTED/PuTTY key headers,
+assignments inside escaped-JSON strings, and `secret_key` / `private_key` key names.
+
+**Deliberately still not attempted:** generic high-entropy base64. A rule that redacts any
+long base64 string would shred legitimate hashes, checksums and encoded examples to catch
+a secret inside one — a worse trade than the gap, so it stays a documented limitation
+(asserted by a test so it cannot be quietly forgotten). Redaction remains best-effort, not
+a guarantee.
+
+### Fixed: subprocess log handles were never closed (M11)
+
+`Popen` duplicates the descriptor, so the parent did not need to keep the log handle open —
+and leaving it open leaked one descriptor per cycle. On Windows an open handle also blocks
+`os.replace`, so rotation silently stopped working for any log that had been written to.
+Both spawn paths now close their handle after the spawn, guarded so a close failure can
+never lose the pid.
+
+### Fixed: four run logs grew without bound (M12)
+
+`adoptions.log` (both adopt paths), `failure_memory.log` and `fragments.log` never called
+the existing `rotate_log_if_large`. The latter two are fully re-read on every status poll,
+so the cost grew with install age. All three now rotate, best-effort, so a rotation failure
+never stops an audit row being written.
+
+### Fixed: `default_config()` re-parsed 32 KB of YAML on a per-chat path (M13)
+
+It sat on the reward-model scoring path (`score_rollout` → `model_path` →
+`merged_config` → `default_config`), which runs once per finished chat in the harvester and
+2×N per real gate. The parse is now cached on the file's `(mtime, size)`; the result is a
+deep copy, because callers mutate it and that is why the original docstring concluded no
+cache was possible. **Measured: 58.6 ms → 0.31 ms per call, 190×.** Editing
+`default_config.yaml` still takes effect immediately.
+
+### Fixed: both banner CTAs dispatched a dead action (M14)
+
+`open-plugin-config:skillopt` matches no branch in
+`welcome-store.js:executeBannerAction`, which only handles `open-modal:` and `open-url:`.
+The button rendered and did nothing — worse than no button, because it looked like a
+working control. Both banners now use
+`open-modal:/usr/plugins/skillopt/webui/config.html`, the replacement this repo's own
+`scripts/gen_missing_agents_md.py` had already recorded. The test asserts against the
+WebUI **source**, not a literal, so the next rename fails there rather than in a user's face.
+
+### Tests
+
+259 → 267, eight new deterministic cases. One product bug was caught by the new tests
+during this phase: `sanitize_rollout` rewrote a present-but-`None` `task` to `""`, a lossy
+type change to persisted data made for no benefit — redaction now only touches string
+fields.
+## [1.8.38] - 2026-10-04
+
+
+Audit remediation, **Phase 4: ledger durability and path safety**. Phase 1 gates, Phase 2
+the approval path, Phase 3 settings and routes; Phase 4 is about the things that must
+stay **true over time and on disk**. Findings M1-M4 from `AGENTS.md` → *Open findings
+register*; sequencing in `REMEDIATION_ROADMAP.md`.
+
+The shared theme: **a fact that is correct when written and wrong later, for reasons
+nothing reports.**
+
+### Fixed: rotation silently revoked every older approval (M2)
+
+`governance.log` rotates at 5 MB and the previous generation is **deleted**. Every
+approval older than one rotation window therefore vanished: `_human_approved` returned
+False, a `require_human_approval` skill reverted to *pending* with no visible cause, and
+`decided_by="autonomous"` audit rows were lost — contradicting the "auditable forever"
+contract the whole dual-mode feature rests on.
+
+`mark_human_decision` now also appends to `logs/runs/approvals_index.jsonl`, written by
+the same function (so still one writer), never rotated, and holding only the latest row
+per (skill, proposal) — bounded by the number of skills and outstanding proposals rather
+than by history. Readers consult the log, its `.1` generation, **and** the index,
+newest-wins. An install that predates the index still benefits from generation
+fallback.
+
+### Fixed: the two ledgers were merged by string-comparing timestamps (M1)
+
+`governance.log` writes microsecond ISO in **UTC**; `cycle_history.jsonl` writes
+`strftime("%Y-%m-%dT%H:%M:%S%z")` — no fraction, **local** time. `_decided_proposal_ids`
+merged them with a plain string compare, so `'.' > '+'` plus the differing offsets
+decided the winner rather than the clock, and an automatic adoption could be attributed
+to a human approval. The merge now compares **parsed epochs** via a shared
+`_parse_ts` that also handles the `+0200` offset `fromisoformat` rejects before 3.11.
+
+Relatedly, `_last_human_decision` now picks the newest decision by timestamp rather than
+by line order — strictly more correct, since generations merged after a rotation can be
+out of line order.
+
+### Fixed: `_skill_dir` had only one of two containment layers (M3)
+
+`safe_skill_dir` documents name validation **and** a post-resolve containment check.
+`_skill_dir` implemented only the first, so a symlinked skill directory let governance's
+marker writes escape the skills tree while the adopt path refused the same name. Both
+layers now run there, so the two agree.
+
+Unsafe names also no longer share a single `_invalid_/` bucket: each gets a
+subdirectory keyed by a digest of the raw name, so two different bad names cannot share
+a policy scope (and `auto_optin_new_skill` can no longer `mkdir` and populate a shared
+directory), the mapping stays deterministic so the audit trail remains meaningful, and
+the unsafe string itself never reaches a path.
+
+### Fixed: an explicit `0` in a policy was turned back into the default (M4)
+
+`int(policy.get(key, D) or D)` meant `min_interval_seconds: 0` became a 3600-second
+floor and `daily_budget_cents: 0` became a 100c cap — while `budget.BudgetTracker`
+documents `daily_cap_cents <= 0` as unlimited, so governance contradicted the very
+module it delegates to. Both now read through `_opt_int`, which defaults only on `None`.
+`0` means "no limit" in both rails, and positive values still bite.
+
+### Tests
+
+252 → 259, seven new deterministic cases. One v1.8.35-era case was corrected for the new
+newest-by-timestamp semantics (its year-2999 probe row would otherwise outrank every
+later decision, so it now runs against its own skill).
+
+The M2 case caught a real leak in its own fix: the durable index is a **new** file in
+`logs/runs/`, and `reset_for_tests()` wiped only `governance.log` — so test rows
+accumulated across runs and `t_c4_governance_approve_endpoint`'s "before approval"
+assertion saw the previous run's approval and found the skill already eligible. Caught
+live, cleaned, and both `reset_for_tests()` and the pollution guard now name the file.
+That is the standing rule this exposed: **whenever a file lands in `logs/runs/`, it must
+be added to `reset_for_tests()` and to the guard.**
+
+---
+
+## [1.8.37] - 2026-10-04
+
+Audit remediation, **Phase 3: inert configuration and latent dispatch**. Phase 1 made
+the gates correct, Phase 2 made the human approval path authoritative; Phase 3 makes
+the **settings** do what they say and the **routes** mean what their path says.
+Findings F4, F11-F14 from `AGENTS.md` → *Open findings register*; sequencing in
+`REMEDIATION_ROADMAP.md`.
+
+The shared theme: **a declared setting or a documented route that does nothing**,
+and a test suite structurally unable to notice either.
+
+### Fixed: two API routes silently answered with the wrong handler (F4)
+
+The framework binds one handler per `api/<name>.py` module, taking `classes[0]` from
+`load_classes_from_file`, which iterates `reversed(inspect.getmembers(...))` — the
+**alphabetically last** matching class. Two modules declared two handlers each:
+
+- `api/fragments.py`: `Fragments` (read) lost to `FragmentsRollback` (write), so
+  `GET /fragments` returned the rollback handler's *"missing one of: skill,
+  fragment_id, target_version"* error and a fragment **write** was reachable at a
+  read-shaped path.
+- `api/cycles.py`: `Cycle` (detail) lost to `Cycles` (list), so the documented
+  `/cycle/<id>` answered with a **list payload**. The audit found only the first;
+  the new structural test found the second.
+
+Both are now one handler per module (`fragments_rollback.py`, `cycle.py`).
+`t_v1837_api_dispatch_matches_intent` simulates the framework's selection across every
+`api/*.py` — a check nothing previously could make, because every other test imports
+handler classes **by name** and never exercises the dispatcher.
+
+### Fixed: a whole subsystem's configuration was inert (F11)
+
+In the A0 runtime the plugin is imported as `usr.plugins.skillopt.helpers.*`, so
+`helpers` is the **framework** package and a bare `from helpers.sleep_runner import
+merged_config` raises on every call. Four sites did that with **no** namespace
+attempt — `helpers/failure_memory.py` (×3) and `helpers/ab_harness.py` — each wrapped
+in a bare `except`. The failure was invisible and permanent: every `failure_memory_*`
+and `ab_harness_*` key resolved to its hardcoded default, so
+`failure_memory_enabled: false` did nothing. The rest of the plugin already used the
+two-path idiom; these four did not.
+
+### Fixed: `cycle_history` read its config from a module that does not exist (F12)
+
+`helpers/cycle_history.py` imported `usr.plugins.skillopt.helpers.config_loader`, and
+there is no `config_loader.py` in this tree. Every call raised, the `except` returned
+the default, and `cycle_history_enabled` / `cycle_history_max_entries` were dead since
+they were declared. Both now read through `sleep_runner.merged_config()`.
+
+### Fixed: five declared budget/cadence settings were read by nothing (F13)
+
+`BudgetTracker(...)` was constructed at **nine** call sites, each with a different
+ad-hoc subset of the `budget:` block — which is why `daily_cap_cents` and
+`reset_hour_utc` were declared but never supplied and the effective cap was always the
+module default. `budget.enabled`, `cadence.enabled` and `cadence.target_rollouts` were
+read by nothing at all.
+
+All budget construction now goes through one factory, `budget.tracker_from_config()`,
+so the settings cannot drift per call site again. The tracker that **records** spend is
+built by the same factory as the one that **refuses** it — otherwise they accumulate
+against different budgets. `budget.enabled: false` and `cadence.enabled: false` are
+honoured, the latter via an internal `_CadenceDisabled` sentinel so the budget gate
+still runs.
+
+**The test that should have caught this was itself blind.** `t_v1824_config_keys_have_readers`
+greps the leaf name anywhere in the sources, so a key appearing only in a helper's own
+signature counted as "read" while no caller supplied it. A companion case now asserts
+the distinction, so the next inert key cannot pass either.
+
+### Fixed: a timed-out official engine was not marked `deferred` (F14)
+
+On timeout the official engine is left detached and may still write
+`staging/<skill>.md` seconds later, but the result carried `fallback_to_direct: True`
+**without** `deferred: True` — which the caller reads to skip the competing direct
+cycle. So after a timeout both engines wrote the same staged file, and cadence/budget
+were charged once for what was actually two cycles. The branch now reports `deferred`
+and names the still-running pid in its reason.
+
+### Tests
+
+244 → 252, eight new deterministic cases, including a source-level assertion that no
+`helpers/` import lacks a namespace attempt and a structural assertion over the
+framework's handler selection for every `api/*.py`.
+
+The `cycle_history_max_entries` case immediately caught a bug in the fix itself: the
+`or 500` idiom collapsed `0`, which that function's own docstring defines as "no
+compaction".
+## [1.8.36] - 2026-10-04
+
+
+Audit remediation, **Phase 2: the human approval path is authoritative**. Phase 1 made
+the gates correct; Phase 2 makes the routes a person actually clicks behave the way
+the approval UI claims they do. Findings F2, F3, F10, M5-M8 (and L3) from
+`AGENTS.md` → *Open findings register*; sequencing in `REMEDIATION_ROADMAP.md`.
+
+The shared thesis: **the three adopt paths — HTTP route, agent tool, and background
+drain — must be the same gate. A path that is easier to reach must not be weaker.**
+
+### Fixed: a human rejection was advisory, so the drain re-adopted the document (F2)
+
+`/reject` wrote two audit rows and returned. It did not quarantine the file, did not
+record the denial in the governance ledger, and **there was no "human said no" rail
+anywhere** — the only approval gate (`require_human_approval`) is exactly the one the
+autonomous override skips. So on a later tick the drain re-read the same rejected file
+and wrote it into the live `SKILL.md`, contradicting the documented rule that rejects do
+not stay in staging.
+
+Three changes:
+
+1. `/reject` now validates the id against the staged queue (closing L3: an arbitrary
+   string used to become the `skill` on both audit rows, so a row naming a
+   not-yet-staged stem made `find_pending_proposal` report the skill's *next* proposal
+   as already rejected and the Governance card silently stopped prompting).
+2. `/reject` **quarantines** the proposal — the document is preserved verbatim under
+   `staging/rejected/` with all its sidecars, it simply leaves the pending queue — and
+   records the denial bound to that `proposal_id`. Both outcomes are surfaced in the
+   response and shown in the UI.
+3. New rail at `governance.check_skill_eligible` **step 6.5**, deliberately *outside*
+   the `auto_adopt` bypass. Autonomy may bypass "has nobody approved this document?"
+   — that is what autonomy means. It must never bypass "a human explicitly refused
+   this document."
+
+The rail is **staleness-aware**, which is what keeps it from becoming a mute button: a
+denial binds only the proposal it was made about (compared against the staged file's
+mtime), so a *new* proposal for the same skill is judged on its own merits and a
+re-approval clears it immediately. A machine row never arms it.
+
+Its first implementation was silently inert and a probe caught it: the ledger stores
+microsecond-precision ISO while `st_mtime` is a full-resolution float, so `ts >=
+staged_at` failed by ~0.5 µs for a write that causally happened first.
+`_REJECTION_MTIME_TOLERANCE_S` absorbs the precision gap and nothing else.
+
+### Fixed: `/adopt` wrote the live skill non-atomically and overwrote without a snapshot (F3)
+
+The route snapshotted, **swallowed a snapshot failure**, then wrote with
+`Path.write_text` — open-truncate-then-write. That is the v1.8.24 P0 defect on the one
+route a human clicks: a failed snapshot left `/rollback` with no target while the
+overwrite proceeded (the unrecoverable case `adopt_write_skill`'s own docstring says
+must refuse), and a mid-write stop left a half-written live skill.
+
+The write now goes through `sleep_runner.adopt_write_skill()` — the only sanctioned
+writer, which the drain and the agent tool already used — and the route returns
+`ok: false` when it refuses. A refused adopt is still audited, so the trail shows an
+attempt that did not land rather than nothing at all.
+
+### Fixed: `/governance_approve` could approve by accident (F10)
+
+`bool(data.get("approved", True))` on an endpoint that records a human decision *and*
+touches the opt-in marker: a body with no `approved` key approved, and
+`{"approved": "false"}` approved because `bool("false")` is `True`. The field is now
+**required** and strictly coerced (real booleans, 0/1, and the unambiguous string
+spellings) — the same dialect `api/config.py` uses, so there is one coercion rule in
+the plugin rather than three. `skill` is validated before it reaches a path builder,
+matching `api/governance_pause.py`, and a failed opt-in marker write is now **reported**
+rather than swallowed behind `ok: true`.
+
+### Fixed: `/adopt` silently adopted the wrong proposal (M5)
+
+A supplied `proposal_id` that matched no staged stem fell through to `staged[0]`. A
+reviewer could read proposal A's summary and diff, click Approve, and have proposal
+B written instead. `api/proposal.py` already treated stem-equality as a hard boundary;
+this was the one route that treated a non-match as "no constraint". A non-match is now
+an error, and "adopt latest" remains only for the genuinely argument-less call.
+
+### Fixed: the manual adopt paths skipped real-gate single-flight and never consumed (M7)
+
+Neither the route nor the tool honoured `find_pending_real_gate_sidecar()`, so an
+operator could adopt a proposal whose independent replay was still running — and if
+the worker later returned a negative verdict, `_harvest_real_gate` would act on the
+same file again. Neither consumed the proposal, so it stayed queued and the drain
+re-attempted it. Both now defer while a gate is in flight and consume on success,
+carrying every sidecar.
+
+### Fixed: the agent-callable adopt tool skipped governance entirely (M8)
+
+`skillopt_sleep verb=adopt` went straight from `find_staged_proposals()` to
+`validate_proposal()` to `adopt_write_skill()`, so an agent could write a live
+`SKILL.md` for a skill carrying optout / immutable / pause / interval / budget markers.
+It also omitted `skill_name=`, so the two adopt paths ran **different gates**. The tool
+now runs the same governance chain as the drain and the route, and fails **closed** if
+governance is unavailable or raises. The child DOX states the intent plainly: "the
+agent-callable adopt tool is as exposed as the background loop."
+
+### Fixed: the settings page reported a failed snapshot as success (M6)
+
+The adopt status ended in `|| true`, so `lastOk` was always `true` and the message
+rendered green even when it read `FAILED` — and after F3 the snapshot failing now
+blocks the write, so the two had to be brought in line. Colour follows the text, and
+the message also reports whether the proposal actually left the queue. The reject
+message now says whether the proposal really moved out of it.
+
+### Tests
+
+235 → 244, nine new deterministic cases. One v1.8.34-era test was updated rather than
+the code: `t_c3_reject_records_cycle_history` rejected an id that was never staged,
+which the new L3 validation correctly refuses — it now stages a real proposal and
+asserts the full flow (quarantine, preservation, ledger, rail armed).
+
+The new cases assert both causal directions of the rejection rail, and pin that all
+three adopt paths refuse what the rails forbid.
+
+---
+
+## [1.8.35] - 2026-10-04
+
+Audit remediation, **Phase 1: safety rails and the autonomy contract**. Every item
+below was a defect on the path that writes a live `SKILL.md` unattended, found by
+the read-only audit recorded in `AGENTS.md` → *Open findings register*. Phasing and
+the full list: `REMEDIATION_ROADMAP.md`.
+
+### Fixed: autonomous mode was inert on any install using the legacy alias (F1)
+
+`governance.evolution_mode` ships as `manual`, so `merged_config()` **always**
+contains it — and all eight production call sites passed that merged blob to
+`resolve_evolution_mode(cfg)`. Precedence therefore matched on the *shipped
+default*, the legacy alias was never consulted, and an install whose
+`config.json` says `auto_adopt: true` resolved to **manual** while reporting
+`source: "evolution_mode"` — a provenance that was false. Meanwhile `/mode`
+(no-argument call) consulted the operator's own settings and reported
+`autonomous`, so the UI and the drain disagreed about the same install.
+
+Live evidence: the drain's own canary line fired on every tick
+(`logs/runs/auto_loop.log`, 08:37 / 09:07 / 09:37 / 10:08 on 2026-10-04).
+
+The fix has two halves and **both were required** — fixing only the resolver
+leaves production broken, which is exactly what shipped:
+
+1. `_operator_config()` prefers the operator's persisted config
+   (`_framework_registry_config()`) whenever the registry yields anything.
+2. Every production call site now calls `resolve_evolution_mode()` with **no
+   argument**. A test asserts this on the source, because a merged blob
+   re-introduces the defect precisely.
+
+The v1.8.34 guard missed this because it called the bare resolver — a path
+production never took. `t_v1835_autoloop_resolves_mode_from_merged` now drives
+the drain gate itself.
+
+### Fixed: a raising governance check disabled every rail (F8)
+
+`check_skill_eligible` could raise — `_runs_dir()` ends in a `mkdir` and sat
+outside the `try` in two readers, and the `.skillopt.pause_until` read was
+unguarded. The sole production caller logged `"fall through"` and continued to
+**eligible**, so optout, immutable, pause, cadence and budget were all skipped
+and autonomy then wrote a live skill for a paused one.
+
+Now fail-**closed**: `governance_unavailable`, a logged `DEFER`, and
+`_record_error` so the dashboard shows it. Absent governance is also treated as
+a broken install rather than a permissive one. Cadence and budget keep their own
+fall-through — those only throttle work and cannot authorise it.
+
+### Fixed: an autonomous decision satisfied the human-approval gate (F9)
+
+`_human_approved()` filtered on `event == "human_decision"` only, while the
+drain's audit hook writes `decided_by="autonomous"` rows through the same
+function. After one autonomous adoption, switching back to manual passed
+`require_human_approval` with no human ever clicking Approve.
+
+The filter excludes the **machine** values (`MACHINE_DECIDED_BY`), not
+everything that is not literally `"user"` — `decided_by` is free-form and a named
+operator is legitimate, so an allow-list of human strings would have silently
+invalidated real approvals. Rows predating the field default to human.
+
+### Fixed: the daily budget cap latched permanently (F7)
+
+`_maybe_rollover()` was reachable only from `record_spend()`, which itself runs
+only *after* a cycle that `can_spend()` gates. Hitting the cap therefore
+deadlocked: the skill reported "daily cap exceeded" every tick, forever, with no
+reset. `can_spend()` and `get_status()` now roll over on the read path too.
+
+### Fixed: the per-tick rollout-count invalidation was a no-op (F5)
+
+`_invalidate_rollout_counts()` assigned a **class** attribute while the reader
+used `getattr(self, ...)` and wrote `self._rollout_counts_cache`. Once the
+instance attribute existed it shadowed the class one permanently, so the cache
+stayed frozen at whatever the first drain saw — the exact staleness the code
+claimed to prevent. It is now an instance method, initialised in `__init__`.
+Inert at the shipped default (`autonomous_min_evidence_rollouts: 0`), actively
+wrong for any operator who raises it.
+
+### Fixed: the last non-atomic state write (F6)
+
+`_save_state()` used a bare `write_text` while `api/loop.py` reads the same file
+on the HTTP request thread. A torn read is swallowed by `_load_state`, which
+returns defaults — resetting counters *and* zeroing
+`last_rollout_count_at_cycle`, which fires an unscheduled cycle. Now
+write-temp + `os.replace` + `fsync`, matching `cadence.py` and `budget.py`,
+with the temp file cleaned up on any failure.
+
+### Tests
+
+226 → 235, nine new deterministic cases (no LLM, network, or clock dependence),
+including two cross-checks that the whole fail-closed set holds together under
+autonomy and that an unreadable pause marker defers rather than reading as
+"not paused".
+
+One v1.8.34 test was corrected rather than the code: `t_autonomous_postcheck_rolls_back`
+drove the mode by passing a `cfg`, which after F1 no longer overrides the
+operator's persisted config — so its "manual is inert" case had been running with
+the rails **active** and passing for the wrong reason. It now drives the
+registry, as production does.
+
+---
+
+## [1.8.34] - 2026-10-03
+
+Approval now shows *what* would change and *why*, and the plugin has a
+first-class manual/autonomous switch that is **off by default**.
+
+### Added: informed approval
+
+Staged proposals and the Governance card render a bounded `ProposalSummary`
+(`helpers/proposal_view.py`, schema `skillopt.proposal_summary/1`, persisted as
+`staging/<skill>.md.summary.json`): an intent classification, a one-paragraph
+summary, evidence-anchored rationale bullets, the gate evidence, and a unified
+diff against the live `SKILL.md`. `POST /api/plugins/skillopt/proposal` serves
+one proposal at a time for the uncapped diff view.
+
+Two gaps were closed rather than just restyled. The only field built for a
+human summary had been `"diff_summary": f"{size} bytes"` — a stringified byte
+count, which the template never even rendered. And proposals had no link to
+decisions at all: `staging/` keys on the filename stem while `governance.log`
+keys on the skill, so the Governance card could not say *which* document its
+Approve button referred to. `governance.find_pending_proposal()` resolves that
+link, and `mark_human_decision()` takes optional `proposal_id` / `summary_id` /
+`note` so a decision binds to the file the reviewer actually read.
+
+Intent is **advisory**: nothing in `validate_proposal` or
+`check_skill_eligible` reads it. A misclassified intent cannot change whether a
+proposal is adoptable. Proposals staged before this release are summarised on
+first view — no migration step.
+
+Rejecting now asks for a reason, which is recorded and fed into failure memory
+instead of the fixed string *"user rejected via UI"*.
+
+### Added: dual-mode operation
+
+`governance.evolution_mode` (`manual` | `autonomous`, default `manual`) is the
+single operator-facing switch. The pre-existing top-level `auto_adopt` is
+demoted to a **legacy alias**, read only when `evolution_mode` is absent, so
+existing installs keep their behaviour; `evolution_mode` wins when both are
+present. A second parallel mode flag was deliberately not added — two
+overlapping switches with undefined interaction is precisely the failure mode
+behind the `auto_adopt: null` stall and the v1.8.18 semantics change.
+
+`governance.resolve_evolution_mode(cfg)` is the only way to read the answer, and
+replaces three call sites that used `bool(cfg.get("auto_adopt", False))`:
+that expression is `None` for `auto_adopt:` with no value (the drain silently
+stops) and `True` for the string `"false"` (the drain silently starts). The
+resolver strictly coerces, falls back to `manual`, and writes a rejected value
+to `logs/runs/auto_loop.log` naming the value and the valid set — once per
+distinct value, not once per tick.
+
+`logs/runs/.autonomous_pause` is checked **first** and overrides both config
+sources, so autonomy can be frozen without editing `config.json` (which the
+WebUI also writes) or restarting.
+
+### Added: autonomous safety rails
+
+`auto_adopt_max_per_tick` is 5 and a tick is every 30 minutes, so the
+theoretical ceiling on writes to live skills was ~240/day with **no daily
+bound**. Autonomy is now bounded by `autonomous_max_adoptions_per_day` (5),
+`autonomous_max_adoptions_per_skill_per_day` (2),
+`autonomous_min_evidence_rollouts` (0 — inert), `autonomous_require_post_adopt_check`
+(true), and `autonomous_audit` (true). A cap refusal returns `skipped` and
+leaves the proposal in staging, because a cap that resets tomorrow is a
+deferral, not a rejection.
+
+`autonomous_min_evidence_rollouts` defaults to **0 rather than 20**, a change
+from the original design: a rollout *count* is a weak proxy for justification
+(the held-out gate is the real measurement), and `rollout_retention_days`
+deletes rollout files, so a non-zero default would block every autonomous
+adoption after a prune, with proposals parked in staging and no obvious cause.
+
+Every autonomous adoption is recorded in `governance.log` through the existing
+`mark_human_decision` with `decided_by: autonomous` — one ledger, using the
+discriminator that already existed, so a machine decision stays permanently
+distinguishable from a human one.
+
+### Fixed: five settings-page controls were silently discarded on save
+
+`webui/config.html`'s `save()` hard-coded a six-key POST body while the page
+declared thirteen, so `privacy_redact_secrets`, `privacy_include_tool_args`,
+`privacy_include_tool_results`, `rollout_retention_days`, and the three
+`replay_evalkit_*` settings rendered as live controls and were thrown away on
+every save — the same class of defect as the v1.8.2 config wipe. `SKILLOPT_EDITABLE_KEYS`
+is now the single source of truth for both `save()` and `refresh()`, and
+`refresh()` no longer hides a server value whose key it did not already know.
+
+### Fixed: `api/config.py` persisted client values verbatim
+
+The endpoint stored whatever the client sent (`clean[k] = v`) and `_read_disk()`
+applied no validation, so `{"governance": {"autonomous_require_post_adopt_check":
+"yes"}}` was stored as the string `"yes"` and reached every consumer
+unvalidated. Values are now coerced to the type of their default; an
+uncoercible value is reported in a new `rejected` list and **skipped** rather
+than aborting the save. Nested sections merge one level deep with per-leaf
+coercion, so a partial `governance` payload cannot clobber its siblings.
+
+### Fixed: diff counters counted the `+++` file header as an addition
+
+`compute_diff` counted the `+++ b/staged` header line as an added line. This
+was not cosmetic: a pure deletion reported `added_lines=1`, which pushed
+`classify_intent()` past its remove-only branch and mislabelled a clean
+condensation as `unknown`. Truncation also now reserves its marker *out of*
+`diff_max_chars`, so the returned text never exceeds the advertised cap.
+
+### Fixed: the suite leaked a proposal sidecar into production `staging/`
+
+Once `/staged` began building summaries, `t_c3_staged_endpoint_returns_evidence`
+left `c3_staged_skill.md.summary.json` behind on every run — its cleanup removed
+only the `.md`. `staging/` is the one directory where a leaked file is an
+operational hazard rather than clutter, because `find_staged_proposals()` scans
+its top level. The fixture cleanup now removes its sidecars, and the existing
+fixture-pollution guard (which previously checked only `logs/runs`) was extended
+to cover `staging/`.
+
+### Fixed: upgrading no longer silently stops an autonomous install
+
+`governance.evolution_mode` ships as `manual`, so `merged_config()` always
+contains it. The first implementation resolved precedence against the merged
+config, which meant that on an install whose `config.json` said
+`auto_adopt: true` — **including this repository's own** — upgrading to
+v1.8.34 silently switched unattended writes to live skills off, with no log
+line and no UI indication.
+
+Precedence is now decided against the **operator's persisted** config (the
+framework registry, or `{}` when unavailable), and only then falls back to the
+shipped default: kill switch → operator's `evolution_mode` → operator's
+`auto_adopt` → shipped default. A shipped default never outranks an explicit
+operator setting. `source` reports `evolution_mode`, `auto_adopt_legacy`,
+`evolution_mode_default`, or `kill_switch`, so the Evolution mode card shows
+which input won instead of the mode changing behind the operator's back.
+
+### Fixed: `/mode` could have wiped the governance section
+
+The route persisted `merged_config()` directly. `merged_config()` returns an
+**empty** dict (measured: 0 of 79 keys) whenever the defaults YAML is
+unreadable, and `save_plugin_config` **replaces** the `governance` section
+rather than deep-merging it — so in that condition a single UI toggle would
+have written `governance: {evolution_mode: ...}` alone, destroying
+`default_policy` and every `autonomous_*` rail. The v1.8.2 config-wipe
+incident class reached through a different door.
+
+The write now goes through `api/config.py`'s already-tested `_read_disk()` +
+`_clean_overrides()`, sends only the two keys it owns, carries the complete
+governance section, and **refuses** rather than writing when the config cannot
+be read in full. Its response is built from the config it just wrote, not a
+re-read, so the UI cannot display a stale mode when `clear_plugin_cache()` has
+not yet taken effect.
+
+### Fixed: the gated-cycle runner reported a bare truthiness mode and no content
+
+`scripts/run_sleep_cycle.py` still read `bool(cfg.get('auto_adopt'))` — the same
+bug fixed in `auto_loop` — so its `PENDING_HUMAN_APPROVAL` status could
+contradict what the loop was actually doing. It now reports the resolved mode
+and its source. That emit is the operator-facing "a change is waiting for you"
+record, and it named a path and a byte count; it now carries the bounded
+proposal summary too, so reading the cycle log tells you what is being proposed
+without opening the file. The runner still never adopts.
+
+### Fixed: the dashboard namespace was never exposed (dead extension point)
+
+`webui/skillopt-dashboard.js` declared `const SkillOptDashboard = {...}` inside
+its IIFE and **never assigned it to `window`**, so `window.SkillOptDashboard`
+was `undefined` — while its own header comment promised "a small
+`window.SkillOptDashboard` namespace that the WebUI config page and the
+sidebar card can hook into". The entire documented dashboard extension point
+was unreachable; any page calling `SkillOptDashboard.staged()` would have got a
+`TypeError`. Nothing failed visibly only because no consumer referenced it yet,
+which is how it stayed unnoticed. Now assigned (guarded, for the older browsers
+this WebUI supports and for a double-injected script).
+
+### Fixed: the dashboard's approval surface dropped the summary
+
+`renderStagedProposals` mapped a `/staged` response down to
+skill/proposal_id/size/lift/gate_reason and discarded everything else — so
+while the settings page gained an intent badge, a rationale and a diff, the
+dashboard stayed a name-and-byte-count card. Two approval surfaces, one of them
+still blind, is the exact problem this feature set out to remove. It now carries
+`summary` and `pending_approval`, with three new pure defensive renderers
+(`renderProposalSummary`, `renderPendingApproval`, `renderEvolutionMode`) and
+`/proposal`, `/mode`, and a proposal-binding `approveGovernance` client.
+
+### Fixed: the Governance card would have shown "No summary available"
+
+`/staged`'s `pending_approval` entries carried no `summary` — only
+`/governance_status`'s per-skill block did. Since the Governance card reads the
+`/staged` map (fetched once and shared so both cards render one document), its
+informed block was permanently empty in the live UI. Both routes now attach the
+summary, and a test asserts they resolve the *same* text, so a reviewer cannot
+approve one card's view of a document while looking at another's.
+
+### Fixed: stale dashboard JS could be served from cache
+
+The script tag pinned `cb=3`, so shipping changed dashboard JS kept the same
+URL and a browser could serve the old file — a silently dead UI. Bumped to
+`cb=4`, and the smoke assertion now checks for a numeric cache-bust parameter
+instead of one literal, so future bumps need no test edit.
+
+### Tests
+
+22 new deterministic cases (204 → 226), no LLM, network, or clock dependence.
+The load-bearing one is `t_autonomous_cannot_bypass_rails`, which asserts that
+optout, immutable, pause, opt-in/opt-out markers, and `min_interval_seconds` all
+still bite with `auto_adopt=True`, and that the approval gate is the *only*
+thing autonomy yields — each on a fresh skill so one seeded decision cannot
+shadow another assertion; and \	_v1834_upgrade_preserves_operator_choice\ plus
+\	_v1834_mode_route_no_config_wipe\, which pin that upgrading cannot silently
+stop an autonomous install and that one UI toggle cannot delete the settings.
+
+---
+
 ## [1.8.29] - 2026-09-26
 
 ### Added: configurable rollout expiry

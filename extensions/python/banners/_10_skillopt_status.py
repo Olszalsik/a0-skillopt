@@ -8,7 +8,7 @@ is active (toggle ON or default).
 Follows the AGENTS.md banner/card contract:
 - type: 'feature' (community plugin)
 - priority: low (don't out-shout core system features)
-- cta_action: 'open-plugin-config:skillopt'
+- cta_action: 'open-modal:/usr/plugins/skillopt/webui/config.html'
 - dismissible: True (so users can hide it once installed)
 - source: 'backend' (v2.5 extension contract requirement)
 
@@ -79,7 +79,7 @@ def execute(banners: list, **kwargs):  # type: ignore[no-untyped-def]
         ),
         "icon": "dna",
         "cta_text": "Open Settings",
-        "cta_action": "open-plugin-config:skillopt",
+        "cta_action": "open-modal:/usr/plugins/skillopt/webui/config.html",
         "dismissible": True,
         "source": "backend",
     })

@@ -142,7 +142,8 @@ When you trust the output, set `auto_adopt: true` in the settings (or POST to `/
 | `auto_loop_interval_sec` | `1800` | How often the loop wakes up. 30 min is a good baseline. |
 | `auto_loop_min_rollouts` | `10` | New rollouts required before a cycle is worth running. |
 | `auto_loop_skill_target` | `""` | Focus the loop on one skill. Empty = all skills with data. |
-| `auto_adopt` | `false` | Auto-promote gate-passing proposals. **Read critiques first.** |
+| `auto_adopt` | `false` | **Legacy alias** of `governance.evolution_mode`. Only read when `evolution_mode` is absent. Prefer the mode setting. |
+| `governance.evolution_mode` | `manual` | The operating mode: `manual` waits for your approval, `autonomous` applies gate-passing changes without asking. See [Evolution mode](#evolution-mode). |
 | `gate_min_chars` | `200` | Reject proposals shorter than this. |
 | `gate_max_shrink_ratio` | `0.5` | Reject proposals smaller than 50% of the current skill. |
 | `gate_min_improvement_pp` | `5.0` | Reject if held-out improvement < 5 percentage points. Set to `0` to disable. |
@@ -157,6 +158,75 @@ When you trust the output, set `auto_adopt: true` in the settings (or POST to `/
 | `replay_evalkit_enabled` | `false` | Attach optional upstream paired statistics to a completed real replay gate when the installed package supports evalkit. Informational only. |
 
 For the full reference with comments, see `default_config.yaml`.
+
+### Informed approval (v1.8.34)
+
+Every staged proposal now carries a summary so you can decide on evidence
+rather than on a name. Each card in **Staged proposals** and **Governance**
+shows:
+
+- an **intent badge** — `bug_fix`, `performance`, `new_feature`, `refactor`,
+  `docs`, or `unknown`, from a deterministic read of the diff (an optional LLM
+  refinement can upgrade the wording; it is off by default);
+- a one-paragraph **summary** of what changes and why;
+- **rationale** bullets, each tied to recorded evidence (failure memory,
+  held-out lift, gate verdict, independent replay confirmation);
+- an expandable **unified diff** against the live `SKILL.md`, with
+  *View full diff* for the uncapped view and the proposal's relative path;
+- any **warnings**, such as *"official gate marker absent — gate provenance
+  unknown"* for a locally-produced rewrite.
+
+Rejecting asks for a reason. That reason goes into the audit trail and into
+failure memory, so the next cycle can avoid repeating the mistake — a
+previously-recorded rejection carried only the string *"user rejected via
+UI"*.
+
+Intent is **advisory**. It is display-only and is never read by the validation
+gate: a misclassified intent cannot change whether a proposal is adoptable.
+Proposals staged before v1.8.34 are summarised on first view; there is nothing
+to migrate.
+
+### Evolution mode
+
+SkillOpt runs in one of two modes, set on the **Evolution mode** card or via
+`governance.evolution_mode`:
+
+| Mode | Behaviour |
+|---|---|
+| `manual` (default) | Improvements are proposed and wait for an explicit decision from you. |
+| `autonomous` | Improvements that pass every gate are written into live `SKILL.md` files without asking. |
+
+**Autonomous mode does not mean unguarded.** It overrides exactly one thing:
+the approval gate. These still apply, unchanged:
+
+- a skill's `.skillopt.optout` marker, and `mode: immutable`;
+- the per-skill pause marker;
+- `min_interval_seconds` between cycles and the daily cost budget.
+
+And autonomy is additionally bounded:
+
+| Setting | Default | What it bounds |
+|---|---|---|
+| `autonomous_max_adoptions_per_day` | `5` | Autonomous adoptions per day, across all skills. `0` means "on but frozen". |
+| `autonomous_max_adoptions_per_skill_per_day` | `2` | Autonomous adoptions for one skill per day. |
+| `autonomous_min_evidence_rollouts` | `0` | Off by default. A rollout *count* is a weak proxy for justification, and `rollout_retention_days` deletes rollout files — a non-zero default would block every autonomous adoption after a prune. |
+| `autonomous_require_post_adopt_check` | `true` | Verifies the write is present, non-empty and still loadable, and rolls back automatically when it is not. |
+| `autonomous_audit` | `true` | Records every autonomous adoption in `logs/runs/governance.log` as `decided_by: autonomous`, permanently distinguishable from your own decisions. |
+
+When a cap is reached the proposal **stays in staging** rather than being
+rejected — the cap resets tomorrow, and a queued proposal can become eligible
+again.
+
+`auto_adopt` is a legacy alias, still honoured so existing installs keep their
+behaviour, and mirrored on write so the two never disagree. `evolution_mode`
+wins when both are present. An invalid value falls back to `manual` and is
+written to `logs/runs/auto_loop.log` naming the value and the valid set.
+
+**Kill switch.** Create `logs/runs/.autonomous_pause` to freeze autonomy
+regardless of the setting, without editing `config.json` (which the WebUI also
+writes) and without a restart. Delete it, or press *Resume autonomy*, to
+resume. To stop a single skill, pause it on the Governance card or write
+`.skillopt.optout` in its skill directory.
 
 ### Rollout data and privacy
 

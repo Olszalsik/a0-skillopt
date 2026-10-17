@@ -117,6 +117,30 @@ def _parse_judge_response(raw: str) -> dict[str, Any]:
     return {"label": label, "confidence": conf, "reason": reason}
 
 
+def _configured_judge_slot() -> str:
+    """`judge_model` from the merged config, falling back to `target_model`.
+
+    Returns "" when neither is configured or the config cannot be read, so
+    the caller's existing fallback chain is unchanged. Never raises.
+    """
+    try:
+        try:
+            from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
+        except ImportError:
+            from helpers import sleep_runner  # type: ignore
+        cfg = sleep_runner.merged_config()
+    except Exception:
+        return ""
+    for key in ("judge_model", "target_model"):
+        try:
+            val = str(cfg.get(key) or "").strip()
+        except Exception:
+            val = ""
+        if val:
+            return val
+    return ""
+
+
 def _judge_model(model: str | None) -> str:
     # v1.8.28: a slot sentinel ('chat' OR 'utility') must be RESOLVED, not
     # returned as a literal model name. The old `model != "chat"` test would
@@ -140,6 +164,16 @@ def _judge_model(model: str | None) -> str:
     _req_slot = model if (model and _is_slot(model)) else ""
     env_model = os.environ.get("SKILLOPT_JUDGE_MODEL")
     raw = env_model or _req_slot or ""
+    # v1.8.48 (audit P2): honour the `judge_model` CONFIG before falling back
+    # to `optimizer_model`. The shipped config declares `judge_model:
+    # utility` precisely because labelling is classification, not reasoning -
+    # but nothing read it, and the production judge callers pass no hint at
+    # all, so every single label ran on the chat slot (the most expensive
+    # model in the preset) while the operator's setting did nothing. That is
+    # the v1.8.44 R6 complaint applied to EVERY label instead of only the
+    # escalated ones. `target_model` is the documented default for the key.
+    if not raw:
+        raw = _configured_judge_slot()
     if not raw:
         _ensure_path()
         # v1.8.1: two-path import - the bare `helpers` resolves to the
@@ -161,6 +195,18 @@ def _judge_model(model: str | None) -> str:
             resolved, _conn = _cm.effective_model(raw)
             if resolved:
                 return resolved
+        except Exception:  # noqa: BLE001
+            pass
+        # v1.8.48 (audit P2): the configured slot may not exist in the active
+        # preset (a fixture, a preset without a utility model). Falling
+        # through would return the SENTINEL, and a sentinel must never reach
+        # a provider as a literal model id - so fall back to the chat slot,
+        # which is always configured, and only then to a literal.
+        try:
+            if _is_slot(raw):
+                resolved, _conn = _cm.effective_model("chat")
+                if resolved:
+                    return resolved
         except Exception:  # noqa: BLE001
             pass
     return raw
@@ -385,6 +431,26 @@ def _judge_llm_call(direct_optimizer: Any, prompt: str, model: str) -> str:
     immediately; exhaustion re-raises the last error - both land in
     judge_outcome never-raises wrapper as {label: None, error}.
     '''
+    return _guarded_call(direct_optimizer, prompt, model,
+                         max_tokens=300, system=JUDGE_SYSTEM)
+
+
+def _guarded_call(direct_optimizer: Any, prompt: str, model: str, *,
+                  max_tokens: int, system: str | None = None) -> str:
+    '''Limiter + pacing + bounded retries around one judge LLM call.
+
+    v1.8.44 (re-audit R6): the escalation ladder in `judge_client` used to
+    call `direct_optimizer._call_llm` DIRECTLY, so every escalated attempt
+    skipped the in-flight limiter, the `SKILLOPT_JUDGE_THROTTLE_S` pacing, and
+    the retry policy - while `judge_rollouts` looped it over up to `limit`
+    rollouts on one thread. That is precisely the un-paced 429 storm the three
+    burst-protection layers exist to prevent, and it contradicted the
+    contract wording that judge pacing "spaces ACTUAL starts".
+
+    The escalation is now routed through here, so every judge call this
+    module makes - first attempt or escalated - obeys the same discipline.
+    Exported as `judge_call` for `judge_client` to use.
+    '''
     attempts_allowed = _retry_max() + 1
     last_exc: BaseException | None = None
     for attempt in range(attempts_allowed):
@@ -393,7 +459,7 @@ def _judge_llm_call(direct_optimizer: Any, prompt: str, model: str) -> str:
             _throttle_wait()
             try:
                 return direct_optimizer._call_llm(
-                    prompt, model, max_tokens=300, system=JUDGE_SYSTEM,
+                    prompt, model, max_tokens=max_tokens, system=system,
                 )
             except Exception as e:  # noqa: BLE001
                 last_exc = e
@@ -407,12 +473,47 @@ def _judge_llm_call(direct_optimizer: Any, prompt: str, model: str) -> str:
     raise last_exc
 
 
+def judge_call(prompt: str, model: str, *, max_tokens: int = 6000,
+               system: str | None = None) -> str:
+    """Public entry point for a judge LLM call that must obey burst limits.
+
+    v1.8.44 (re-audit R6). `judge_client`'s escalation ladder calls this
+    instead of reaching into `direct_optimizer._call_llm`, so an escalated
+    attempt is limited, paced and retried exactly like a first attempt.
+
+    Raises on failure; the caller decides how to record it.
+    """
+    try:
+        from usr.plugins.skillopt.helpers import direct_optimizer as _do  # type: ignore
+    except ImportError:
+        from helpers import direct_optimizer as _do  # type: ignore
+    return _guarded_call(_do, prompt, model, max_tokens=max_tokens,
+                         system=system)
+
+
 def judge_outcome(rollout: dict[str, Any], *, model: str | None = None) -> dict[str, Any]:
     """Judge one rollout's outcome via the LLM. Never raises.
 
     Returns {label, confidence, reason, model} on success, or
-    {label: None, error: ...} on any failure (LLM unreachable, bad response).
+    {label: None, error: ..., model: ...} on any failure (LLM unreachable,
+    bad response).
+
+    v1.8.44 (re-audit R6): the FAILURE shape now carries `model` too, and
+    that is load-bearing rather than cosmetic.
+
+    `judge_client.judge_rollout` only escalates when the first call produced
+    no label, and it reads `base.get("model")` to decide whom to re-ask with
+    a bigger token budget. Neither failure path used to include `model`, so
+    `judge_name` was always `''`, `candidates` collapsed to `[('', 6000)]`, and
+    the two "retry the resolved judge model at 800/6000 tokens" rungs - the
+    entire reason the escalation exists - never ran. Every rollout that failed
+    because the judge exhausted `max_tokens=300` on hidden tokens was instead
+    re-asked of the CHAT-slot model, and the provenance recorded on the label
+    misreported which model judged it.
+
+    So the failure shape must name the model that was actually tried.
     """
+    resolved_model = ''
     try:
         # v1.8.1: resolve the model ONCE (the old code called _judge_model
         # twice — once for the call, once for the recorded field — which
@@ -427,7 +528,9 @@ def judge_outcome(rollout: dict[str, Any], *, model: str | None = None) -> dict[
         raw = _judge_llm_call(direct_optimizer, prompt, resolved_model)
         parsed = _parse_judge_response(raw)
         if parsed.get("label") is None:
-            return parsed  # already an {label: None, error} shape
+            # v1.8.44 (R6): carry the model we actually tried, so the caller
+            # can escalate to THIS model rather than to the chat slot.
+            return {**parsed, "model": resolved_model}
         return {
             "label": parsed["label"],
             "confidence": parsed["confidence"],
@@ -435,7 +538,8 @@ def judge_outcome(rollout: dict[str, Any], *, model: str | None = None) -> dict[
             "model": resolved_model,
         }
     except Exception as e:  # noqa: BLE001
-        return {"label": None, "error": f"{type(e).__name__}: {e}"}
+        return {"label": None, "error": f"{type(e).__name__}: {e}",
+                "model": resolved_model}
 
 
 def label_rollout_file(

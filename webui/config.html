@@ -6,6 +6,8 @@
     // dependencies in the host dashboard. We use plain fetch instead.
   </script>
   <style>
+    /* Alpine needs this to avoid a flash of un-initialised bindings. */
+    [x-cloak] { display: none !important; }
     .so-card { background: rgba(0,0,0,0.2); padding: 12px; border-radius: 6px; margin-bottom: 12px; border: 1px solid rgba(255,255,255,0.08); }
     .so-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
     .so-row label { display: block; font-size: 12px; margin-bottom: 4px; }
@@ -21,6 +23,31 @@
     h3 { margin: 0 0 8px 0; }
     h4 { margin: 12px 0 6px 0; }
     .so-green { background: rgba(40,120,40,0.12); padding: 12px; border-radius: 6px; border: 1px solid rgba(120,200,120,0.25); }
+    /* v1.8.34: informed-approval block */
+    .so-intent { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 10px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; vertical-align: middle; }
+    .so-intent-bug_fix { background: rgba(200,80,80,0.22); color: #f0a0a0; }
+    .so-intent-performance { background: rgba(200,150,60,0.22); color: #e8c07a; }
+    .so-intent-new_feature { background: rgba(90,160,220,0.22); color: #9ecdf0; }
+    .so-intent-refactor { background: rgba(150,120,210,0.22); color: #c4b0e8; }
+    .so-intent-docs { background: rgba(120,180,140,0.22); color: #a8d8bc; }
+    .so-intent-unknown { background: rgba(140,140,140,0.22); color: #cccccc; }
+    .so-summary { font-size: 12px; line-height: 1.6; margin: 6px 0; }
+    .so-rationale { font-size: 11px; line-height: 1.7; margin: 4px 0 4px 16px; opacity: 0.85; }
+    .so-diff { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.45; white-space: pre; overflow: auto; max-height: 420px; padding: 8px; background: rgba(0,0,0,0.35); border: 1px solid rgba(255,255,255,0.1); border-radius: 4px; margin: 6px 0; }
+    .so-warn { color: #e6a23c; font-size: 11px; margin: 4px 0; }
+    .so-path { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10px; opacity: 0.6; word-break: break-all; }
+    .so-decided { opacity: 0.75; }
+    details > summary { cursor: pointer; font-size: 11px; opacity: 0.85; margin: 4px 0; user-select: none; }
+    details > summary:hover { opacity: 1; }
+    .so-banner-autonomous { background: rgba(200,120,40,0.16); border: 1px solid rgba(230,160,60,0.45); color: #f0c070; }
+    /* v2026-10-13: engaged-mode style. The ACTIVE mode was previously shown
+       as a disabled grey button ("already on" rendered identically to
+       "broken"), which is the exact misreading that made the operator report
+       the enable button as dead. The engaged mode now looks ON; the control
+       is disabled only so it cannot be re-clicked, and the tooltip says so. */
+    .so-btn-on { border-color: rgba(120,220,120,0.55); background: rgba(60,160,60,0.28); color: #bfe8bf; cursor: default; }
+    .so-note { display: block; margin-top: 6px; font-size: 11px; opacity: 0.85; line-height: 1.6; }
+    .so-confirm { border: 1px solid rgba(230,160,60,0.45); background: rgba(200,120,40,0.12); padding: 10px; border-radius: 6px; margin-top: 8px; font-size: 12px; line-height: 1.6; }
   </style>
 </head>
 <body>
@@ -60,11 +87,18 @@
       <input type="text" x-model="cfg.auto_loop_skill_target" placeholder="e.g. code-review" style="width: 100%;" />
     </div>
 
-    <label style="display: block; margin: 8px 0 0 0;">
-      <input type="checkbox" x-model="cfg.auto_adopt" />
-      <strong>Auto-adopt proposals that pass the gate</strong>
-    </label>
-    <small style="opacity: 0.8;">OFF by default for safety. First run with this OFF, watch the staged proposals, then turn it ON.</small>
+    <!-- v1.8.34: the standalone "auto-adopt" checkbox that used to live here
+         was REMOVED, not moved. It and the new Evolution mode card were two
+         controls for one setting, and their interaction was undefined — the
+         exact failure mode behind the `auto_adopt: null` stall and the
+         v1.8.18 semantics change. There is now one switch, in the Evolution
+         mode card below, backed by governance.resolve_evolution_mode().
+         `auto_adopt` remains in config.json as a LEGACY ALIAS that
+         /mode mirrors; do not re-add a second control for it. -->
+    <small style="opacity: 0.8; display: block; margin-top: 8px;">
+      Whether improvements are applied automatically is now the
+      <strong>Evolution mode</strong> setting below.
+    </small>
   </div>
 
   <!-- LOOP STATUS -->
@@ -117,10 +151,10 @@
     <small x-show="lastMsg" x-text="lastMsg" class="so-msg" :class="{ 'so-err': !!lastErr, 'so-on': !lastErr && lastOk }"></small>
   </div>
 
-  <!-- STAGED PROPOSALS (v1.7.0, Solution C Phase C3: human-in-the-loop) -->
+  <!-- STAGED PROPOSALS (v1.7.0 Phase C3 human-in-the-loop; v1.8.34 informed) -->
   <div class="so-card">
     <h4>Staged proposals <small style="opacity: 0.6; font-weight: normal;">— review, approve, reject, or roll back</small></h4>
-    <small style="opacity: 0.7;">Each card is a gated proposal awaiting your decision. Approve promotes it to the live SKILL.md (with a reversible snapshot); Reject records a no; Roll back restores the prior SKILL.md.</small>
+    <small style="opacity: 0.7;">Each card is a gated proposal awaiting your decision. Read the summary and diff before approving — Approve promotes it to the live SKILL.md (with a reversible snapshot); Reject records a no; Roll back restores the prior SKILL.md.</small>
     <template x-if="stagedProposals.length === 0">
       <small style="opacity: 0.6; display: block; margin-top: 8px;">No staged proposals right now.</small>
     </template>
@@ -133,7 +167,59 @@
           <div x-show="p.lift_pp != null">Lift: <span x-text="(p.lift_pp != null ? (p.lift_pp > 0 ? '+' : '') + p.lift_pp.toFixed(1) + 'pp' : '—')"></span></div>
           <div x-show="p.n_held_out != null">Held-out n: <span x-text="p.n_held_out ?? '—'"></span></div>
         </div>
-        <small style="opacity: 0.7; display: block; margin: 4px 0;" x-text="p.gate_reason || 'no gate reason recorded'"></small>
+
+        <!-- v1.8.34: the informed block. Before this the card showed a skill
+             name, a byte count, and nothing else. -->
+        <div class="so-summary" x-show="p.summary && p.summary.available">
+          <span class="so-intent" :class="'so-intent-' + ((p.summary && p.summary.intent && p.summary.intent.category) || 'unknown')"
+                x-text="(p.summary && p.summary.intent && p.summary.intent.category) || 'unknown'"></span>
+          <span x-text="(p.summary && p.summary.intent && p.summary.intent.headline) || ''"></span>
+          <div style="margin-top: 6px;" x-text="(p.summary && p.summary.summary) || ''"></div>
+          <ul class="so-rationale">
+            <template x-for="(b, i) in ((p.summary && p.summary.rationale) || [])" :key="i">
+              <li x-text="b"></li>
+            </template>
+          </ul>
+          <div class="so-stat" style="margin-top: 4px;">
+            <div x-show="p.summary.evidence && p.summary.evidence.gate_outcome">Gate verdict:
+              <strong x-text="(p.summary.evidence && p.summary.evidence.gate_outcome) || '—'"></strong>
+            </div>
+            <div x-show="p.summary.evidence && p.summary.evidence.official_gated">Provenance: <strong>official engine</strong></div>
+            <div x-show="p.summary.evidence && p.summary.evidence.real_gate">Independent replay:
+              <strong x-text="(p.summary.evidence.real_gate.status || '') + ((p.summary.evidence.real_gate.accepted === true) ? ' (accepted)' : '')"></strong>
+            </div>
+            <div x-show="(p.summary && p.summary.diff && p.summary.diff.available) || (p.diff_full && p.diff_full.text)">Diff: <strong><span x-text="(p.summary && p.summary.diff && p.summary.diff.added_lines) || ((p.diff_full || {}).added_lines) || 0"></span> added / <span x-text="(p.summary && p.summary.diff && p.summary.diff.removed_lines) || ((p.diff_full || {}).removed_lines) || 0"></span> removed</strong></div>
+          </div>
+          <template x-for="w in ((p.summary && p.summary.warnings) || [])" :key="w">
+            <div class="so-warn" x-text="'⚠ ' + w"></div>
+          </template>
+          <div class="so-path" x-show="p.summary.artifacts && p.summary.artifacts.proposal_rel"
+               x-text="p.summary.artifacts ? p.summary.artifacts.proposal_rel : ''"></div>
+        </div>
+        <template x-if="p.summary && !p.summary.available">
+          <div>
+            <div class="so-warn" x-text="'No summary available for this proposal' + ((p.summary.warnings || []).length ? ' (' + p.summary.warnings.join('; ') + ')' : '') + '.'"></div>
+            <!-- Fallback so a pre-1.8.34 proposal (or one built while the
+                 summary subsystem was off) still shows the gate evidence
+                 rather than an empty card. -->
+            <small style="opacity: 0.7; display: block; margin: 4px 0;" x-text="p.gate_reason || 'no gate reason recorded'"></small>
+          </div>
+        </template>
+
+        <div x-show="(p.summary && p.summary.diff && p.summary.diff.available) || (p.diff_full && p.diff_full.text)">
+          <details>
+            <summary>View proposed changes (<span x-text="(p.summary && p.summary.diff && p.summary.diff.hunk_count) || 0"></span> section(s))</summary>
+            <div class="so-diff" x-text="(p.diff_full && p.diff_full.text) || ((p.summary && p.summary.diff && p.summary.diff.text) || '')"></div>
+            <div class="so-row">
+              <button type="button" class="so-btn" :disabled="busy" @click="loadFullDiff(p.proposal_id)">
+                <span x-show="!p.diff_full">Load full diff</span><span x-show="p.diff_full" x-cloak>Reload full diff</span>
+              </button>
+              <small style="opacity: 0.6;" x-show="p.summary && p.summary.diff && p.summary.diff.truncated"
+                     x-text="'Shown diff is truncated. Read the proposal file for the complete change.'"></small>
+            </div>
+          </details>
+        </div>
+
         <div class="so-row">
           <button type="button" class="so-btn so-btn-primary" :disabled="busy" @click="adoptProposal(p.proposal_id)">Approve</button>
           <button type="button" class="so-btn" :disabled="busy" @click="rejectProposal(p.proposal_id)">Reject</button>
@@ -143,10 +229,97 @@
     </template>
   </div>
 
-  <!-- GOVERNANCE (v1.7.0, Solution C Phase C4: auto opt-in with guardrails) -->
+  <!-- EVOLUTION MODE (v1.8.34: the ONE manual/autonomous switch) -->
+  <div class="so-card" :class="modeState.autonomous ? 'so-banner-autonomous' : ''">
+    <h4>
+      Evolution mode
+      <small style="opacity: 0.6; font-weight: normal;">— who decides whether a change lands</small>
+    </h4>
+    <div class="so-stat" style="margin-top: 4px;">
+      <div>Current: <strong x-text="(modeState.mode || '…') + (modeState.killed ? ' (PAUSED)' : '')"></strong></div>
+      <div>Set by: <strong x-text="modeState.source || '—'"></strong></div>
+      <div>Daily cap: <strong x-text="(modeState.adopted_today ?? 0) + ' / ' + (modeState.max_per_day ?? '—')"></strong></div>
+    </div>
+
+    <div class="so-row" style="margin-top: 8px;">
+      <button type="button" class="so-btn"
+              :class="modeState.mode === 'manual' ? 'so-btn-on' : 'so-btn-primary'"
+              :disabled="busy || modeState.killed || modeState.mode === 'manual'"
+              :title="(modeState.mode === 'manual' && modeState.mode) ? 'Manual is already the active mode — use “Autonomous” to change it' : ''"
+              @click="setMode('manual')">Manual — ask me first</button>
+      <button type="button" class="so-btn"
+              :class="modeState.autonomous ? 'so-btn-on' : 'so-btn-primary'"
+              :disabled="busy || modeState.killed || modeState.autonomous"
+              :title="(modeState.autonomous) ? 'Autonomous is ALREADY ACTIVE. The button is only disabled so you cannot re-click it — use “Manual” to turn autonomy off.' : (modeState.killed ? 'Autonomy is paused by the .autonomous_pause kill switch — use “Resume autonomy”' : 'One click arms an inline confirmation; the second click enables autonomy')"
+              @click="requestAutonomous()">Autonomous — apply automatically</button>
+      <button type="button" class="so-btn" :disabled="busy || !modeState.killed"
+              @click="setPause(false)">Resume autonomy</button>
+    </div>
+    <div x-show="confirmAutonomous" class="so-confirm">
+      <strong>Enable AUTONOMOUS mode?</strong> SkillOpt will apply improvements to live
+      <code>SKILL.md</code> files <strong>without asking you</strong>, as soon as they pass
+      the validation gate. Bounded by the daily caps below; every change is snapshotted and
+      recorded as <code>decided_by: autonomous</code> and can be rolled back. Skills you opted
+      out of, marked immutable, or paused are never touched.
+      <div class="so-row" style="margin-top: 6px;">
+        <button type="button" class="so-btn so-btn-primary" :disabled="busy"
+                @click="setMode('autonomous')">Confirm — enable autonomy</button>
+        <button type="button" class="so-btn" :disabled="busy"
+                @click="cancelAutonomous()">Cancel</button>
+      </div>
+    </div>
+    <small x-show="modeState.autonomous && !modeState.killed" class="so-note so-on">
+      Autonomy is ON (set by: <span x-text="modeState.source || '—'"></span>). Proposals that
+      pass every gate are applied without asking — daily cap
+      <span x-text="(modeState.adopted_today ?? 0) + ' / ' + (modeState.max_per_day ?? '—')"></span>.
+      Use “Manual” to turn it off.
+    </small>
+    <small x-show="modeState.killed" class="so-err" style="display: block; margin-top: 6px;">
+      Autonomy is paused by the <code>.autonomous_pause</code> kill switch in
+      <code>logs/runs/</code>. It overrides the mode setting; use “Resume autonomy” to lift it.
+    </small>
+    <small x-show="modeState.error" class="so-err" style="display: block; margin-top: 6px;"
+           x-text="modeState.error"></small>
+
+    <details style="margin-top: 8px;">
+      <summary>What autonomous mode does, and what still stops it</summary>
+      <ul class="so-rationale" style="margin-left: 16px;">
+        <li>Changes that pass every gate are written into live <code>SKILL.md</code> files <strong>without asking you</strong>. Each write is snapshotted, so it can be rolled back.</li>
+        <li>At most <strong x-text="modeState.max_per_day ?? '—'"></strong> autonomous adoptions per day, and <strong x-text="modeState.max_per_skill_per_day ?? '—'"></strong> per skill per day.</li>
+        <li>A proposal needs at least <strong x-text="modeState.min_evidence_rollouts ?? '—'"></strong> rollouts of evidence before it can be adopted automatically.</li>
+        <li>Post-adopt verification is <strong x-text="modeState.require_post_adopt_check ? 'ON — a failing check rolls the change back' : 'OFF'"></strong>.</li>
+        <li>Every autonomous change is recorded in <code>logs/runs/governance.log</code> as <code>decided_by: autonomous</code>, permanently distinguishable from your own decisions.</li>
+        <li><strong>Never</strong> bypassed by autonomy: a skill's <code>.skillopt.optout</code> marker, <code>immutable</code> mode, the pause marker, the minimum interval between cycles, or the daily cost budget.</li>
+      </ul>
+      <small style="opacity: 0.75; display: block; margin-top: 6px;">
+        To freeze autonomy without changing this setting, create
+        <code>logs/runs/.autonomous_pause</code>. To stop a single skill, pause it
+        in the Governance card below, or write <code>.skillopt.optout</code> in its skill directory.
+      </small>
+    </details>
+  </div>
+
+<!-- GOVERNANCE (v1.7.0 Phase C4 auto opt-in; v1.8.34 informed + mode) -->
   <div class="so-card">
     <h4>Governance <small style="opacity: 0.6; font-weight: normal;">— auto opt-in behind a human-approval gate</small></h4>
-    <small style="opacity: 0.7;">New skills seen in rollouts are auto-opted-in with <code>require_human_approval: true</code> — they stay <em>pending</em> until you Approve them here. Immutable or opted-out skills are never touched.</small>
+    <small x-show="!modeState.autonomous" style="opacity: 0.7;">New skills seen in rollouts are auto-opted-in with <code>require_human_approval: true</code> — they stay <em>pending</em> until you Approve them here. Immutable or opted-out skills are never touched.</small>
+    <small x-show="modeState.autonomous" style="opacity: 0.7;">While autonomy is ON, gate-passing proposals are adopted <strong>without your approval</strong> — the Approve/Deny controls below matter again when autonomy is off, or when a rail (opt-out, immutable, pause, budget, or your own rejection) stops a proposal for a skill.</small>
+
+    <!-- v1.8.34: when the install is autonomous this card must never let a
+         reviewer believe their approval is what gated a change. -->
+    <template x-if="modeState && modeState.autonomous">
+      <div class="so-card so-banner-autonomous" style="margin-top: 8px;">
+        <strong>AUTONOMOUS MODE</strong>
+        <div style="font-size: 11px; margin-top: 4px; line-height: 1.6;">
+          Changes that pass every gate are adopted into live
+          <code>SKILL.md</code> files <strong>without asking you</strong>.
+          Daily cap: <span x-text="modeState.adopted_today ?? 0"></span> /
+          <span x-text="modeState.max_per_day ?? '—'"></span>.
+          <span x-show="modeState.killed"> Autonomy is currently PAUSED by the <code>.autonomous_pause</code> kill switch.</span>
+        </div>
+      </div>
+    </template>
+
     <div class="so-stat" style="margin-top: 8px;">
       <div>Default mode: <strong x-text="(govState.default_policy && govState.default_policy.mode) || '—'"></strong></div>
       <div>Require approval: <strong x-text="(govState.default_policy && govState.default_policy.require_human_approval) ? 'yes' : 'no'"></strong></div>
@@ -154,16 +327,77 @@
       <div>Opted-out: <strong x-text="(govState.opted_out && govState.opted_out.length) || 0"></strong></div>
       <div>Paused: <strong x-text="(govState.paused && govState.paused.length) || 0"></strong></div>
     </div>
+    <!-- v2026-10-13: when the install is autonomous the whole per-skill
+         approval roster collapses — its controls are real but mostly inert
+         while autonomy is on, and its "pending until you Approve" framing
+         read as "manual opt-in is still required". Collapsed, not hidden:
+         the informed proposal blocks stay reachable with one click. -->
+    <details :open="!modeState.autonomous">
+      <summary>
+        <span x-show="modeState.autonomous">Per-skill opt-in & approval controls (collapsed while autonomy is ON — they apply again when autonomy is off or a rail stops a skill)</span>
+        <span x-show="!modeState.autonomous">Per-skill opt-in &amp; approval controls</span>
+      </summary>
     <template x-if="!govState.opted_in || govState.opted_in.length === 0">
       <small style="opacity: 0.6; display: block; margin-top: 8px;">No opted-in skills yet.</small>
     </template>
     <template x-for="s in govState.opted_in || []" :key="s">
-      <div class="so-card" style="margin-top: 8px; background: rgba(0,0,0,0.15);">
+      <div class="so-card" style="margin-top: 8px; background: rgba(0,0,0,0.15);" :class="(pendingFor(s) && pendingFor(s).decision !== 'pending') ? 'so-decided' : ''">
         <div class="so-stat">
           <div><strong x-text="s"></strong></div>
           <div>Last decision: <span x-text="(govState.last_decisions && govState.last_decisions[s] && govState.last_decisions[s].reason) || '—'"></span></div>
           <div x-show="govState.paused && govState.paused.includes(s)" style="color: #e6a23c;">Currently paused</div>
         </div>
+
+        <!-- v1.8.34: the informed approval block. `pendingFor(s)` resolves
+             which staged proposal this skill's pending approval is about and
+             carries its summary; before this the card had no proposal
+             context at all, so Approve was a blind decision. -->
+        <template x-if="pendingFor(s)">
+          <div class="so-summary" style="margin-top: 6px;">
+            <div style="font-size: 11px; margin-bottom: 4px;">
+              Proposal <code x-text="pendingFor(s).proposal_id"></code>
+              <span x-show="pendingFor(s).decision && pendingFor(s).decision !== 'pending'"
+                    x-text="'— ' + pendingFor(s).decision + (pendingFor(s).decided_by ? ' by ' + pendingFor(s).decided_by : '')"></span>
+            </div>
+            <template x-if="pendingFor(s).summary && pendingFor(s).summary.available">
+              <div>
+                <span class="so-intent" :class="'so-intent-' + ((pendingFor(s).summary.intent || {}).category || 'unknown')"
+                      x-text="((pendingFor(s).summary.intent || {}).category) || 'unknown'"></span>
+                <span x-text="((pendingFor(s).summary.intent || {}).headline) || ''"></span>
+                <div style="margin-top: 6px;" x-text="pendingFor(s).summary.summary || ''"></div>
+                <ul class="so-rationale">
+                  <template x-for="(b, i) in (pendingFor(s).summary.rationale || [])" :key="i">
+                    <li x-text="b"></li>
+                  </template>
+                </ul>
+                <div class="so-stat" style="margin-top: 4px;">
+                  <div x-show="(pendingFor(s).summary.evidence || {}).gate_outcome">Gate verdict:
+                    <strong x-text="((pendingFor(s).summary.evidence || {}).gate_outcome) || '—'"></strong></div>
+                  <div x-show="(pendingFor(s).summary.diff || {}).available">Diff: <strong><span x-text="pendingFor(s).summary.diff.added_lines"></span> added / <span x-text="pendingFor(s).summary.diff.removed_lines"></span> removed</strong></div>
+                </div>
+                <template x-for="w in (pendingFor(s).summary.warnings || [])" :key="w">
+                  <div class="so-warn" x-text="'⚠ ' + w"></div>
+                </template>
+                <details>
+                  <summary>View proposed changes (<span x-text="(pendingFor(s).summary.diff || {}).hunk_count || 0"></span> section(s))</summary>
+                  <div class="so-diff" x-text="(pendingFor(s).diff_full && pendingFor(s).diff_full.text) || ((pendingFor(s).summary.diff || {}).text) || ''"></div>
+                  <div class="so-row">
+                    <button type="button" class="so-btn" :disabled="busy" @click="loadFullDiff(pendingFor(s).proposal_id)">Load full diff</button>
+                    <small style="opacity: 0.6;" x-show="(pendingFor(s).summary.diff || {}).truncated">Shown diff is truncated. Read the proposal file for the complete change.</small>
+                  </div>
+                </details>
+                <div class="so-path" x-text="((pendingFor(s).summary.artifacts || {}).proposal_rel) || ''"></div>
+              </div>
+            </template>
+            <template x-if="pendingFor(s).summary && !pendingFor(s).summary.available">
+              <div class="so-warn" x-text="'No summary available (' + ((pendingFor(s).summary.warnings || []).join('; ') || 'unknown') + ').'"></div>
+            </template>
+          </div>
+        </template>
+        <template x-if="!pendingFor(s)">
+          <div class="so-path" style="margin-top: 6px;">No proposal staged for this skill — approving here only clears its approval gate.</div>
+        </template>
+
         <div class="so-row">
           <button type="button" class="so-btn so-btn-primary" :disabled="busy" @click="governanceApprove(s, true)">Approve</button>
           <button type="button" class="so-btn" :disabled="busy" @click="governanceApprove(s, false)">Deny</button>
@@ -172,6 +406,7 @@
         </div>
       </div>
     </template>
+    </details>
   </div>
 
   <!-- BACKEND -->
@@ -225,7 +460,13 @@
       <input type="checkbox" x-model="cfg.replay_evalkit_enabled" />
       Attach the official SkillOpt evalkit report to completed real-gate records
     </label>
-    <small style="display: block; opacity: 0.8;">Uses the already-scored current/proposed task pairs. Requires an installed skillopt_sleep version with evalkit support. The report is informational and cannot change the gate or adoption result.</small>
+    <small style="display: block; opacity: 0.8;">Without a manifest, reports descriptively on gate pairs. To use an independent reviewed set, enter an absolute JSON file path containing a list of {"id":"stable-id","task":"task text"} records. Keep those tasks out of optimization rollouts. Independent replay uses real A0 runs and can incur extra model cost. Reports never change the gate or adoption result.</small>
+    <label style="display: block; margin-top: 10px;">Independent task manifest path
+      <input type="text" x-model="cfg.replay_evalkit_tasks_file" placeholder="Optional absolute path to reviewed tasks.json" style="width: 100%;" />
+    </label>
+    <label style="display: block; margin-top: 8px;">Maximum independent tasks
+      <input type="number" min="1" max="20" x-model.number="cfg.replay_evalkit_max_tasks" />
+    </label>
   </div>
 
   <!-- SAVE -->
@@ -243,8 +484,40 @@
 // dashboard's MisformatGuardDashboard or any global store — that
 // dependency was the cause of the "MisformatGuardDashboard not loaded"
 // error on Save.
+// v1.8.34 (P0.1): the settings the operator can actually change in this
+// page. This array is the SINGLE SOURCE OF TRUTH for both directions:
+//   - save()    builds the POST body from it
+//   - refresh() copies a server key into `cfg` only when it is listed here
+// Before this, save() hard-coded 6 keys while `cfg` declared 13, so
+// privacy_redact_secrets, privacy_include_tool_args,
+// privacy_include_tool_results, rollout_retention_days and the three
+// replay_evalkit_* settings rendered as live controls and were silently
+// discarded on every save. That is the same class of defect as the v1.8.2
+// config-wipe incident: an operator-visible switch that does nothing.
+// Adding a control means adding its key HERE.
+//
+// `auto_adopt` is deliberately NOT in this list even though it still
+// exists in config.json: it is the legacy alias of `governance.evolution_mode`,
+// and the Evolution mode card owns it via /mode. Keeping it here would
+// reintroduce two controls for one setting.
+const SKILLOPT_EDITABLE_KEYS = [
+  'auto_loop_enabled',
+  'auto_loop_interval_sec',
+  'auto_loop_min_rollouts',
+  'auto_loop_skill_target',
+  'backend',
+  'privacy_redact_secrets',
+  'privacy_include_tool_args',
+  'privacy_include_tool_results',
+  'rollout_retention_days',
+  'replay_evalkit_enabled',
+  'replay_evalkit_tasks_file',
+  'replay_evalkit_max_tasks',
+];
+
 function skilloptSettings() {
   return {
+    editableKeys: SKILLOPT_EDITABLE_KEYS,
     busy: false,
     lastMsg: '',
     lastOk: false,
@@ -254,36 +527,153 @@ function skilloptSettings() {
       auto_loop_interval_sec: 1800,
       auto_loop_min_rollouts: 10,
       auto_loop_skill_target: '',
-      auto_adopt: false,
+      // v1.8.34: no local `auto_adopt` default. It is the legacy alias of
+      // governance.evolution_mode and is owned by the Evolution mode card
+      // via /mode; a local copy here would be a second, never-sent value
+      // that looks authoritative and is not.
       backend: 'auto',
       privacy_redact_secrets: true,
       privacy_include_tool_args: false,
       privacy_include_tool_results: false,
       rollout_retention_days: 0,
       replay_evalkit_enabled: false,
+      replay_evalkit_tasks_file: '',
+      replay_evalkit_max_tasks: 4,
     },
     skills: [],
     rollouts: 0,
     staged: 0,
     stagedProposals: [],
+    // v1.8.34: skill -> pending proposal + summary, from /staged.
+    pendingApproval: {},
     govState: {},
     loopState: {},
+    // v1.8.34: resolved operating mode, from /mode (P3). Empty until then.
+    modeState: {},
     privacyStatus: { available: false },
 
     async init() {
       await this.refresh();
     },
 
+    // v2026-10-13 (fetch hardening): this page used raw fetch with no CSRF
+    // header, no timeout, and no busy-watchdog. Three failure modes that
+    // produced exactly the "the buttons do nothing" report:
+    //   - a post-restart tab whose csrf_token_<runtime_id> cookie no longer
+    //     matches: every POST 403'd, surfaced as the useless "mode: bad json";
+    //   - a suppressed confirm() dialog silently no-oping the only enable
+    //     button (fixed by the inline confirmation bar);
+    //   - a hung endpoint leaving busy=true forever: every button rendered
+    //     with cursor: not-allowed (the "crossed-out cursor").
+    // It now fetches /api/csrf_token once (reusing window.SkillOptDashboard's
+    // loader when present), attaches the header, retries a 403 once with a
+    // fresh token, detects login redirects, adds a 30s timeout, and a busy
+    // watchdog guarantees the buttons come back even if a call never returns.
+    _csrfToken: null,
+
+    async _fetchCsrf(force) {
+      if (!force && this._csrfToken) return this._csrfToken;
+      // Prefer the dashboard helper's loader (skillopt-dashboard.js) when the
+      // page-head extension has loaded it; fall back to our own fetch.
+      const dash = globalThis.SkillOptDashboard;
+      if (dash && typeof dash.csrfToken === 'function') {
+        const t = await dash.csrfToken().catch(() => null);
+        if (t) { this._csrfToken = t; return t; }
+      }
+      const r = await fetch('/api/csrf_token', { credentials: 'same-origin', cache: 'no-store' });
+      const j = await r.json();
+      this._csrfToken = (j && j.ok && (j.token || j.csrf_token)) || null;
+      return this._csrfToken;
+    },
+
+    _fetchWithTimeout(url, init, ms) {
+      const ctl = ('AbortController' in globalThis) ? new AbortController() : null;
+      const tid = setTimeout(() => { if (ctl) ctl.abort(); }, ms || 30000);
+      const p = fetch(url, Object.assign({}, init, ctl ? { signal: ctl.signal } : {}));
+      return p.finally(() => clearTimeout(tid));
+    },
+
     async api(path, opts) {
       opts = opts || {};
       opts.method = opts.method || 'POST';
-      opts.headers = Object.assign({ 'content-type': 'application/json' }, opts.headers || {});
-      if (opts.body && typeof opts.body !== 'string') {
-        opts.body = JSON.stringify(opts.body);
+      const isGet = opts.method.toUpperCase() === 'GET';
+      let body = opts.body;
+      if (body && typeof body !== 'string') body = JSON.stringify(body);
+
+      const doSend = async () => {
+        const headers = { 'content-type': 'application/json' };
+        if (!isGet) {
+          const tok = await this._fetchCsrf(false).catch(() => null);
+          if (tok) headers['x-csrf-token'] = tok;
+        }
+        return await this._fetchWithTimeout(
+          '/api/plugins/skillopt' + path,
+          { method: opts.method, headers: headers, body: isGet ? undefined : (body || null) },
+          opts.timeoutMs || 30000
+        );
+      };
+
+      let r;
+      try {
+        r = await doSend();
+      } catch (e) {
+        const aborted = e && (e.name === 'AbortError');
+        return { ok: false, error: aborted
+          ? 'request timed out (30s) — the backend may be busy; try again'
+          : 'network error: ' + e };
       }
-      const r = await fetch('/api/plugins/skillopt' + path, opts);
+      // 403: refresh the token once and retry — the SPA cookie for the
+      // current runtime id may be missing in a tab opened after a restart.
+      if (r.status === 403) {
+        const tok = await this._fetchCsrf(true).catch(() => null);
+        try {
+          r = await this._withTokenRetry(path, opts, tok);
+        } catch (e) {
+          return { ok: false, error: 'csrf retry failed: ' + e };
+        }
+      }
       const txt = await r.text();
-      try { return JSON.parse(txt); } catch (e) { return { ok: false, error: 'bad json', raw: txt }; }
+      try { return JSON.parse(txt); } catch (e) {
+        const looksHtml = txt.indexOf('<html') !== -1 || txt.indexOf('Redirecting') !== -1;
+        if (looksHtml || r.status === 401 || r.status === 403 || r.redirected) {
+          return { ok: false, error: 'session expired — reload the page and log in again' };
+        }
+        return { ok: false, error: 'bad json (HTTP ' + r.status + ')', raw: txt };
+      }
+    },
+
+    async _withTokenRetry(path, opts, token) {
+      const isGet = opts.method.toUpperCase() === 'GET';
+      const headers = { 'content-type': 'application/json' };
+      if (!isGet) {
+        if (token) headers['x-csrf-token'] = token;
+      }
+      const body = opts.body && typeof opts.body !== 'string'
+        ? JSON.stringify(opts.body) : opts.body;
+      return await this._fetchWithTimeout(
+        '/api/plugins/skillopt' + path,
+        { method: opts.method, headers: headers, body: isGet ? undefined : (body || null) },
+        opts.timeoutMs || 30000
+      );
+    },
+
+    // Busy state with a hard self-reset: no stuck cursor, no matter what.
+    _busySeq: 0,
+    confirmAutonomous: false,
+    _confirmSeq: 0,
+
+    _armBusy() {
+      const seq = ++this._busySeq;
+      this.busy = true;
+      setTimeout(() => { if (this._busySeq === seq) { this._busySeq++; this.busy = false; } }, 45000);
+    },
+    _clearBusy() {
+      ++this._busySeq; // invalidate any pending watchdog
+      this.busy = false;
+    },
+    _clearConfirm() {
+      ++this._confirmSeq;
+      this.confirmAutonomous = false;
     },
 
     setMsg(msg, ok) {
@@ -293,7 +683,7 @@ function skilloptSettings() {
     },
 
     async refresh() {
-      this.busy = true;
+      this._armBusy();
       try {
         const s = await this.api('/status');
         this.skills = (s && s.skills_available) || [];
@@ -307,8 +697,12 @@ function skilloptSettings() {
         // page open used to wipe config.json (the auto-adopt toggle bug).
         const c = await this.api('/config', { method: 'GET' });
         if (c && c.ok && c.config) {
-          for (const k of Object.keys(c.config)) {
-            if (k in this.cfg) this.cfg[k] = c.config[k];
+          // v1.8.34 (P0.1): copy in EVERY editable key, not just the ones
+          // that happen to be pre-declared in `cfg`. The old `k in this.cfg`
+          // guard silently hid any server-side value whose key the local
+          // default object did not already know about.
+          for (const k of this.editableKeys) {
+            if (k in c.config) this.cfg[k] = c.config[k];
           }
         }
       } catch (e) { this.setMsg('config: ' + e, false); }
@@ -316,54 +710,213 @@ function skilloptSettings() {
         const l = await this.api('/loop');
         if (l && l.loop) this.loopState = l.loop || {};
       } catch (e) { /* loop endpoint may not be wired */ }
+      await this.refreshMode();
       await this.refreshStaged();
       await this.refreshGovernance();
-      this.busy = false;
+      this._clearBusy();
+    },
+
+    async refreshMode() {
+      // v1.8.34: read the RESOLVED mode, not the raw config value, so the UI
+      // shows where the answer came from (canonical key vs legacy alias) and
+      // whether the kill switch is engaged. `adopted_today` is passed in from
+      // the loop-state mirror; /mode never reads the auto-loop state file, so
+      // it cannot become a second writer or reader of it.
+      try {
+        const body = {};
+        const today = this.loopState && this.loopState.autonomous_adoptions_today;
+        if (today != null) body.adopted_today = today;
+        const m = await this.api('/mode', { body: body });
+        if (m && m.ok) this.modeState = m;
+        // v2026-10-13: a failed mode read used to leave modeState {} — the
+        // card silently showed "…" with no explanation. Surface the error in
+        // the card's own error line instead.
+        else if (m && m.error) this.modeState = { error: m.error };
+      } catch (e) { /* mode endpoint may not be wired on an older build */ }
+    },
+
+    // v2026-10-13: the enable-autonomy confirmation no longer uses
+    // window.confirm. A browser's "prevent this page from creating additional
+    // dialogs" checkbox makes confirm() return false SILENTLY, so a click on
+    // the enable button could no-op with no message, no error, nothing — one
+    // of the reported failure modes. The confirmation is now an inline bar in
+    // the card (requestAutonomous arms it; "Confirm" calls setMode; timed
+    // auto-cancel). Switching BACK to manual keeps zero friction.
+    async requestAutonomous() {
+      if (this.confirmAutonomous) {
+        // second click inside the window: proceed via the bar's Confirm path
+        this._clearConfirm();
+        return await this.setMode('autonomous');
+      }
+      this.confirmAutonomous = true;
+      const seq = ++this._confirmSeq;
+      setTimeout(() => { if (this._confirmSeq === seq) this.confirmAutonomous = false; }, 12000);
+      this.setMsg('armed: press “Confirm — enable autonomy” below to proceed', true);
+    },
+
+    cancelAutonomous() {
+      this._clearConfirm();
+      this.setMsg('cancelled: autonomous mode was NOT enabled', false);
+    },
+
+    async setMode(mode) {
+      this._clearConfirm();
+      this._armBusy();
+      this.setMsg('setting mode: ' + mode + '...', true);
+      try {
+        const r = await this.api('/mode', { body: { mode: mode } });
+        if (r && r.ok) {
+          this.modeState = r;
+          this.setMsg('mode: ' + r.mode, true);
+          await this.refresh();
+        } else {
+          this.setMsg('mode: ' + ((r && r.error) || 'unknown'), false);
+        }
+      } catch (e) { this.setMsg('mode: ' + e, false); }
+      this._clearBusy();
+    },
+
+    async setPause(paused) {
+      this._armBusy();
+      this.setMsg(paused ? 'pausing autonomy...' : 'resuming autonomy...', true);
+      try {
+        const r = await this.api('/mode', { body: { pause: paused } });
+        if (r && r.ok) {
+          this.modeState = r;
+          this.setMsg(paused ? 'autonomy paused' : 'autonomy resumed', true);
+        } else {
+          this.setMsg('kill switch: ' + ((r && r.error) || 'unknown'), false);
+        }
+      } catch (e) { this.setMsg('kill switch: ' + e, false); }
+      this._clearBusy();
     },
 
     async refreshStaged() {
       try {
         const s = await this.api('/staged');
         this.stagedProposals = (s && s.ok && Array.isArray(s.proposals)) ? s.proposals : [];
-      } catch (e) { this.stagedProposals = []; }
+        // v1.8.34: the pending-approval map is the proposal<->decision link
+        // the Governance card needs. It is fetched ONCE here and the
+        // Governance card reads it through pendingFor(), so both cards
+        // render the SAME document from ONE response. Two independently
+        // fetched copies could disagree, and a reviewer acting on a stale
+        // diff is worse than no diff at all.
+        this.pendingApproval = (s && s.ok && s.pending_approval) || {};
+      } catch (e) { this.stagedProposals = []; this.pendingApproval = {}; }
+    },
+
+    // v1.8.34: resolve a skill's pending proposal for the Governance card.
+    pendingFor(skill) {
+      const m = this.pendingApproval || {};
+      return m[skill] || null;
+    },
+
+    // v1.8.34: fetch the larger diff for ONE proposal. Stored on the staged
+    // row when it matches so the Staged card's <details> can show it too;
+    // otherwise the Governance card falls back to the bounded sidecar text.
+    async loadFullDiff(proposalId) {
+      if (!proposalId) return;
+      this._armBusy();
+      try {
+        const r = await this.api('/proposal', { body: { proposal_id: proposalId, full: true } });
+        if (r && r.ok && r.full_diff) {
+          this.attachFullDiff(proposalId, r.full_diff);
+        } else {
+          this.setMsg('diff: ' + ((r && r.error) || 'unavailable'), false);
+        }
+      } catch (e) { this.setMsg('diff: ' + e, false); }
+      this._clearBusy();
+    },
+
+    attachFullDiff(proposalId, diff) {
+      const row = (this.stagedProposals || []).find(p => p.proposal_id === proposalId);
+      if (row) {
+        row.diff_full = diff;
+        row.diff_available = true;
+        return;
+      }
+      // Governance-card-only case. pendingApproval is keyed by SKILL, not by
+      // proposal_id, so the entry has to be found by matching proposal_id -
+      // looking it up by proposalId directly would silently never match and
+      // the button would appear to do nothing.
+      for (const skill of Object.keys(this.pendingApproval || {})) {
+        const entry = this.pendingApproval[skill];
+        if (entry && entry.proposal_id === proposalId) {
+          entry.diff_full = diff;
+          return;
+        }
+      }
     },
 
     async adoptProposal(proposalId) {
-      this.busy = true;
+      this._armBusy();
       this.setMsg('adopting ' + proposalId + '...', true);
       try {
         const r = await this.api('/adopt', { body: { proposal_id: proposalId } });
         if (r && r.ok) {
-          this.setMsg('adopted: ' + r.skill + ' (snapshot ' + (r.snapshot && r.snapshot.ok ? 'saved' : 'FAILED') + ')', !!(r.snapshot && r.snapshot.ok) || true);
+          // v1.8.36 (audit M6): this used to end in `|| true`, which
+          // short-circuited unconditionally, so lastOk was ALWAYS true and the
+          // message rendered green even when it said the snapshot FAILED - and
+          // after audit F3 the snapshot failing now BLOCKS the write, so the
+          // two had to be brought in line. Colour follows the text.
+          const snapOk = !!(r.snapshot && r.snapshot.ok);
+          this.setMsg(
+            'adopted: ' + r.skill +
+            ' (snapshot ' + (snapOk ? 'saved' : 'FAILED') + ')' +
+            (r.consumed_to ? '' : ' — proposal still queued'),
+            snapOk);
         } else {
           this.setMsg('adopt: ' + ((r && r.error) || 'unknown'), false);
         }
       } catch (e) { this.setMsg('adopt: ' + e, false); }
-      this.busy = false;
+      this._clearBusy();
       await this.refresh();
     },
 
     async rejectProposal(proposalId) {
-      this.busy = true;
+      // v1.8.34: ask WHY. The old call hard-coded
+      // reason: 'user rejected via UI', which is an audit row that carries
+      // no information - it cannot inform a later re-autonomy decision, and
+      // it cannot feed failure_memory, which is what turns a human's
+      // correction into guidance for the next cycle.
+      const why = window.prompt(
+        'Why are you rejecting this proposal?\n\n' +
+        'This is recorded in the audit trail and used as failure memory, so ' +
+        'the next cycle can avoid repeating the mistake.',
+        ''
+      );
+      if (why === null) { this.setMsg('reject cancelled', false); return; }
+      const reason = String(why).trim();
+      if (!reason) { this.setMsg('reject cancelled: a reason is required', false); return; }
+      this._armBusy();
       this.setMsg('rejecting ' + proposalId + '...', true);
       try {
-        const r = await this.api('/reject', { body: { proposal_id: proposalId, reason: 'user rejected via UI' } });
-        if (r && r.ok) { this.setMsg('rejected: ' + proposalId, true); }
+        const r = await this.api('/reject', { body: { proposal_id: proposalId, reason: reason } });
+        if (r && r.ok) {
+          // v1.8.36 (audit F2): /reject now quarantines the proposal and arms
+          // the governance rejection rail, so say so. A rejection that only
+          // wrote a row left the document in the queue for the drain to adopt.
+          this.setMsg('rejected: ' + proposalId +
+            (r.quarantined_to && r.quarantined_to.indexOf('error') !== 0
+              ? ' (moved out of the queue)'
+              : ' — WARNING: could not clear it from the queue'),
+            !!(r.quarantined_to && r.quarantined_to.indexOf('error') !== 0));
+        }
         else { this.setMsg('reject: ' + ((r && r.error) || 'unknown'), false); }
       } catch (e) { this.setMsg('reject: ' + e, false); }
-      this.busy = false;
+      this._clearBusy();
       await this.refresh();
     },
 
     async rollbackSkill(skill) {
-      this.busy = true;
+      this._armBusy();
       this.setMsg('rolling back ' + skill + '...', true);
       try {
         const r = await this.api('/rollback', { body: { skill } });
         if (r && r.ok) { this.setMsg('rolled back: ' + skill + ' (' + (r.bytes || 0) + ' bytes)', true); }
         else { this.setMsg('rollback: ' + ((r && r.error) || 'no snapshot'), false); }
       } catch (e) { this.setMsg('rollback: ' + e, false); }
-      this.busy = false;
+      this._clearBusy();
       await this.refresh();
     },
 
@@ -375,60 +928,69 @@ function skilloptSettings() {
     },
 
     async governanceApprove(skill, approved) {
-      this.busy = true;
+      this._armBusy();
+      // v1.8.34: bind the decision to the proposal the reviewer actually
+      // read. Without proposal_id the ledger row names only the skill, so
+      // find_pending_proposal() cannot tell a pending decision from a
+      // decided one and the card can only ever re-prompt.
+      const pending = this.pendingFor(skill);
+      const proposalId = pending ? pending.proposal_id : null;
       this.setMsg((approved ? 'approving ' : 'denying ') + skill + '...', true);
       try {
-        const r = await this.api('/governance_approve', { body: { skill, approved, decided_by: 'user' } });
+        const body = { skill: skill, approved: approved, decided_by: 'user' };
+        if (proposalId) body.proposal_id = proposalId;
+        const r = await this.api('/governance_approve', { body: body });
         if (r && r.ok) { this.setMsg((approved ? 'approved: ' : 'denied: ') + skill, true); }
         else { this.setMsg('governance: ' + ((r && r.error) || 'unknown'), false); }
       } catch (e) { this.setMsg('governance: ' + e, false); }
-      this.busy = false;
+      this._clearBusy();
       await this.refresh();
     },
 
     async governancePause(skill, hours) {
-      this.busy = true;
+      this._armBusy();
       this.setMsg('pausing ' + skill + '...', true);
       try {
         const r = await this.api('/governance_pause', { body: { skill, action: 'pause', hours: hours || 24 } });
         if (r && r.ok) { this.setMsg('paused: ' + skill + ' for ' + (r.hours || 24) + 'h', true); }
         else { this.setMsg('pause: ' + ((r && r.error) || 'unknown'), false); }
       } catch (e) { this.setMsg('pause: ' + e, false); }
-      this.busy = false;
+      this._clearBusy();
       await this.refresh();
     },
 
     async governanceResume(skill) {
-      this.busy = true;
+      this._armBusy();
       this.setMsg('resuming ' + skill + '...', true);
       try {
         const r = await this.api('/governance_pause', { body: { skill, action: 'resume' } });
         if (r && r.ok) { this.setMsg('resumed: ' + skill, true); }
         else { this.setMsg('resume: ' + ((r && r.error) || 'unknown'), false); }
       } catch (e) { this.setMsg('resume: ' + e, false); }
-      this.busy = false;
+      this._clearBusy();
       await this.refresh();
     },
 
     async save() {
-      this.busy = true;
+      this._armBusy();
       this.setMsg('saving...', true);
       try {
-        // Send only the keys the user can change in the UI
-        const payload = {
-          auto_loop_enabled: this.cfg.auto_loop_enabled,
-          auto_loop_interval_sec: this.cfg.auto_loop_interval_sec,
-          auto_loop_min_rollouts: this.cfg.auto_loop_min_rollouts,
-          auto_loop_skill_target: this.cfg.auto_loop_skill_target,
-          auto_adopt: this.cfg.auto_adopt,
-          backend: this.cfg.backend,
-        };
+        // v1.8.34 (P0.1): build the payload from the editable-key allowlist
+        // instead of a hand-copied literal, so a control added to the page
+        // cannot be silently dropped on save. Empty / null values are sent
+        // as-is: api/config.py whitelists against the merged defaults and
+        // deep-merges nested objects, so a partial `governance` payload
+        // cannot clobber its sibling keys.
+        const payload = {};
+        for (const k of this.editableKeys) {
+          if (k in this.cfg) payload[k] = this.cfg[k];
+        }
         const r = await this.api('/config', { body: payload });
         if (r && r.ok) {
           // Pull the persisted values back so the UI reflects them
           if (r.config) {
-            for (const k of Object.keys(r.config)) {
-              if (k in this.cfg) this.cfg[k] = r.config[k];
+            for (const k of this.editableKeys) {
+              if (k in r.config) this.cfg[k] = r.config[k];
             }
           }
           this.setMsg('saved: ' + JSON.stringify(r.updated || Object.keys(payload)), true);
@@ -438,11 +1000,11 @@ function skilloptSettings() {
       } catch (e) {
         this.setMsg('save: ' + e, false);
       }
-      this.busy = false;
+      this._clearBusy();
     },
 
     async runSleep(verb) {
-      this.busy = true;
+      this._armBusy();
       this.setMsg('launching ' + verb + '...', true);
       try {
         const r = await this.api('/sleep', { body: { verb } });
@@ -452,12 +1014,12 @@ function skilloptSettings() {
           this.setMsg('sleep: ' + ((r && r.error) || 'unknown'), false);
         }
       } catch (e) { this.setMsg('sleep: ' + e, false); }
-      this.busy = false;
+      this._clearBusy();
       await this.refresh();
     },
 
     async adopt() {
-      this.busy = true;
+      this._armBusy();
       this.setMsg('adopting...', true);
       try {
         const r = await this.api('/adopt');
@@ -467,7 +1029,7 @@ function skilloptSettings() {
           this.setMsg('adopt: ' + ((r && r.error) || 'unknown'), false);
         }
       } catch (e) { this.setMsg('adopt: ' + e, false); }
-      this.busy = false;
+      this._clearBusy();
       await this.refresh();
     },
 

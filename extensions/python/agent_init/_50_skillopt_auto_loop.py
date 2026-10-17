@@ -99,13 +99,29 @@ def _start_loop_if_needed() -> None:
     """
     global _loop_thread
     with _loop_lock:
-        if _loop_thread is not None and _loop_thread.is_alive():
-            return  # already running, no-op
         try:
             from usr.plugins.skillopt.helpers import auto_loop  # type: ignore
         except Exception as e:
             log.warning("[skillopt] cannot import auto_loop: %s", e)
             return
+        # v1.8.48 (audit A4): the inner loop is started FIRST, and
+        # unconditionally w.r.t. the outer loop's liveness. It used to sit
+        # behind the `return` on line 102, which only ever tested the OUTER
+        # thread - so a skill-opted inner loop that exited (disabled at start,
+        # import failure, or toggled off and on mid-run, which the worker
+        # supports by re-reading config) was never restarted for the life of
+        # the process. The suggestion queue silently stopped filling while the
+        # outer loop looked healthy. `start_inner_loop` self-guards on its own
+        # thread's liveness, so calling it here is safe and idempotent.
+        inner = auto_loop.start_inner_loop(get_config=_get_config)
+        if inner is not None:
+            log.info(
+                "[skillopt] inner-loop started (pid=%s, thread=%s)",
+                __import__("os").getpid(),
+                inner.name,
+            )
+        if _loop_thread is not None and _loop_thread.is_alive():
+            return  # already running, no-op
         # v1.8.3 process-wide guard: the A0 loader re-imports this
         # module per profile/project; dedupe by live thread name.
         import threading as _sk_th
@@ -118,22 +134,6 @@ def _start_loop_if_needed() -> None:
             __import__("os").getpid(),
             _loop_thread.name,
         )
-        # v1.3.0 (Day-4 item 4): start the inner-loop thread alongside
-        # the auto-loop. Same lifecycle, faster cadence, separate
-        # responsibilities. The inner loop NEVER writes to staging/ or
-        # SKILL.md - it only produces per-rollout suggestions. The
-        # auto-loop reads them via list_pending_suggestions() at the
-        # start of each cycle. See helpers/inner_loop.py for the
-        # inner-loop contract.
-        inner = auto_loop.start_inner_loop(get_config=_get_config)
-        if inner is not None:
-            log.info(
-                "[skillopt] inner-loop started (pid=%s, thread=%s)",
-                __import__("os").getpid(),
-                inner.name,
-            )
-        else:
-            log.debug("[skillopt] inner-loop disabled or failed to start")
 
 
 def _watchdog_loop() -> None:

@@ -86,6 +86,7 @@ VERIFIED API (v1.6.1, verified against microsoft/skillopt @ HEAD 2026-08-10)
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -251,6 +252,54 @@ def _resolve_skill_path(target: str | None) -> str | None:
 def _official_staging_root() -> Path:
     """Where the official `run` writes its staging dirs: `<a0>/.skillopt-sleep/staging/`."""
     return _a0_root() / ".skillopt-sleep" / "staging"
+
+
+def _active_run_path() -> Path:
+    return _official_staging_root().parent / "active_run.json"
+
+
+def _active_official_run() -> dict[str, Any] | None:
+    """Keep timed-out detached runs single-flight across later ticks."""
+    marker = _active_run_path()
+    if not marker.exists():
+        return None
+    try:
+        state = json.loads(marker.read_text(encoding="utf-8"))
+        pid = int(state["pid"])
+    except Exception:
+        return {"pid": None, "error": "active-run marker is unreadable"}
+    try:
+        running = sleep_runner.is_running(pid)
+    except Exception:
+        running = True
+    if running:
+        return state
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError:
+        return {"pid": pid, "error": "finished-run marker could not be cleared"}
+    return None
+
+
+def _write_active_run(pid: int, log_path: str, target: str) -> None:
+    marker = _active_run_path()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    temp = marker.with_suffix(".tmp")
+    temp.write_text(json.dumps({
+        "pid": int(pid), "log_path": str(log_path), "target": str(target),
+        "started_at": time.time(),
+    }), encoding="utf-8")
+    temp.replace(marker)
+
+
+def _clear_active_run(pid: int) -> None:
+    marker = _active_run_path()
+    try:
+        state = json.loads(marker.read_text(encoding="utf-8"))
+        if int(state.get("pid", -1)) == int(pid):
+            marker.unlink(missing_ok=True)
+    except (OSError, ValueError, TypeError):
+        pass
 
 
 def probe_official(force: bool = False) -> dict[str, Any]:
@@ -450,7 +499,7 @@ def _build_run_args(cfg: dict[str, Any], target: str | None) -> list[str]:
 # Staged-proposal discovery + rename
 # ----------------------------------------------------------------------- #
 
-def _find_staging_dir() -> Path | None:
+def _find_staging_dir(*, exclude: set[str] | None = None) -> Path | None:
     """Locate the official engine's most recent staging dir.
 
     The `run` command writes to `<project>/.skillopt-sleep/staging/<ts>/`
@@ -460,11 +509,13 @@ def _find_staging_dir() -> Path | None:
     heuristic). Returns None if no staging exists.
     """
     root = _official_staging_root()
+    exclude = exclude or set()
     if not root.is_dir():
         return None
     candidates: list[Path] = []
     for child in root.iterdir():
-        if child.is_dir() and (child / "manifest.json").is_file():
+        if (child.is_dir() and child.name not in exclude
+                and (child / "manifest.json").is_file()):
             candidates.append(child)
     if not candidates:
         return None
@@ -486,8 +537,10 @@ def _read_gate_verdict(staging_dir: Path) -> dict[str, Any] | None:
         rep = json.loads(rj.read_text(encoding="utf-8"))
     except Exception:
         return None
+    if not isinstance(rep, dict) or type(rep.get("accepted")) is not bool:
+        return None
     return {
-        "accepted": bool(rep.get("accepted", False)),
+        "accepted": rep["accepted"],
         "gate_action": rep.get("gate_action", ""),
         "baseline_score": rep.get("baseline_score"),
         "candidate_score": rep.get("candidate_score"),
@@ -542,6 +595,17 @@ def run_official_sleep_cycle(
             "reason": f"official package not available: {probe.get('error') or 'not installed'}",
         }
 
+    active = _active_official_run()
+    if active is not None:
+        return {
+            "ok": False,
+            "deferred": True,
+            "engine": "official",
+            "reason": f"official run still active (pid={active.get('pid')}); waiting",
+            "pid": active.get("pid"),
+            "log_path": active.get("log_path"),
+        }
+
     verb = _str_cfg(cfg, "official_run_verb") or "run"
     extra = _build_run_args(cfg, target or None)
 
@@ -549,6 +613,17 @@ def run_official_sleep_cycle(
     # Claude Code history format the engine's harvest expects, builds the
     # subprocess env from .skillopt-env, and writes a timestamped log file
     # we can parse for the held-out score.
+    # Snapshot existing runs before launch. Selecting the globally newest
+    # staging directory can otherwise attach a previous run's verdict when
+    # this invocation completed without producing a staging directory.
+    staging_root = _official_staging_root()
+    try:
+        prior_staging_dirs = {
+            child.name for child in staging_root.iterdir() if child.is_dir()
+        } if staging_root.is_dir() else set()
+    except OSError:
+        prior_staging_dirs = set()
+
     try:
         launch = sleep_runner.launch_sleep_subprocess(
             verb=verb,
@@ -565,6 +640,23 @@ def run_official_sleep_cycle(
 
     pid = launch["pid"]
     log_path = launch["log_path"]
+    try:
+        _write_active_run(pid, log_path, target)
+    except Exception as e:
+        # v1.8.48 (audit T5): the engine is ALREADY LAUNCHED and detached.
+        # `fallback_to_direct` without `deferred` made the caller start a
+        # competing direct cycle against a running engine AND left the pid
+        # unrecorded, so nothing on a later tick could find it. This is the
+        # F14 class: a still-running engine is DEFERRED, never raced.
+        return {
+            "ok": False,
+            "fallback_to_direct": True,
+            "deferred": True,
+            "engine": "official",
+            "reason": f"could not persist active-run marker: {e}",
+            "pid": pid,
+            "log_path": log_path,
+        }
 
     # Poll the detached subprocess until it finishes or we time out.
     # We never kill it — if it outlives our timeout we leave it running
@@ -584,19 +676,37 @@ def run_official_sleep_cycle(
     except Exception:
         still_running = False
     if still_running:
+        # v1.8.37 (audit F14): `deferred: True` is REQUIRED here, not a nicety.
+        #
+        # The caller (auto_loop's official-engine step) reads `deferred` and
+        # uses it to SKIP the competing direct-optimizer cycle for this skill
+        # this tick. Without it, a timed-out-but-still-running official engine
+        # and the direct optimizer both write `staging/<skill>.md`, and
+        # cadence/budget are charged once for what is actually two cycles. The
+        # engine is detached and was deliberately left running, so it may well
+        # write that file seconds later.
+        #
+        # The pid is reported too, so an operator (or a later tick) can see
+        # what is still in flight rather than guessing.
         return {
             "ok": False,
             "fallback_to_direct": True,
+            # The engine is still running, so this cycle is DEFERRED, not
+            # handed over. The direct optimizer must not start.
+            "deferred": True,
             "engine": "official",
-            "reason": f"official run timed out after {timeout_s}s (left detached)",
+            "reason": f"official run timed out after {timeout_s}s (left "
+                      f"detached and still running; direct cycle deferred)",
             "pid": pid,
             "log_path": log_path,
         }
 
+    _clear_active_run(pid)
+
     # Discover the official staging dir + the authoritative gate verdict
     # from report.json (NOT log scraping). The engine ran evaluate_gate
     # before staging, so report.json is the source of truth.
-    staging_dir = _find_staging_dir()
+    staging_dir = _find_staging_dir(exclude=prior_staging_dirs)
     if not staging_dir:
         return {
             "ok": False,
@@ -608,6 +718,16 @@ def run_official_sleep_cycle(
         }
     verdict = _read_gate_verdict(staging_dir)
     proposed = staging_dir / "proposed_SKILL.md"
+    if verdict is None:
+        return {
+            "ok": False,
+            "fallback_to_direct": True,
+            "engine": "official",
+            "reason": "official staging has no valid gate report; proposal not trusted",
+            "pid": pid,
+            "log_path": log_path,
+            "official_staging_dir": str(staging_dir),
+        }
     if not proposed.is_file():
         # v1.8.20 (P6): a gate-verdict night that staged no proposal is a
         # normal reject outcome (e.g. no edits generated), NOT an
@@ -684,6 +804,31 @@ def run_official_sleep_cycle(
             "official_staging_dir": str(staging_dir),
             "gate": verdict,
         }
+    # v1.8.46 (audit R16): the copied artefact is MODEL OUTPUT, so it gets
+    # the same pre-persistence redaction as the direct optimizer's staged
+    # write. Without it the raw bytes live in `staging/<skill>.md`, are
+    # copied again into `staging/adopted/*.md`, and appear in the summary
+    # sidecar's diff - so `adopt_write_skill` redacting at the live write
+    # never removed them. Placed AFTER the copy try/except, so a redaction
+    # problem cannot be reported as a copy failure.
+    try:
+        from usr.plugins.skillopt.helpers import privacy as _pv  # type: ignore
+    except Exception:
+        try:
+            from helpers import privacy as _pv  # type: ignore
+        except Exception:
+            _pv = None  # type: ignore[assignment]
+    if _pv is not None:
+        try:
+            if _pv.privacy_settings().get("redact_secrets", True):
+                _raw = dest.read_text(encoding="utf-8", errors="replace")
+                _clean = _pv.redact_text(_raw)
+                if _clean != _raw:
+                    dest.write_text(_clean, encoding="utf-8")
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "pre-persist redaction failed for %s: %s", skill_name, e)
+
     # v1.8.1: write the provenance marker so _auto_adopt / /adopt know this
     # proposal already passed the official held-out gate (replaces the
     # per-skill-last-run `state["last_engine"]` heuristic).
@@ -693,6 +838,24 @@ def run_official_sleep_cycle(
         )
     except Exception:
         pass
+    # v1.8.34: write the proposal summary so the approval UI can show WHAT
+    # changed and WHY instead of only the skill name. Best-effort by
+    # construction (proposal_view.annotate_staged never raises): the
+    # proposal is already safely on disk, so a summary failure must not
+    # turn an accepted run into a failure. The gate marker above is
+    # written first because collect_evidence() reads it.
+    try:
+        from usr.plugins.skillopt.helpers import proposal_view  # type: ignore
+    except Exception:
+        try:
+            from helpers import proposal_view  # type: ignore
+        except Exception:
+            proposal_view = None  # type: ignore[assignment]
+    if proposal_view is not None:
+        try:
+            proposal_view.annotate_staged(dest, skill=skill_name)
+        except Exception:
+            pass
     try:
         size = dest.stat().st_size
     except Exception:

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -65,22 +66,56 @@ def _short_id() -> str:
 
 
 def _enabled() -> bool:
+    """Is the cycle_history writer switched on? Default ON.
+
+    v1.8.37 (audit F12). This read its config from
+    `usr.plugins.skillopt.helpers.config_loader`, and **there is no
+    `config_loader.py` in this tree** - so the import raised on every call,
+    the `except` returned `True`, and `cycle_history_enabled: false` did
+    nothing. The key has been dead since it was declared.
+    """
     try:
-        from usr.plugins.skillopt.helpers import config_loader  # type: ignore
-        cfg = config_loader.load_config()
-        return bool(cfg.get("cycle_history_enabled", True))
+        from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
+    except ImportError:
+        try:
+            from helpers import sleep_runner  # type: ignore
+        except Exception:
+            return True
+    try:
+        return bool(sleep_runner.merged_config().get("cycle_history_enabled",
+                                                      True))
     except Exception:
         return True
 
 
 def _max_entries() -> int:
-    """Resolve the cycle_history_max_entries cap (0 = no compaction)."""
+    """Resolve the cycle_history_max_entries cap (0 = no compaction).
+
+    v1.8.37 (audit F12): same dead `config_loader` import as `_enabled()` -
+    `cycle_history_max_entries` was permanently pinned at 500.
+    """
     try:
-        from usr.plugins.skillopt.helpers import config_loader  # type: ignore
-        cfg = config_loader.load_config()
-        return max(0, int(cfg.get("cycle_history_max_entries", 500) or 500))
+        from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
+    except ImportError:
+        try:
+            from helpers import sleep_runner  # type: ignore
+        except Exception:
+            return 500
+    try:
+        raw = sleep_runner.merged_config().get("cycle_history_max_entries", 500)
+        # `0` means "no compaction" per this function's own contract, so it
+        # must NOT be collapsed by an `or 500` - that idiom turns a
+        # deliberately-disabled compaction back on, which is the opposite of
+        # what the operator asked for. Only a genuinely absent or None value
+        # takes the default.
+        if raw is None:
+            raw = 500
+        return max(0, int(raw))
     except Exception:
         return 500
+
+
+_CYCLE_LOCK = threading.RLock()
 
 
 def _compact_jsonl(max_entries: int) -> dict:
@@ -89,34 +124,43 @@ def _compact_jsonl(max_entries: int) -> dict:
     so the hot file stays bounded. The archive is append-only and never
     re-compacted. Best-effort: a failure returns {ok: False, error} and
     never raises (compaction must not break recording).
+
+    v1.8.48 (audit G3): this rewrites the APPEND TARGET wholesale, and five
+    writers append to it (the drain thread plus three HTTP handlers) with no
+    lock - the module imported no `threading` at all. A row appended between
+    the read and the `os.replace` was dropped from BOTH files: silently, and
+    unrecoverably. Two concurrent compactions also duplicated the same cold
+    block into the archive. This is the failure the approvals index was
+    created to prevent, reintroduced in a second file.
     """
     out = {"ok": True, "compacted": 0, "archived": 0}
     if max_entries <= 0:
         return out
-    jsonl = _jsonl_path()
-    if not jsonl.is_file():
-        return out
-    try:
-        with open(jsonl, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        total = len(lines)
-        if total <= max_entries:
+    with _CYCLE_LOCK:
+        jsonl = _jsonl_path()
+        if not jsonl.is_file():
             return out
-        overflow = total - max_entries
-        cold = lines[:overflow]
-        hot = lines[overflow:]
-        archive = _runs_dir() / "cycle_history.archive.jsonl"
-        with open(archive, "a", encoding="utf-8") as f:
-            f.writelines(cold)
-        # Atomic-ish rewrite of the hot file with the retained entries.
-        tmp = jsonl.with_suffix(jsonl.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.writelines(hot)
-        os.replace(tmp, jsonl)
-        out["compacted"] = overflow
-        out["archived"] = len(cold)
-    except Exception as e:
-        out = {"ok": False, "error": f"compaction failed: {e}"}
+        try:
+            with open(jsonl, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            total = len(lines)
+            if total <= max_entries:
+                return out
+            overflow = total - max_entries
+            cold = lines[:overflow]
+            hot = lines[overflow:]
+            archive = _runs_dir() / "cycle_history.archive.jsonl"
+            with open(archive, "a", encoding="utf-8") as f:
+                f.writelines(cold)
+            # Atomic-ish rewrite of the hot file with the retained entries.
+            tmp = jsonl.with_suffix(jsonl.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.writelines(hot)
+            os.replace(tmp, jsonl)
+            out["compacted"] = overflow
+            out["archived"] = len(cold)
+        except Exception as e:
+            out = {"ok": False, "error": f"compaction failed: {e}"}
     return out
 
 
@@ -148,10 +192,14 @@ def record_cycle_entry(cycle_entry: dict) -> dict:
     log = _log_path()
     try:
         line = json.dumps(entry, ensure_ascii=False, sort_keys=False)
-        with open(jsonl, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        # v1.8.48 (audit G3): the append and the compaction that rewrites
+        # this file must be mutually exclusive, or a row can be lost between
+        # the compaction's read and its `os.replace`.
+        with _CYCLE_LOCK:
+            with open(jsonl, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
         with open(log, "a", encoding="utf-8") as f:
             f.write(
                 f"{entry['ts']}\t{entry['cycle_id']}\t"

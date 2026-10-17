@@ -89,6 +89,14 @@ def main() -> int:
     # configured, or the caller explicitly opts back in.
     _cfg = sleep_runner.merged_config()
     _backend = str(_cfg.get('official_backend') or '').strip()
+    # v1.8.47 (re-audit R31): bind the log path BEFORE the guard. The
+    # guard's refusal is the record of the one run that deliberately did
+    # NOT execute, so it is precisely the line that must not be lost -
+    # and it fired while `_LOG_PATH` was still None, so `emit()` wrote
+    # nothing and the refusal left no trace in gated_cycle_*.jsonl.
+    runs_dir = sleep_runner.runs_dir()
+    _LOG_PATH = runs_dir / ('gated_cycle_'
+                          + time.strftime('%Y%m%dT%H%M%S') + '.jsonl')
     if not args.allow_mock_backend and (not _backend or _backend == 'mock'):
         _why = ('official_backend is unset; the official engine defaults to --backend mock'
                 if not _backend else 'official_backend is "mock"')
@@ -98,8 +106,6 @@ def main() -> int:
         return finish(1, 'INFRA_FAILED',
                       detail=_why + ' (mock backend rejects by construction; refusing the run)')
 
-    runs_dir = sleep_runner.runs_dir()
-    _LOG_PATH = runs_dir / ('gated_cycle_' + time.strftime('%Y%m%dT%H%M%S') + '.jsonl')
     emit('start', plugin_root=str(sleep_runner.plugin_root()), log_file=str(_LOG_PATH),
          python=sys.executable, argv=' '.join(sys.argv[1:]))
 
@@ -212,17 +218,69 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001
             marker = {'error': type(e).__name__ + ': ' + str(e)}
     gcfg = (cfg.get('governance') or {}).get('default_policy') or {}
-    auto_adopt = bool(cfg.get('auto_adopt'))
+    # v1.8.34: the resolved operating mode, via the single resolver. The
+    # previous `bool(cfg.get('auto_adopt'))` is the same bare-truthiness bug
+    # fixed in auto_loop: it is None for `auto_adopt:` with no value and True
+    # for the string "false", so the status this line reported could
+    # contradict what the loop was actually doing.
+    resolved_mode = 'manual'
+    mode_source = 'unavailable'
+    try:
+        from usr.plugins.skillopt.helpers import governance  # type: ignore
+    except Exception:
+        try:
+            from helpers import governance  # type: ignore
+        except Exception:
+            governance = None  # type: ignore[assignment]
+    if governance is not None:
+        try:
+            _m = governance.resolve_evolution_mode() or {}
+            resolved_mode = str(_m.get('mode') or 'manual')
+            mode_source = str(_m.get('source') or 'default')
+        except Exception:
+            pass
     require_human = bool(gcfg.get('require_human_approval', True))
+
+    # v1.8.34: carry the proposal SUMMARY, not just its path. This emit is
+    # the operator-facing "a change is waiting for you" record, and before
+    # this it named a file and a byte count - so a human reading the cycle
+    # log had to open the file to learn what was being proposed. The summary
+    # is bounded, so the JSONL line stays bounded too.
+    summary = None
+    if staged_path:
+        try:
+            from usr.plugins.skillopt.helpers import proposal_view  # type: ignore
+        except Exception:
+            try:
+                from helpers import proposal_view  # type: ignore
+            except Exception:
+                proposal_view = None  # type: ignore[assignment]
+        if proposal_view is not None:
+            try:
+                skill = str(Path(staged_path).stem)
+                summary = proposal_view.get_summary(staged_path, skill=skill)
+            except Exception as e:  # noqa: BLE001
+                summary = {'available': False,
+                           'warnings': [f'{type(e).__name__}: {e}']}
+
     emit('staging', staged_path=staged_path, staged_size=staged_size,
-         official_gate_marker=marker, auto_adopt=auto_adopt,
+         official_gate_marker=marker, resolved_mode=resolved_mode,
+         mode_source=mode_source,
+         autonomous=resolved_mode == 'autonomous',
          require_human_approval=require_human, status='PENDING_HUMAN_APPROVAL',
          adopt_invoked=False,
-         note='adoption is a separate human action (/adopt or governance approve); this runner never adopts')
+         summary=summary,
+         next_action=('review the summary and diff on the WebUI Staged '
+                      'proposals card, then Approve or Reject'),
+         note=('adoption is a separate human action (/adopt or governance '
+               'approve); this runner never adopts'))
     if not staged_path:
         return finish(1, 'INFRA_FAILED', detail='gate accepted but no staged path returned')
     return finish(0, 'STAGED',
-                  next_action='review ' + staged_path + ' then adopt via the WebUI /adopt endpoint')
+                  next_action=('review the summary/diff in the WebUI (or '
+                               'GET /proposal {proposal_id: %s}) then adopt '
+                               'via the /adopt endpoint'
+                               % str(Path(staged_path).stem)))
 
 
 if __name__ == '__main__':

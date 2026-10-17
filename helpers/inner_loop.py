@@ -229,6 +229,77 @@ _last_error: str | None = None
 # LLM call (mirror ab_harness._llm_judge_via_http - POST JSON, never raise)
 # ----------------------------------------------------------------------- #
 
+# v1.8.45 (re-audit R14): a deliberately broad credential probe used ONLY to
+# prove sanitisation actually happened before an egress. It is not the redactor
+# - `privacy._ASSIGNMENT_RE` is - it is the assertion that the redactor ran, so
+# that a silent no-op (the bug this replaces) fails loudly instead of shipping
+# raw rollout text to an external endpoint.
+_CREDENTIAL_PROBE = re.compile(
+    r"(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{20,}"
+    r"|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}"
+    r"|[A-Za-z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD)\s*[:=]\s*\S{8,})",
+    re.IGNORECASE)
+
+
+def _sanitize_payload(payload: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    """Return `payload` with every free-text field sanitized.
+
+    v1.8.45 (re-audit R14). The previous attempt called
+    `sanitize_rollout_records(payload["rollouts"])`, but
+    `_build_rollout_payload` emits `{task, trajectory, last_response,
+    outcome, failure_mode, skill_hint}` and has **no** `rollouts` key - so the
+    call received `None`, its result was discarded, and NOTHING was
+    sanitized. `trajectory` is a LIST, which the per-field
+    `isinstance(v, str)` filter skipped in any case.
+
+    `sanitize_rollout` already knows this shape: it redacts `task`,
+    `last_response` and `fragments_active_text` as strings, and walks
+    `trajectory` step-by-step applying the `include_tool_args` /
+    `include_tool_results` policy (both default to OFF, so `args` and
+    `result` are POPPED, not merely redacted). The payload's keys are a
+    subset of a rollout's, so it is the right primary path - and then any
+    string field it does not know about is redacted generically.
+    """
+    _pv = _privacy_module()
+    red = bool(settings.get("redact_secrets", True))
+    if _pv is None:
+        return dict(payload)
+
+    # Shape 1: the payload IS a rollout (`_build_rollout_payload` emits
+    # {task, trajectory, last_response, outcome, failure_mode, skill_hint}).
+    # `sanitize_rollout` walks `trajectory` step-by-step and applies the
+    # include_tool_args / include_tool_results policy, so it must see the
+    # whole record - handling the keys one at a time loses that policy.
+    if any(k in payload for k in ("task", "trajectory", "last_response",
+                                  "fragments_active_text")):
+        return _pv.sanitize_rollout(dict(payload), config=settings)
+
+    # Shape 2: a wrapper carrying a `rollouts` LIST. Each element goes
+    # through the list sanitizer; other free-text fields are redacted here.
+    out: dict[str, Any] = {}
+    for key, val in payload.items():
+        if key == "rollouts" and isinstance(val, list):
+            out[key] = _pv.sanitize_rollout_records(val, config=settings)
+        elif isinstance(val, str):
+            out[key] = _pv.redact_text(val, enabled=red)
+        else:
+            out[key] = val
+    return out
+
+
+def _privacy_module():
+    """The privacy helper, or None. Never raises."""
+    try:
+        from usr.plugins.skillopt.helpers import privacy as _pv  # type: ignore
+        return _pv
+    except Exception:
+        try:
+            from helpers import privacy as _pv  # type: ignore
+            return _pv
+        except Exception:
+            return None
+
+
 def _llm_suggest_via_http(
     payload: dict[str, Any], *, endpoint: str, model: str, timeout: float = 15.0,
 ) -> dict[str, Any]:
@@ -241,6 +312,69 @@ def _llm_suggest_via_http(
     import urllib.request  # local import to keep import-time fast
     import urllib.error
     body = {"model": model, "prompt": INNER_LOOP_PROMPT, **payload}
+    # v1.8.39 (audit M9): sanitize the rollout payload BEFORE it leaves the
+    # process. This path sends raw rollout text to an arbitrary configured
+    # endpoint, so it was an unsanitized egress - dormant only because
+    # `inner_loop_llm_endpoint` defaults to empty, which is a config accident
+    # rather than a control. Every other provider boundary in this plugin
+    # sanitizes and fails closed; this one must too, or enabling the endpoint
+    # silently starts shipping credentials.
+    #
+    # Fails CLOSED: if the privacy helper is unavailable, the request is not
+    # sent. The DOX rule is explicit — "if the privacy helper is unavailable,
+    # skip ... or refuse the provider call; never silently continue with raw
+    # inputs" — and an egress is exactly where that matters most.
+    try:
+        from usr.plugins.skillopt.helpers import privacy as _pv  # type: ignore
+    except Exception:
+        try:
+            from helpers import privacy as _pv  # type: ignore
+        except Exception:
+            return {"text": "", "error": "privacy_unavailable: refusing to send "
+                                          "raw rollout text to an external endpoint"}
+    try:
+        settings = _pv.privacy_settings()
+        if isinstance(payload, dict):
+            body = {"model": model, "prompt": INNER_LOOP_PROMPT}
+            # v1.8.48 (audit P1): keep the SANITISED payload. The no-op guard
+            # below compared the raw payload against the whole request body,
+            # which always carries two extra keys (`model`, `prompt`), so the
+            # two serialisations could never be equal and the guard was dead
+            # code - the very "sanitiser called and its result discarded"
+            # defect it exists to catch would have shipped silently.
+            _clean = _sanitize_payload(payload, settings)
+            body.update(_clean)
+
+            # Prove sanitisation actually happened. The bug this replaces was
+            # a SILENT no-op - a sanitize call whose result was discarded - so
+            # a no-op must be loud rather than ship raw text.
+            #
+            # The test is for the no-op itself, NOT a shape match on the
+            # body: an earlier version re-probed the serialised body for a
+            # credential SHAPE, which matched its own `[REDACTED]` marker
+            # (`API_KEY=[REDACTED]`) and so refused to send every time a task
+            # merely mentioned a key. If the SANITISED payload is identical to
+            # the raw one while the raw one held something worth redacting,
+            # sanitisation demonstrably did nothing - the only thing worth
+            # catching.
+            if settings.get("redact_secrets"):
+                try:
+                    _before = json.dumps(payload, default=str, sort_keys=True)
+                    _after = json.dumps(_clean, default=str, sort_keys=True)
+                except Exception:
+                    _before = _after = ""
+                if (_before and _before == _after
+                        and _CREDENTIAL_PROBE.search(_before)):
+                    return {"text": "", "error": "privacy_noop: sanitisation "
+                                                  "changed nothing while the "
+                                                  "payload held a credential "
+                                                  "pattern; refusing to send"}
+        else:
+            body = {"model": model, "prompt": INNER_LOOP_PROMPT,
+                    "payload": _pv.redact_text(str(payload))}
+    except Exception as e:
+        return {"text": "", "error": f"privacy_error: {type(e).__name__}: {e}"}
+
     try:
         req = urllib.request.Request(
             endpoint,
@@ -574,6 +708,34 @@ def _build_rollout_payload(rollout: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _bump_skip(rec: dict, counters: dict) -> bool:
+    """Count one consecutive skip for `rec`; retire it once the cap is hit.
+
+    v1.8.45 (re-audit R21): extracted so the retirement budget is shared by
+    both deferral paths - a rollout the harvester could not attribute, and a
+    rollout whose suggestion request hit a TRANSPORT error. Retiring is the
+    only thing that makes a rollout stop being retried, and it must be
+    reachable from an unreachable endpoint, not only from a "cannot attribute"
+    verdict; otherwise an endpoint outage either retries forever or, as before,
+    retires data silently.
+
+    Returns True when the rollout was retired.
+    """
+    rid_key = str(rec.get("id") or "")
+    skips = _skip_counts.get(rid_key, 0) + 1
+    if skips >= _skip_retire_after:
+        enqueue_suggestion(rec, "", skill_name=rec.get("skill_used"))
+        _skip_counts.pop(rid_key, None)
+        _save_skip_counts()
+        counters["skipped"] = int(counters.get("skipped") or 0) + 1
+        counters["retired"] = int(counters.get("retired") or 0) + 1
+        return True
+    _skip_counts[rid_key] = skips
+    _save_skip_counts()
+    counters["skipped"] = int(counters.get("skipped") or 0) + 1
+    return False
+
+
 def inner_loop_tick(llm_endpoint: str | None = None) -> dict[str, Any]:
     """One tick of the background worker.
 
@@ -681,15 +843,7 @@ def inner_loop_tick(llm_endpoint: str | None = None) -> dict[str, Any]:
             # permanently. The outer loop treats an empty suggestion as a
             # skip, so retiring has no adoption effect.
             rid_key = str(rec.get("id") or f.name)
-            skips = _skip_counts.get(rid_key, 0) + 1
-            if skips >= _skip_retire_after:
-                enqueue_suggestion(rec, "", skill_name=rec.get("skill_used"))
-                _skip_counts.pop(rid_key, None)
-                _save_skip_counts()
-            else:
-                _skip_counts[rid_key] = skips
-                _save_skip_counts()
-            counters["skipped"] += 1
+            _bump_skip(rec, counters)
             continue
         # No endpoint -> deterministically enqueue a keyword-stub
         # suggestion so the queue is non-empty in tests and offline
@@ -710,16 +864,30 @@ def inner_loop_tick(llm_endpoint: str | None = None) -> dict[str, Any]:
                 counters["errors"] += 1
                 counters["last_error"] = resp["error"]
                 _last_error = resp["error"]
-                # Don't re-attempt this rollout on the next tick -
-                # we just hit the same LLM-unreachable error. Mark it
-                # done by enqueueing a stub. The outer loop will see
-                # an empty suggestion and skip it.
-                enqueue_suggestion(rec, "", skill_name=rec.get("skill_used"))
+                # v1.8.45 (re-audit R21): a TRANSPORT ERROR IS NOT A
+                # COMPLETION. This used to enqueue an empty suggestion, and
+                # because an empty suggestion is exactly how "the model had
+                # no useful idea" is represented, the rollout was marked done
+                # and its contribution to the training signal was retired
+                # PERMANENTLY - with no retry, no error budget, and nothing
+                # distinguishing "we asked and it had nothing" from "we
+                # never got to ask".
+                #
+                # So the two cases are now separate. A real error does NOT
+                # enqueue; the rollout stays awaiting a suggestion and is
+                # retried on a later tick, bounded by the same
+                # `_skip_retire_after` counter that retires a rollout the LLM
+                # has genuinely declined. An unreachable endpoint therefore
+                # costs retries, not data.
+                counters["transport_errors"] = int(
+                    counters.get("transport_errors") or 0) + 1
+                _bump_skip(rec, counters)
                 continue
             suggestion, conf_out, fm_out = _extract_suggestion(resp.get("text") or "")
             if not suggestion:
-                # The LLM said "no useful suggestion". Enqueue a
-                # no-op so we don't re-suggest on every tick.
+                # The LLM was reached and said "no useful suggestion".
+                # Enqueue a no-op so we don't re-suggest on every tick -
+                # this one really IS a completed judgement.
                 enqueue_suggestion(rec, "", skill_name=rec.get("skill_used"))
                 counters["skipped"] += 1
                 continue

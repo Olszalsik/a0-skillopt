@@ -224,6 +224,20 @@ def _truncate(s: str, n: int = 400) -> str:
     return s[: n - 1] + "…"
 
 
+def _threshold_or_default(value: Any, default: float) -> float:
+    """`default` only when the value is absent or unusable - never on 0.0.
+
+    v1.8.48 (audit U5). An explicit `0` is a value, not an absence: `or <default>`
+    is banned for numeric settings by the plugin's own contract.
+    """
+    if value is None:
+        return float(default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _safe_call(*fns):
     """Return the first fn() that produces a non-None value; tolerate errors."""
     for fn in fns:
@@ -442,7 +456,13 @@ def execute(*args, **kwargs):  # type: ignore[no-untyped-def]
         if (
             rm_result.get("source") == "model"
             and float(rm_result.get("confidence") or 0.0)
-            >= float(rm_result.get("prefer_model_above") or 0.6)
+            # v1.8.48 (audit U5): an explicit calibrated threshold of 0.0 is a
+            # VALUE ("always trust the model"), and `_config_prefer_above`
+            # returns exactly that when the operator sets
+            # `reward_model_prefer_above: 0`. `or 0.6` collapsed it back to the
+            # hardcoded 0.6, so the comment below about removing the hardcoded
+            # threshold was not true. Default only on None/absent.
+            >= _threshold_or_default(rm_result.get("prefer_model_above"), 0.6)
         ):
             # v1.8.1: use the calibrated threshold the reward helper computes
             # (calibration.json > reward_model_prefer_above > 0.6) instead of

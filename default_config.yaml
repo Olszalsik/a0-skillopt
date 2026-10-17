@@ -71,6 +71,17 @@ gate_max_shrink_ratio: 0.5
 # 5pp is a reasonable default; set to 0 to disable (legacy behavior).
 gate_min_improvement_pp: 5.0
 
+# Require a triple-backtick example block in proposals from the DIRECT
+# optimizer. The official Sleep engine always emits one and its proposals
+# keep that requirement unconditionally (v2026-10-13 gate-contract fix);
+# the direct optimizer emits prose skills and never emits a code block, so
+# the legacy hard check rejected 12 of 13 direct-engine drain attempts
+# during 2026-10-05..10-13 and autonomy adopted nothing. Default false:
+# direct-engine proposals still pass the framework-schema gate (valid YAML
+# frontmatter with name/description), the markdown-header check and
+# gate_min_chars. Set true to restore the legacy whole-file requirement.
+direct_engine_require_example_block: false
+
 # =====================================================================
 # LOCAL REPLAY GATE (v1.7.0 — Solution C, Phase C2)
 # =====================================================================
@@ -121,6 +132,11 @@ replay_real_max_tasks: 4
 # runs only after a real replay produced usable per-task pairs; the report
 # is informational and never changes gate/adoption decisions.
 replay_evalkit_enabled: false
+# Optional reviewed, independent task set for a second descriptive replay.
+# The file must be a JSON list of {"id": "stable-id", "task": "..."};
+# keep these tasks out of the rollouts used to optimize skills.
+replay_evalkit_tasks_file: ""
+replay_evalkit_max_tasks: 4
 # v1.8.19 (P3, audit RC4): the MOCK executor is a deterministic keyword
 # relevance heuristic, not a real replay - its numeric lift on real
 # proposals is noise (the Sep-19 real proposal scored 2.08pp and was
@@ -518,6 +534,51 @@ cycle_history_include_skipped: true
 # Per-skill opt-out marker: usr/skills/<name>/.skillopt.optout
 # Per-skill opt-in marker: usr/skills/<name>/.skillopt.optin
 governance:
+  # v1.8.34: THE operating mode. This is the single operator-facing switch
+  # for manual vs autonomous behaviour.
+  #
+  #   manual     - improvements are proposed and wait for an explicit human
+  #                decision (the safe default, and what ships)
+  #   autonomous - improvements that pass every gate are adopted into live
+  #                SKILL.md files without asking
+  #
+  # `auto_adopt` (top level) is the LEGACY ALIAS and is read only when this
+  # key is absent, so an existing install keeps its behaviour. Do not set
+  # both: `evolution_mode` wins, and `auto_adopt` is then ignored. An
+  # invalid value falls back to manual AND is logged to
+  # logs/runs/auto_loop.log naming the value and the valid set - a switch
+  # that silently does nothing is the defect class this plugin keeps
+  # regressing into.
+  #
+  # The kill switch `logs/runs/.autonomous_pause` overrides both: create it
+  # to stop autonomous writes without editing config, delete it to resume.
+  evolution_mode: manual
+  # v1.8.34: autonomous safety rails. These bound HOW MUCH autonomy may do.
+  # They are independent of the mode: keeping the mode on with a cap of 0 is
+  # a legitimate "on but frozen" state.
+  #
+  # autonomous_max_adoptions_per_day matters most: `auto_adopt_max_per_tick`
+  # is 5 and a tick is every 30 min, so the theoretical ceiling on writes to
+  # live skills was ~240/day with no daily bound at all. This is that bound.
+  autonomous_max_adoptions_per_day: 5
+  autonomous_max_adoptions_per_skill_per_day: 2
+  # Re-run one post-adopt held-out confirmation through the real-gate
+  # executor and roll back automatically when it regresses.
+  autonomous_require_post_adopt_check: true
+  # Refuse to auto-adopt a proposal built from a thinner rollout base.
+  # DEFAULT 0 = inert, OFF by default, and that is deliberate. A raw
+  # rollout COUNT is a weak proxy for justification - the held-out gate
+  # measurement is the real evidence - and a non-zero default has a
+  # concrete failure mode: `rollout_retention_days` deletes rollout files,
+  # so a pruned or rotated rollout dir would block EVERY autonomous
+  # adoption forever, with proposals parked in staging and no obvious
+  # cause. Set it only if you control retention.
+  autonomous_min_evidence_rollouts: 0
+  # Record every autonomous adoption in governance.log with
+  # decided_by="autonomous", so a machine decision stays distinguishable
+  # from a human one forever. That distinction is the price of the
+  # off-by-default guarantee; do not disable it.
+  autonomous_audit: true
   default_policy:
     mode: opt_out
     min_interval_seconds: 3600
@@ -529,3 +590,62 @@ governance:
     # human approves it via /governance_approve. Set false to leave new
     # skills inert until a marker is hand-created.
     auto_optin_new_skills: true
+
+# ---------------------------------------------------------------------- #
+# v1.8.34: informed approval - the proposal summary shown to a reviewer
+# ---------------------------------------------------------------------- #
+#
+# Every staged proposal gets a bounded, display-only summary sidecar
+# (`staging/<skill>.md.summary.json`) carrying an intent classification, a
+# one-paragraph rationale, the gate evidence, and a unified diff against
+# the live SKILL.md. Read by helpers/proposal_view.py ONLY.
+#
+# This block NEVER gates. `intent` is advisory text: nothing in
+# sleep_runner.validate_proposal or governance.check_skill_eligible reads
+# it, so a wrong or missing classification cannot change whether a proposal
+# is adoptable. The sizes exist so a config typo cannot produce a
+# multi-megabyte HTTP response; the helper additionally clamps every value
+# to a hard ceiling regardless of what is configured here.
+proposal_summary:
+  # Master switch. Off means /staged and /proposal report "no summary" and
+  # no sidecar is written; the approval flow still works, just blind.
+  enabled: true
+  # Write the sidecar next to the proposal. Off computes on every read
+  # (correct, just slower) - useful for a debugging run.
+  persist: true
+  summary_max_chars: 600
+  diff_max_lines: 400
+  diff_max_chars: 20000
+  # LLM refinement of the intent block. OFF by default: the deterministic
+  # heuristic is what the smoke suite exercises, and it keeps the summary
+  # path free of network + cost. When enabled, a hook failure degrades to
+  # the heuristic result with source="heuristic" - never to an error.
+  #
+  # v1.8.44 (audit R19): the refinement runs the hook on a worker thread
+  # with a HARD DEADLINE - a hanging hook previously hung the staging
+  # write path indefinitely, and this parameter was documented but never
+  # read. An over-running hook is abandoned (a daemon thread cannot be
+  # cancelled) and the heuristic stands. Abandoned hooks are capped by a
+  # module-level slot limit so they cannot accumulate.
+  intent_llm_enabled: false
+  intent_llm_timeout_s: 20
+  intent_llm_timeout_s: 20
+
+# ---------------------------------------------------------------------- #
+# v1.8.44 (audit R5): per-request timeout for the optimizer's LLM call.
+# ---------------------------------------------------------------------- #
+# `direct_optimizer._call_llm` built its OpenAI client without a timeout,
+# inheriting the SDK's 600 s read timeout AND its own 2 internal retries.
+# That call runs inside `llm_judge`'s single-slot semaphore, so one
+# non-responding endpoint stopped every other judge caller - and
+# `judge_client.judge_rollouts` is a synchronous loop called inline by
+# `run_sleep_cycle.py`, so a single cycle could hang for the whole backlog.
+#
+# A long timeout is not "slow" here, it is "the judge queue is stopped".
+# The SDK retry loop is disabled (max_retries=0) because llm_judge owns the
+# retry policy and owns it better: pacing-aware, bounded, and 429-aware.
+#
+# Also settable per-deploy as SKILLOPT_LLM_TIMEOUT_S; this key wins.
+# Clamped to (0, 600]; a non-positive value would mean "block forever",
+# which is the failure this fixes.
+llm_call_timeout_s: 60

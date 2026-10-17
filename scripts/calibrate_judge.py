@@ -78,11 +78,27 @@ def cohen_kappa(y1: list[str], y2: list[str]) -> float | None:
 # ----------------------------------------------------------------------- #
 
 def _make_judge(use_stub: bool, use_http: bool):
-    """Return a judge callable. Uses the production LLM judge by default
-    (POSTs to SKILLOPT_JUDGE_ENDPOINT). With --use-stub-judge, falls
-    back to the deterministic keyword stub from ab_harness. With
-    --use-http-judge, forces the HTTP path even if SKILLOPT_JUDGE_ENDPOINT
-    is unset (will fail at call time with a clear error)."""
+    """Return a judge callable, and NAME it so the report cannot lie.
+
+    v1.8.44 (re-audit R23): the docstring here claimed "Uses the production
+    LLM judge by default (POSTs to SKILLOPT_JUDGE_ENDPOINT)" while BOTH
+    no-flag branches returned `ab_harness._default_judge_fn` - the
+    deterministic keyword stub. So `python scripts/calibrate_judge.py` printed
+    `OK: judge is calibrated (kappa ...)` about the STUB, and an operator had
+    no way to tell from the output that nothing about the real judge had been
+    measured.
+
+    Returns `(callable, description)`. The description is printed with the
+    verdict, so the report always states WHICH judge produced the numbers.
+    Offline-by-default is a legitimate choice - the script is meant to run
+    without a provider - but it must be visible, not implied.
+
+    * `--use-stub-judge` — the deterministic keyword stub. Honest smoke test
+      of the harness plumbing; says nothing about judge quality.
+    * `--use-http-judge` — POSTs to SKILLOPT_JUDGE_ENDPOINT.
+    * default — the HTTP judge when `SKILLOPT_JUDGE_ENDPOINT` is set,
+      otherwise the stub, and the report says which was used.
+    """
     # When this script is run directly (not via `python -m`), the
     # plugin root is NOT on sys.path. Add it so `from helpers.ab_harness
     # import ...` works. Also try the production `usr.plugins.*` path
@@ -98,16 +114,27 @@ def _make_judge(use_stub: bool, use_http: bool):
     except Exception:
         from helpers import ab_harness as _ab  # type: ignore
     if use_stub:
-        return _ab._default_judge_fn
+        return _ab._default_judge_fn, "the DETERMINISTIC KEYWORD STUB (offline)"
     if use_http:
         # Force the HTTP path. set_judge_mode("http") wires a closure
         # that POSTs JUDGE_PROMPT to SKILLOPT_JUDGE_ENDPOINT. If the
         # env var is unset it raises with a clear message.
         _ab.set_judge_mode("http")
-        return _ab.get_judge_fn()  # the HTTP-bound closure
-    # Default: the keyword stub. Production would set judge_mode=http
-    # via the env var; calibrate_judge runs offline by default.
-    return _ab._default_judge_fn
+        return _ab.get_judge_fn(), "the HTTP LLM judge (SKILLOPT_JUDGE_ENDPOINT)"
+    # Default: use the real judge when one is configured, else the stub -
+    # and SAY which, so the kappa is never mistaken for a measurement of the
+    # production judge.
+    try:
+        import os as _os
+        endpoint = (_os.environ.get("SKILLOPT_JUDGE_ENDPOINT") or "").strip()
+    except Exception:
+        endpoint = ""
+    if endpoint:
+        _ab.set_judge_mode("http")
+        return _ab.get_judge_fn(), "the HTTP LLM judge (SKILLOPT_JUDGE_ENDPOINT)"
+    return _ab._default_judge_fn, (
+        "the DETERMINISTIC KEYWORD STUB (offline - SKILLOPT_JUDGE_ENDPOINT "
+        "is unset, so this run measured NOTHING about the production judge)")
 
 
 # ----------------------------------------------------------------------- #
@@ -256,17 +283,38 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     # 3. Run the judge
-    judge = _make_judge(args.use_stub_judge, args.use_http_judge)
+    judge, judge_desc = _make_judge(args.use_stub_judge, args.use_http_judge)
+    print(f"[{PLUGIN_NAME}] judge under test: {judge_desc}")
     judge_labels: list[str] = []
     human_labels: list[str] = []
     judge_raised = 0
     for rec in pairs:
-        # Build a synthetic rollout dict the judge accepts
-        rollout = {"task": rec["task"], "last_response": rec["response_b"]}
-        # Score A vs B heuristically by response length (the keyword stub
-        # would produce this anyway, so this keeps the demo deterministic).
-        score_a = 0.4 if len(rec["response_a"]) < 40 else 0.5
-        score_b = 0.6 if len(rec["response_b"]) < 40 else 0.7
+        # Build a synthetic rollout dict the judge accepts.
+        #
+        # v1.8.44 (re-audit R23): this used to be
+        #   {"task": rec["task"], "last_response": rec["response_b"]}
+        # so ARM A WAS NEVER SENT. `human_label` is a comparison BETWEEN
+        # responses A and B, and the HTTP judge only ever saw B - so the
+        # measurement never had the arm it was supposed to judge.
+        # Both arms now go in, under the keys the judge prompt reads.
+        rollout = {
+            "task": rec["task"],
+            "response_a": rec["response_a"],
+            "response_b": rec["response_b"],
+            "last_response": rec["response_b"],
+        }
+        # Score A vs B by response length.
+        #
+        # v1.8.44 (R23): the old scores were 0.5/0.7 for a long answer and
+        # 0.4/0.6 for a short one, so `score_b - score_a` was ALWAYS positive
+        # and the stub answered "win" for every pair. The reported kappa was
+        # then a function of the human label distribution ALONE - completely
+        # independent of judge quality. The gap is now derived from the
+        # lengths, so a pair whose two answers are similar scores close
+        # together and the judge has something real to discriminate.
+        la, lb = len(rec["response_a"]), len(rec["response_b"])
+        score_a = min(1.0, 0.3 + la / 400.0)
+        score_b = min(1.0, 0.3 + lb / 400.0)
         try:
             v = judge(rollout, score_a, score_b)
         except Exception as e:
@@ -317,7 +365,19 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{PLUGIN_NAME}]     {h:5s}  " + "  ".join(f"{c:>4s}" for c in row))
     # Verdict
     if kappa >= args.min_kappa:
-        print(f"[{PLUGIN_NAME}] OK: judge is calibrated (kappa {kappa:.3f} >= {args.min_kappa})")
+        # v1.8.44 (R23): the verdict must name the judge it measured. A kappa
+        # computed against the offline stub is a harness smoke test, not
+        # evidence about the production judge, and the old line said "OK: judge
+        # is calibrated" for both.
+        if "STUB" in judge_desc:
+            print(f"[{PLUGIN_NAME}] HARNESS OK (kappa {kappa:.3f} >= "
+                  f"{args.min_kappa}) - but this ran against {judge_desc}.")
+            print(f"[{PLUGIN_NAME}]     Nothing was measured about the "
+                  f"production LLM judge. Set SKILLOPT_JUDGE_ENDPOINT (or pass "
+                  f"--use-http-judge) and re-run to calibrate the real judge.")
+        else:
+            print(f"[{PLUGIN_NAME}] OK: judge is calibrated (kappa "
+                  f"{kappa:.3f} >= {args.min_kappa}) against {judge_desc}")
         return 0
     print(f"[{PLUGIN_NAME}] FAIL: judge is unreliable (kappa {kappa:.3f} < {args.min_kappa})", file=sys.stderr)
     return 1

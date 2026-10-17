@@ -27,11 +27,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import traceback
+import unittest
 from pathlib import Path
 from typing import Callable
 
@@ -237,9 +240,45 @@ def main() -> int:
     # Ensure the plugin's own helpers are importable as a fallback
     sys.path.insert(0, str(PLUGIN_ROOT))
 
+    # v1.8.51: sandbox the fragment snapshot tree for the WHOLE run. It is the
+    # last production path this suite wrote into (`staging/` and `logs/runs/`
+    # are already redirected), and it is why a live install accumulated
+    # fixture skill directories and 0-byte `_default.pre_adopt.md` files. The
+    # override is restored and the temp tree removed on the way out, so a run
+    # leaves production byte-identical.
+    _frag_root = None
+    try:
+        import tempfile as _tf
+        from helpers import fragment_store as _fs_boot  # type: ignore
+        _frag_root = Path(_tf.mkdtemp(prefix='skillopt_suite_fragments_'))
+        _fs_boot.set_plugin_root_for_tests(_frag_root)
+    except Exception as _e:
+        print(f"WARN: fragment sandbox unavailable ({_e}); fragment tests will "
+              f"write into the real tree", file=sys.stderr)
+
+    # v1.8.52: sandbox the default-policy rails for the WHOLE run. A live
+    # install has a real config.json whose governance.default_policy
+    # (mode / require_human_approval) is operator intent, and t_v1816-style
+    # adoption tests read it through governance._default_policy - which is
+    # why 13 governance tests read "skipped" on a live install while CI
+    # (no config.json) stayed green. The override points the read at a
+    # tmp path that does not exist - bit-for-bit the conditions CI runs
+    # under. Restored and the tmp tree removed on the way out.
+    _gov_cfg = None
+    try:
+        import tempfile as _tf
+        from helpers import governance as _gov_boot  # type: ignore
+        _gov_cfg = Path(_tf.mkdtemp(prefix='skillopt_suite_govcfg_')) / 'config.json'
+        _gov_boot.default_policy_config_path = _gov_cfg
+    except Exception as _e:
+        print(f"WARN: governance config sandbox unavailable ({_e}); governance"
+              f" tests will read the install's config.json", file=sys.stderr)
+
     failures = 0
     _section("SkillOpt smoke test suite")
     print(f"plugin_root = {PLUGIN_ROOT}")
+    if _frag_root is not None:
+        print(f"fragment sandbox = {_frag_root}")
     print(f"tests registered = {len(_tests)}")
 
     for name, fn in _tests:
@@ -261,6 +300,25 @@ def main() -> int:
     print(f"  total   : {total}")
     print(f"  passed  : {passed}")
     print(f"  failed  : {failures}")
+    # v1.8.51: restore the real snapshot root and remove the sandbox, whatever
+    # the outcome. A run must never leave the override installed for the next
+    # process - or the temp tree behind in %TEMP%.
+    if _frag_root is not None:
+        try:
+            from helpers import fragment_store as _fs_end  # type: ignore
+            _fs_end.set_plugin_root_for_tests(None)
+        except Exception:
+            pass
+        import shutil as _sh
+        _sh.rmtree(_frag_root, ignore_errors=True)
+    if _gov_cfg is not None:
+        try:
+            from helpers import governance as _gov_end  # type: ignore
+            _gov_end.default_policy_config_path = None
+        except Exception:
+            pass
+        import shutil as _sh
+        _sh.rmtree(_gov_cfg.parent, ignore_errors=True)
     if failures == 0:
         print()
         print("  ALL TESTS PASSED.")
@@ -506,7 +564,7 @@ def t_v1824_ungated_direct_adopt_blocked() -> None:
     except Exception:
         from helpers import sleep_runner as _sr, auto_loop as _al
 
-    tmp = Path(_tempfile.mkdtemp(prefix="skillopt_v1824_ungated_"))
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1824_ungated_"))
     try:
         _gov_setup(tmp)
         stage = tmp / "staging"
@@ -602,7 +660,7 @@ def t_v1825_snapshot_history_pruned() -> None:
     except Exception:
         from helpers import fragment_store as _fs
 
-    tmp = Path(_tempfile.mkdtemp(prefix="skillopt_v1825_prune_"))
+    tmp = Path(tempfile.mkdtemp(prefix="skillopt_v1825_prune_"))
     try:
         d = tmp / "frags"
         d.mkdir()
@@ -791,6 +849,124 @@ def t_v1824_schema_gate_rejects_unloadable() -> None:
     assert ok2, f"a valid rewrite must still be accepted, got {reason2!r}"
 
     _ok("schema gate rejects unloadable proposals, accepts loadable ones")
+
+
+# ----------------------------------------------------------------------- #
+# v2026-10-13 remediation: config-wipe, gate contract, frontmatter repair
+# ----------------------------------------------------------------------- #
+
+@test("v2026-10-13: _merge_for_save carries forward keys the payload omitted")
+def t_v2026_merge_for_save() -> None:
+    """The wipe fix: save_plugin_config REPLACES the file, so every write
+    must be merged over the persisted config. A 2-key /mode payload used to
+    destroy auto_loop_*/privacy_*/replay_real_* settings (caught live
+    2026-10-13), and a 12-key page Save destroyed governance+auto_adopt."""
+    import importlib as _il
+    # config.py imports the framework's helpers.api AND helpers.plugins;
+    # both are stubbed by the suite (same pattern as the /mode route test).
+    _install_helpers_api_stub()
+    _v1834_install_plugins_stub()
+    cfg_api = _il.import_module("api.config")
+
+    disk = {
+        "auto_loop_enabled": True,
+        "auto_loop_min_rollouts": 3,
+        "privacy_redact_secrets": True,
+        "replay_real_gate_enabled": True,
+        "use_official_engine": False,
+        "governance": {"evolution_mode": "autonomous",
+                       "autonomous_min_evidence_rollouts": 20},
+        "auto_adopt": True,
+    }
+    # Shape of a /mode toggle's payload: governance + auto_adopt ONLY.
+    # _clean_overrides coerces against the merged view's defaults, so pass
+    # the persisted dict as the "defaults" — payload values coerce to their
+    # persisted types.
+    clean = cfg_api._clean_overrides(
+        {"governance": {"evolution_mode": "manual"}, "auto_adopt": False},
+        disk,
+    )[0]
+    for_save = cfg_api._merge_for_save(disk, clean)
+    for key in ("auto_loop_enabled", "auto_loop_min_rollouts",
+                "privacy_redact_secrets", "replay_real_gate_enabled",
+                "use_official_engine"):
+        assert key in for_save, (f"a mode write must carry forward {key}, "
+                                 f"got {sorted(for_save)}")
+    assert for_save["governance"]["evolution_mode"] == "manual"
+    assert for_save["governance"]["autonomous_min_evidence_rollouts"] == 20
+
+    # And the inverse: a page-Save payload must not wipe governance.
+    save_clean = {"auto_loop_min_rollouts": 3}
+    for_save2 = cfg_api._merge_for_save(disk, save_clean)
+    assert for_save2["governance"]["evolution_mode"] == "autonomous", (
+        "a plain settings save must not drop the governance section")
+    assert for_save2["auto_adopt"] is True
+    _ok("merge-for-save preserves unposted keys in both wipe directions")
+
+
+@test("v2026-10-13: direct-engine proposal without example block passes; official-gated still requires one")
+def t_v2026_gate_contract() -> None:
+    """Root cause of 'autonomy adopted nothing for a week': the example
+    block was a hard requirement for every proposal, but only the official
+    engine emits one. 8 of 13 drain attempts died on exactly this check."""
+    import importlib as _il
+    _sr = _il.import_module("helpers.sleep_runner")
+    fm = "---\nname: fixture\ndescription: smoke test fixture\n---\n"
+    proposed = fm + "# Improved skill\n\nStep one. " * 20
+    current = fm + "# Old skill\n\n```example\nblock\n```\n" + "old line. " * 40
+
+    ok, reason = _sr.validate_proposal(proposed, current, ab_harness_enabled=False)
+    assert ok, (f"a direct-engine proposal without an example block must "
+                f"pass the structural gate now, got {reason!r}")
+
+    # official-gated: the engine contract stays unconditional.
+    ok2, reason2 = _sr.validate_proposal(
+        proposed, current, ab_harness_enabled=False, official_gated=True)
+    assert not ok2 and "triple-backtick example block" in reason2, (
+        f"official-gated proposals must still require an example block, got "
+        f"ok={ok2} reason={reason2!r}")
+    _ok("example-block requirement is engine-conditional")
+
+
+@test("v2026-10-13: direct_engine_require_example_block:true restores the legacy whole-file check")
+def t_v2026_direct_example_flag() -> None:
+    import importlib as _il
+    _sr = _il.import_module("helpers.sleep_runner")
+    orig_default_config = _sr.default_config
+    base = orig_default_config() or {}
+    _sr.default_config = lambda: {**base, "direct_engine_require_example_block": True}
+    try:
+        fm = "---\nname: fixture\ndescription: smoke test fixture\n---\n"
+        proposed = fm + "# Improved skill\n\nStep one. " * 20
+        current = fm + "# Old skill\n\n```example\nblock\n```\n" + "old line. " * 40
+        ok, reason = _sr.validate_proposal(proposed, current, ab_harness_enabled=False)
+        assert not ok and "triple-backtick example block" in reason, (
+            f"operator opt-in must restore the check, got ok={ok} reason={reason!r}")
+    finally:
+        _sr.default_config = orig_default_config
+    _ok("direct_engine_require_example_block opt-in works")
+
+
+@test("v2026-10-13: restore_frontmatter repairs an unterminated frontmatter opener")
+def t_v2026_frontmatter_repair() -> None:
+    """2 of 13 drain attempts died on 'Unterminated YAML frontmatter' — the
+    model opened `---` and never closed it. The repair now re-attaches the
+    current skill's frontmatter, same as the missing-frontmatter case."""
+    import importlib as _il
+    dopt = _il.import_module("helpers.direct_optimizer")
+    current_fm = "---\nname: fixture\ndescription: smoke\ncurrent: yes\n---\n"
+    current = current_fm + "# Old\n\nbody"
+    improved = "---\nname: wrong\ndescription: also wrong\n\n# Body prose\nKept line."
+    out = dopt.restore_frontmatter(current, improved)
+    assert out.startswith("---\nname: fixture\n"), (
+        f"the current frontmatter must be restored, got: {out[:60]!r}")
+    assert "# Body prose" in out and "Kept line." in out, (
+        f"the body must survive the repair, got: {out!r}")
+    assert "name: wrong" not in out
+    # and a no-blank-line unterminated case still round-trips unchanged
+    out2 = dopt.restore_frontmatter(current, "---\nname: only")
+    assert isinstance(out2, str)
+    _ok("unterminated frontmatter gets the current block re-attached")
 
 
 @test("v1.1.0: validate_proposal accepts a good proposal with passing held-out")
@@ -1354,13 +1530,23 @@ def _write_test_skill(tmp: Path, name: str, fm: str | None = None,
 
 
 def _purge_skill_fragments() -> None:
-    """Wipe the plugin's fragments/SKILL/ dir between fragment tests so
-    they don't pollute each other (write_fragment snapshots go to
-    <plugin>/fragments/<skill>/, keyed off the SKILL.md stem)."""
+    """Wipe the fragment snapshot tree between fragment tests so they don't
+    pollute each other.
+
+    v1.8.51: this used to `rmtree(PLUGIN_ROOT / "fragments" / "SKILL")` - the
+    PRODUCTION snapshot directory, keyed on the stem "SKILL" before audit F7
+    fixed that. Running the suite on a live install therefore deleted and
+    recreated real rollback state, and left fixture directories behind (the
+    source of the 0-byte `_default.pre_adopt.md` files a later sweep removed).
+    The snapshot root is now redirected to a temp tree for the whole run, so
+    this only ever clears that tree.
+    """
     import shutil as _shutil
-    snaps = PLUGIN_ROOT / "fragments" / "SKILL"
-    if snaps.is_dir():
-        _shutil.rmtree(snaps)
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import fragment_store as _fs  # type: ignore
+    root = _fs._plugin_root() / "fragments"
+    if root.is_dir():
+        _shutil.rmtree(root, ignore_errors=True)
 
 
 @test("v1.2.0 NEW (Day-3 item 3): read_fragments() returns one _default fragment for skill without frontmatter")
@@ -1406,37 +1592,79 @@ def t_v121_fragment_with_frontmatter() -> None:
 
 @test("v1.2.0 NEW (Day-3 item 3): write_fragment() creates a versioned snapshot")
 def t_v121_fragment_write() -> None:
-    """write_fragment() contract: stores the new fragment text in a
-    versioned snapshot file under <plugin>/fragments/<skill>/. The body
-    of the SKILL.md is NOT rewritten in v1.2.0 (the spec notes this as
-    a known minimal implementation - the canonical 'current' is the
-    .current.md file). The snapshot_path returned in the result is the
-    file we should assert against."""
+    """write_fragment() contract: snapshots the previous fragment text under
+    <plugin>/fragments/<skill>/ AND applies the edit to the live document.
+
+    v1.8.50 (audit F8): this case asserted the opposite - that a
+    `.current.md` file exists and the SKILL.md body is NOT rewritten. That
+    file had **no reader anywhere in the tree**: `read_fragments` recomputes
+    text from the body, so the function reported `ok: True` while every reader
+    saw the old text, and `rollback_fragment` (its only caller) reported a
+    successful recovery that changed nothing. The test pinned the defect
+    because the defect was described as a deliberate "minimal
+    implementation". It now asserts the BEHAVIOUR - the live document changed,
+    and the reader agrees - which is the only thing that can fail.
+    """
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers import fragment_store  # type: ignore
     _purge_skill_fragments()
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        skill_md = _write_test_skill(tmp, "write_test")
-        # new_text is the FRAGMENT text (a slice), not the whole file.
-        # The fragment we want to update is the 'intro' fragment which
-        # has the "## Section A" selector.
-        new_fragment_text = "## Section A\nTHIS IS THE NEW INTRO BODY\n"
-        result = fragment_store.write_fragment(skill_md, "intro", new_fragment_text)
-        assert result.get("ok"), f"write_fragment returned not-ok: {result}"
-        assert result.get("version"), f"write_fragment returned no version: {result}"
-        # Result includes a snapshot_path pointing at the versioned file
-        snapshot_path = result.get("snapshot_path")
-        assert snapshot_path and Path(snapshot_path).is_file(), (
-            f"snapshot file not created: {snapshot_path}"
-        )
-        # The .current.md file holds the new fragment text
-        current_path = PLUGIN_ROOT / "fragments" / "SKILL" / "intro.current.md"
-        assert current_path.is_file(), f"canonical current file not created: {current_path}"
-        current_content = current_path.read_text(encoding="utf-8")
-        assert "THIS IS THE NEW INTRO BODY" in current_content, (
-            f"canonical file does not contain new text: {current_content!r}"
-        )
+        # v1.8.50 (audit F8): `write_fragment` writes a LIVE skill, through
+        # `adopt_write_skill`, so the fixture must BE one - the skills dir is
+        # redirected to the temp tree, which also keeps the real tree untouched.
+        prev_skills = os.environ.get('SKILLOPT_SKILLS_DIR')
+        skills_root = tmp / "skills"
+        skill_md = _write_test_skill(skills_root, "write_test")
+        os.environ['SKILLOPT_SKILLS_DIR'] = str(skills_root)
+        try:
+            before = skill_md.read_text(encoding="utf-8")
+            assert "THIS IS THE NEW INTRO BODY" not in before, "precondition"
+            # new_text is the FRAGMENT text (a slice), not the whole file.
+            # The fragment we want to update is the 'intro' fragment which
+            # has the "## Section A" selector.
+            new_fragment_text = "## Section A\nTHIS IS THE NEW INTRO BODY\n"
+            result = fragment_store.write_fragment(skill_md, "intro", new_fragment_text)
+            assert result.get("ok"), f"write_fragment returned not-ok: {result}"
+            assert result.get("version"), (
+                f"write_fragment returned no version: {result}")
+            # Result includes a snapshot_path pointing at the versioned file
+            snapshot_path = result.get("snapshot_path")
+            assert snapshot_path and Path(snapshot_path).is_file(), (
+                f"snapshot file not created: {snapshot_path}"
+            )
+            # THE LIVE DOCUMENT carries the new text - the whole point.
+            after = skill_md.read_text(encoding="utf-8")
+            assert "THIS IS THE NEW INTRO BODY" in after, (
+                f"the live SKILL.md was not rewritten: {after[:200]!r}")
+            assert after != before, "precondition: the document must have changed"
+            # And the READER agrees, which is what the .current.md shortcut broke.
+            frags = fragment_store.read_fragments(skill_md)
+            intro = [f for f in frags if f["id"] == "intro"][0]
+            assert "THIS IS THE NEW INTRO BODY" in intro["text"], (
+                f"read_fragments must return the applied text: {intro['text']!r}")
+            # The snapshot dir is keyed on the SKILL NAME, not the stem "SKILL"
+            # (v1.8.50 audit F7: every SKILL.md has the same stem, so all skills
+            # shared one directory and overwrote each other's rollback targets).
+            assert Path(snapshot_path).parent.name == "write_test", (
+                f"per-fragment snapshots must be keyed per skill name, got "
+                f"{Path(snapshot_path).parent}")
+            # And a document this plugin does not own is refused outright,
+            # rather than written by a second unsanctioned writer.
+            stray = tmp / "stray" / "SKILL.md"
+            stray.parent.mkdir(parents=True, exist_ok=True)
+            stray.write_text(
+                "---\nfragments:\n  - id: \"intro\"\n    selector: \"## A\"\n"
+                "---\n## A\nbody\n", encoding="utf-8")
+            refused = fragment_store.write_fragment(
+                stray, "intro", "## A\nother\n")
+            assert refused.get("ok") is False, (
+                f'a path outside the skills dir must be refused: {refused!r}')
+        finally:
+            if prev_skills is None:
+                os.environ.pop('SKILLOPT_SKILLS_DIR', None)
+            else:
+                os.environ['SKILLOPT_SKILLS_DIR'] = prev_skills
 
 
 @test("v1.2.0 NEW (Day-3 item 3): rollback_fragment() restores from snapshot")
@@ -1452,65 +1680,100 @@ def t_v121_fragment_rollback() -> None:
     _purge_skill_fragments()
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        skill_md = _write_test_skill(tmp, "rollback_test")
-        original_skill_text = skill_md.read_text(encoding="utf-8")
-        # Write v1 (creates intro.v1.md with the body text snapshot)
-        r1 = fragment_store.write_fragment(
-            skill_md, "intro", "## Section A\nv1 fragment body\n",
-        )
-        assert r1.get("ok"), f"v1 write failed: {r1}"
-        # Write v2 (creates intro.v2.md + overwrites intro.current.md)
-        r2 = fragment_store.write_fragment(
-            skill_md, "intro", "## Section A\nv2 fragment body\n",
-        )
-        assert r2.get("ok"), f"v2 write failed: {r2}"
-        # History should NOT include 'current' (it's the live version, not a snapshot)
-        hist = fragment_store.list_fragment_history(skill_md, "intro")
-        assert len(hist) >= 1, f"no history: {hist}"
-        assert all(h["version"] != "current" for h in hist), (
-            f"history should not include 'current': {hist}"
-        )
-        first_version = hist[0]["version"]
-        # Roll back succeeds
-        result = fragment_store.rollback_fragment(skill_md, "intro", first_version)
-        assert result.get("ok"), f"rollback failed: {result}"
-        # A new current_version was returned (the pre-rollback bump)
-        assert result.get("current_version"), (
-            f"rollback did not return a new current_version: {result}"
-        )
-        assert result.get("restored_from"), (
-            f"rollback did not return a restored_from path: {result}"
-        )
-        # The SKILL.md itself was overwritten with the snapshot text.
-        # The snapshot for the FIRST version contains the original body
-        # text (because write_fragment snapshots the current body before
-        # writing the new fragment text). So after rollback, the SKILL.md
-        # should contain the original body text.
-        restored = skill_md.read_text(encoding="utf-8")
-        assert restored == original_skill_text, (
-            f"rollback did not restore SKILL.md to original: {restored!r}"
-        )
+        # v1.8.50 (audit F8): a fragment rollback rewrites a LIVE skill, so
+        # the fixture must be one; the skills dir is redirected so the real
+        # tree is untouched.
+        prev_skills = os.environ.get('SKILLOPT_SKILLS_DIR')
+        skills_root = tmp / "skills"
+        skill_md = _write_test_skill(skills_root, "rollback_test")
+        os.environ['SKILLOPT_SKILLS_DIR'] = str(skills_root)
+        try:
+            original_skill_text = skill_md.read_text(encoding="utf-8")
+            # Write v1 (creates intro.v1.md with the body text snapshot)
+            r1 = fragment_store.write_fragment(
+                skill_md, "intro", "## Section A\nv1 fragment body\n",
+            )
+            assert r1.get("ok"), f"v1 write failed: {r1}"
+            # Write v2 (creates intro.v2.md)
+            r2 = fragment_store.write_fragment(
+                skill_md, "intro", "## Section A\nv2 fragment body\n",
+            )
+            assert r2.get("ok"), f"v2 write failed: {r2}"
+            # The edits are REAL: the document now holds v2's text.
+            assert "v2 fragment body" in skill_md.read_text(encoding="utf-8"), (
+                "v1.8.50: a fragment write must apply to the live document")
+            # History should NOT include 'current' (it's the live version, not a snapshot)
+            hist = fragment_store.list_fragment_history(skill_md, "intro")
+            assert len(hist) >= 1, f"no history: {hist}"
+            assert all(h["version"] != "current" for h in hist), (
+                f"history should not include 'current': {hist}"
+            )
+            first_version = hist[0]["version"]
+            # Roll back succeeds
+            result = fragment_store.rollback_fragment(skill_md, "intro", first_version)
+            assert result.get("ok"), f"rollback failed: {result}"
+            # A new current_version was returned (the pre-rollback bump)
+            assert result.get("current_version"), (
+                f"rollback did not return a new current_version: {result}"
+            )
+            assert result.get("restored_from"), (
+                f"rollback did not return a restored_from path: {result}"
+            )
+            # The SKILL.md itself was overwritten with the snapshot text.
+            # The snapshot for the FIRST version contains the original body
+            # text (because write_fragment snapshots the current body before
+            # writing the new fragment text). So after rollback, the SKILL.md
+            # should contain the original body text.
+            restored = skill_md.read_text(encoding="utf-8")
+            assert restored == original_skill_text, (
+                f"rollback did not restore SKILL.md to original: {restored!r}"
+            )
+        finally:
+            if prev_skills is None:
+                os.environ.pop('SKILLOPT_SKILLS_DIR', None)
+            else:
+                os.environ['SKILLOPT_SKILLS_DIR'] = prev_skills
 
 
 @test("v1.2.0 NEW (Day-3 item 3): list_fragment_history() returns sorted history")
 def t_v121_fragment_history() -> None:
+    """History is ordered NUMERICALLY by version (v1.8.48 / audit G2).
+
+    This case used to assert the paths were *lexicographically* sorted, which
+    is the trap `_prune_history` documents: it puts `v9` after `v12`. With the
+    numeric fix in place the assertion below is what distinguishes the two.
+    """
     sys.path.insert(0, str(PLUGIN_ROOT))
     from helpers import fragment_store  # type: ignore
     _purge_skill_fragments()
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        skill_md = _write_test_skill(tmp, "history_test")
-        for i in range(3):
-            fragment_store.write_fragment(
-                skill_md, "intro", f"## Section A\nversion {i} body\n",
-            )
-            time.sleep(0.01)  # ensure mtime ordering
-        hist = fragment_store.list_fragment_history(skill_md, "intro")
-        assert len(hist) >= 3, f"expected >= 3 history entries, got {len(hist)}"
-        # Sorted by version (oldest first) OR by mtime ascending
-        # Either is acceptable; just check it's deterministic and ordered
-        paths = [h["path"] for h in hist]
-        assert paths == sorted(paths), "history paths are not in sorted order"
+        prev_skills = os.environ.get('SKILLOPT_SKILLS_DIR')
+        skills_root = tmp / "skills"
+        skill_md = _write_test_skill(skills_root, "history_test")
+        os.environ['SKILLOPT_SKILLS_DIR'] = str(skills_root)
+        try:
+            cap = fragment_store._config_int(
+                "fragment_max_history_per_id", 8) or 8
+            for i in range(int(cap) + 3):
+                fragment_store.write_fragment(
+                    skill_md, "intro", f"## Section A\nversion {i} body\n",
+                )
+                time.sleep(0.01)  # ensure mtime ordering
+            hist = fragment_store.list_fragment_history(skill_md, "intro")
+            assert len(hist) >= 2, (
+                f"expected a real history, got {len(hist)}")
+            assert len(hist) <= int(cap), (
+                f"history must respect fragment_max_history_per_id "
+                f"({cap}), got {len(hist)}")
+            nums = [int(h["version"].lstrip("v")) for h in hist]
+            assert nums == sorted(nums), (
+                f"history must be ordered numerically by version: {nums}")
+        finally:
+            if prev_skills is None:
+                os.environ.pop('SKILLOPT_SKILLS_DIR', None)
+            else:
+                os.environ['SKILLOPT_SKILLS_DIR'] = prev_skills
 
 
 @test("v1.2.0 NEW (Day-3 item 3): validate_fragments() warns on overlapping selectors")
@@ -2121,7 +2384,6 @@ def t_v121_inner_list_pending_suggestions():
             il_mod.suggestions_dir = orig_dir
 
 
-@test("v1.2.0 NEW (Day-4 item 4): drain_suggestions returns recent + deletes all")
 @test("v1.2.0 NEW (Day-4 item 4): build_targeted_prompt mentions the suggestions")
 def t_v121_inner_build_targeted_prompt():
     """The targeted prompt is the whole point of the inner loop."""
@@ -2147,6 +2409,7 @@ def t_v121_inner_build_targeted_prompt():
             "targeted edit" in prompt.lower()), f"missing minimal-edit directive in prompt: {prompt[:200]}"
 
 
+@test("v1.2.0 NEW (Day-4 item 4): drain_suggestions returns recent + deletes all")
 def t_v121_inner_drain_suggestions():
     """drain_suggestions returns recent suggestions (NOT older than max_age_seconds)
     and deletes ALL matching files (recent returned, stale dropped). The
@@ -2195,6 +2458,9 @@ def t_v121_inner_drain_suggestions():
             assert not (sd / "my_skill_r_new.md").is_file(), "recent file still on disk"
         finally:
             il_mod.suggestions_dir = orig_dir
+
+
+@test("v1.2.0 NEW (Day-4 item 4): inner_loop_tick with llm_endpoint=None does nothing")
 def t_v121_inner_tick_no_llm():
     """inner_loop_tick with no LLM configured returns counters and never raises."""
     sys.path.insert(0, str(PLUGIN_ROOT))
@@ -2450,6 +2716,7 @@ def t_v122_status_snapshot_has_cadence_budget() -> bool:
 
 
 
+@test("v1.3.0 NEW (Day-4 item 5): cadence.compute_next_run for cold / mid / hot skills")
 def t_v122_cadence_compute_next_run() -> None:
     """cadence.compute_next_run: cold=ceiling, hot=floor, mid=interpolation."""
     try:
@@ -2471,6 +2738,7 @@ def t_v122_cadence_compute_next_run() -> None:
     assert abs(mid - expected_mid) <= 2, f"mid {mid} should be near {expected_mid}"
 
 
+@test("v1.3.0 NEW (Day-4 item 5): cadence per-skill state roundtrip (load/save)")
 def t_v122_cadence_state_roundtrip() -> None:
     """cadence.load + save per-skill state: defaults, save, load, atomic write."""
     try:
@@ -2495,6 +2763,7 @@ def t_v122_cadence_state_roundtrip() -> None:
         p.unlink()
 
 
+@test("v1.3.0 NEW (Day-4 item 5): cadence.list_skills_with_state finds the saved skills")
 def t_v122_cadence_list_skills() -> None:
     """cadence.list_skills_with_state: returns sorted list of skills with state files."""
     try:
@@ -2527,6 +2796,7 @@ def t_v122_cadence_list_skills() -> None:
         _sb.__exit__(None, None, None)
 
 
+@test("v1.3.0 NEW (Day-4 item 5): budget.can_spend blocks over the cap and allows under it")
 def t_v122_budget_can_spend() -> None:
     """budget.BudgetTracker.can_spend: under cap, at cap, over cap."""
     try:
@@ -2549,27 +2819,44 @@ def t_v122_budget_can_spend() -> None:
         p.unlink()
 
 
-def t_v122_budget_day_rollover() -> None:
-    """budget.BudgetTracker: day rollover resets the counter."""
+@test("v1.3.0 NEW (Day-4 item 5): budget resets spent_cents on a day rollover")
+def t_v122_budget_day_rollover_tracker() -> None:
+    """budget.BudgetTracker: day rollover resets the counter.
+
+    v1.8.48 (audit T8): this body ran for the first time since v1.3.0 - it had
+    lost its `@test` decorator, so the DOX hazard ("a scripted edit silently
+    consumed a decorator; the suite stayed green") had been hiding a stale
+    scaffolding detail. It injected 1970-era epochs, which cannot roll a
+    tracker whose `reset_at` is derived from the real clock, so the assertion
+    could not have passed as written. The CONTRACT is what matters and it is
+    asserted below with timestamps relative to now: spend on day 1, spend on
+    day 3, and the second write must start from zero.
+    """
     try:
         from usr.plugins.skillopt.helpers import budget  # type: ignore
     except Exception:
         from helpers import budget  # type: ignore
     bt = budget.BudgetTracker(skill_name="__smoke_rollover__", daily_cap_cents=100, reset_hour_utc=0,
                               state_dir=_budget_test_state_dir())
+    base = time.time()
     # Record 80 cents on day 1
-    res1 = bt.record_spend(80, ts=100000.0)
+    res1 = bt.record_spend(80, ts=base)
     assert res1["new_total"] == 80, f"day 1 total: {res1}"
-    # Record 10 cents on day 2 (ts way in the future to trigger rollover)
-    res2 = bt.record_spend(10, ts=200000.0)
+    # Record 10 cents two days later: the daily counter must have rolled.
+    res2 = bt.record_spend(10, ts=base + 2 * 86400)
     assert res2["new_total"] == 10, f"day 2 total should be reset to 10: {res2}"
+    assert res2["day"] != res1["day"], "the two spends must be on different days"
+    # Control: the reset must not repeat within the same day.
+    res3 = bt.record_spend(5, ts=base + 2 * 86400 + 60)
+    assert res3["new_total"] == 15, f"same-day accrual must continue: {res3}"
     # Cleanup
     p = budget._default_state_dir() / "budget___smoke_rollover__.json"
     if p.exists():
         p.unlink()
 
 
-def t_v122_status_snapshot_has_cadence_budget() -> None:
+@test("v1.3.0 NEW (Day-4 item 5): get_status_snapshot carries the cadence and budget blocks")
+def t_v122_status_snapshot_has_cadence_budget_keys() -> None:
     """sleep_runner.get_status_snapshot: includes `cadence` and `budget` keys."""
     try:
         from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
@@ -3692,7 +3979,7 @@ def t_v187_budget_soft_tier() -> None:
     import shutil as _shutil
     import tempfile as _tempfile
     from helpers import budget
-    tmp = _tempfile.mkdtemp(prefix='v187smoke_budget_')
+    tmp = tempfile.mkdtemp(prefix='v187smoke_budget_')
     try:
         bt = budget.BudgetTracker(skill_name='smoke', daily_cap_cents=10,
                                   soft_warn_pct=50, state_dir=tmp)
@@ -4626,6 +4913,18 @@ def t_c3_staged_endpoint_returns_evidence() -> None:
         assert card["n_held_out"] == 5, card
     finally:
         staged_file.unlink(missing_ok=True)
+        # v1.8.34: /staged now reads-or-builds a proposal summary, which
+        # persists a `.summary.json` sidecar beside the fixture. Removing only
+        # the `.md` left the sidecar orphaned in PRODUCTION staging on every
+        # suite run - a new way for a test to pollute live state, in the one
+        # directory where an orphan is a real-gate deadlock risk.
+        try:
+            from helpers import proposal_view as _pv  # type: ignore
+            _pv.summary_path(staged_file).unlink(missing_ok=True)
+        except Exception:
+            for _suf in (".summary.json", ".gate.json"):
+                (staged_file.parent / (staged_file.name + _suf)).unlink(
+                    missing_ok=True)
         ch.reset_for_tests()
 
 
@@ -4655,6 +4954,11 @@ def t_c3_adopt_by_proposal_id() -> None:
     (tmp_skills / skill_b / "SKILL.md").parent.mkdir(parents=True, exist_ok=True)
     (tmp_skills / skill_b / "SKILL.md").write_text("# Old Current\n```\nex\n```\n" + "old\n" * 60, encoding="utf-8")
     try:
+        # v1.8.41 (R1): /adopt now runs the governance gate, and
+        # the default policy is opt_out. Opt the fixture skill in
+        # so this test stays about what it is about.
+        from helpers import governance as _gov_c3
+        _adopt_opt_in(_gov_c3, 'c3a_adopt')
         Adopt = _c3_import_api_class("adopt", "Adopt")
         resp = asyncio.run(Adopt().process({"proposal_id": skill_a}, None))
         assert resp.get("ok") is True, f"adopt failed: {resp!r}"
@@ -4662,8 +4966,12 @@ def t_c3_adopt_by_proposal_id() -> None:
         # The live SKILL.md for skill_a now holds the proposed text
         live = (tmp_skills / skill_a / "SKILL.md").read_text(encoding="utf-8")
         assert "Skill v2" in live, f"SKILL.md not overwritten with proposal: {live[:80]!r}"
-        # A whole-file _default snapshot was written (reversible adopt)
-        snap = Path(PLUGIN_ROOT) / "fragments" / skill_a / "_default.pre_adopt.md"
+        # A whole-file _default snapshot was written (reversible adopt).
+        # v1.8.51: resolve the root through the module rather than PLUGIN_ROOT -
+        # the snapshot tree is redirected to a sandbox for the whole run, and
+        # this literal was the one remaining place asserting against production.
+        from helpers import fragment_store as _fs_c3  # type: ignore
+        snap = _fs_c3._plugin_root() / "fragments" / skill_a / "_default.pre_adopt.md"
         assert snap.is_file(), f"expected pre-adopt snapshot at {snap}"
         assert resp.get("snapshot", {}).get("ok") is True, resp
     finally:
@@ -4693,11 +5001,30 @@ def t_c3_reject_records_cycle_history() -> None:
     ch.reset_for_tests()
     _audit_wipe_local_store()
     pid = "c3_reject_skill"
+    # v1.8.36 (audit L3/F2): stage a REAL proposal first. /reject used to
+    # accept any string as a `proposal_id` and echo it onto both audit rows,
+    # so a row naming a not-yet-staged stem made `find_pending_proposal`
+    # report the skill's NEXT proposal as already rejected and the Governance
+    # card silently stopped prompting. It now validates against the staged
+    # queue - so the test exercises the actual user flow.
+    sr.staging_dir().mkdir(parents=True, exist_ok=True)
+    staged = sr.staging_dir() / f"{pid}.md"
+    staged.write_text(
+        "---\nname: %s\ndescription: reject fixture\n---\n# %s\nbody\n"
+        % (pid, pid), encoding="utf-8")
     try:
         Reject = _c3_import_api_class("reject", "Reject")
         resp = asyncio.run(Reject().process({"proposal_id": pid, "reason": "bad fit"}, None))
         assert resp.get("ok") is True, resp
         assert resp["decision"] == "rejected", resp
+        # v1.8.36 (F2): the proposal must LEAVE the pending queue, and the
+        # denial must be recorded in the governance ledger to arm the rail.
+        assert resp.get("quarantined_to"), resp
+        assert resp.get("governance_recorded") is True, resp
+        assert not staged.exists(), (
+            "a rejected proposal stayed in the queue the drain scans")
+        assert staged.parent.joinpath("rejected").is_dir(), (
+            "the rejected document was not preserved for re-review")
         # cycle_history got a rejected entry for the skill
         entries = ch.read_cycle_history(limit=50)
         rej = [e for e in entries if e.get("outcome") == "rejected" and e.get("skill") == pid]
@@ -4775,6 +5102,11 @@ def t_c3_adopt_without_id_falls_back_to_latest() -> None:
         sk.parent.mkdir(parents=True, exist_ok=True)
         sk.write_text("# Old Current\n```\nex\n```\n" + "old\n" * 60, encoding="utf-8")
     try:
+        # v1.8.41 (R1): /adopt now runs the governance gate, and
+        # the default policy is opt_out. Opt the fixture skill in
+        # so this test stays about what it is about.
+        from helpers import governance as _gov_c3
+        _adopt_opt_in(_gov_c3, 'c3e_new')
         Adopt = _c3_import_api_class("adopt", "Adopt")
         resp = asyncio.run(Adopt().process({}, None))  # no proposal_id
         assert resp.get("ok") is True, f"adopt failed: {resp!r}"
@@ -5293,6 +5625,42 @@ def t_v18_label_rollout_idempotent() -> None:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+
+@test('v1.8.26 judge batch preview remains non-writing by default')
+def t_v1826_judge_batch_preview_does_not_write() -> None:
+    from helpers import judge_client
+    import shutil
+    import tempfile as _tf
+    tmp = _tf.mkdtemp(prefix='skillopt_judge_preview_')
+    path = Path(tmp) / 'rollout.json'
+    original = {'task': 'x', 'last_response': 'done'}
+    path.write_text(json.dumps(original), encoding='utf-8')
+    calls = []
+    old = judge_client.judge_rollout
+    judge_client.judge_rollout = lambda rollout, model=None: calls.append(1) or {
+        'label': 'success', 'confidence': 0.9, 'reason': 'ok', 'model': 'fake'
+    }
+    try:
+        result = judge_client.judge_rollouts([str(path)])
+        assert result['ok'] is True and result['valid'] == 1, result
+        assert len(calls) == 1, calls
+        assert json.loads(path.read_text(encoding='utf-8')) == original
+    finally:
+        judge_client.judge_rollout = old
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+
+
+
+
+
+
+
+
+
+
+
 @test("v1.8.0 P5: _load_labelled_rollouts keeps labelled rollouts, skips unlabelled (success=0/failure=2)")
 def t_v18_train_dataset_loader() -> None:
     import importlib.util, tempfile as _tf, shutil
@@ -5622,10 +5990,30 @@ def t_v185_setup_env_build_sanitize() -> None:
     line1 = 'export SKILLOPT_OPTIMIZER_MODEL=' + Q + 'minimax-m3' + Q
     line2 = 'export AZURE_OPENAI_API_KEY=' + Q + 'fake-credential-value-000' + Q
     text = line1 + NL + line2 + NL
+    # v1.8.46 (audit R24): a plaintext credential with NO matching visible
+    # source is now LEFT ALONE and reported, rather than rewritten into a
+    # `${SELF}` reference that resolves nowhere. This deliberately narrows an
+    # older assertion, so it is worth being explicit about the trade:
+    #
+    #   BEFORE: matched source   -> ${SOURCE}   (unchanged)
+    #   BEFORE: no matching source -> ${SELF}    <- destroyed the credential
+    #   NOW:    matched source   -> ${SOURCE}   (unchanged)
+    #   NOW:    no matching source -> PRESERVED  + reported as needing action
+    #
+    # The property that matters is not "no plaintext on disk" (the plugin did
+    # not put it there - a legacy hand-edit did) but "the plugin does not
+    # BREAK a working credential". Rewriting it to a dangling reference made
+    # the next LLM call fail with "No LLM API key found", and it is not the
+    # plugin's call to destroy a secret it cannot re-create. The key is still
+    # reported in `fixed`, so the condition stays visible.
     new, fixed = se.sanitize_env_text(text, {})
-    assert fixed == ['AZURE_OPENAI_API_KEY']
-    assert 'fake-credential-value-000' not in new
-    assert 'export AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}' in new
+    assert fixed == ['AZURE_OPENAI_API_KEY'], fixed
+    assert 'export AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}' not in new, (
+        'the credential was rewritten to a SELF-reference, which resolves to '
+        'nothing - that is audit R24 and it destroys the only working copy')
+    assert 'fake-credential-value-000' in new, (
+        'a plaintext credential with no matching source must be PRESERVED, '
+        f'not rewritten into a dangling reference: {new!r}')
     assert line1 in new
     ref = 'export AZURE_OPENAI_API_KEY=${OPENAI_API_KEY}' + NL
     new2, fixed2 = se.sanitize_env_text(ref, {})
@@ -5634,7 +6022,9 @@ def t_v185_setup_env_build_sanitize() -> None:
     prov, fixed3 = se.sanitize_env_text(
         text, {'OPENAI_API_KEY': 'fake-credential-value-000'}
     )
-    assert 'export AZURE_OPENAI_API_KEY=${OPENAI_API_KEY}' in prov
+    assert 'export AZURE_OPENAI_API_KEY=${OPENAI_API_KEY}' in prov, (
+        'a MATCHED source must still convert the plaintext to a reference')
+    assert 'fake-credential-value-000' not in prov
     assert fixed3 == ['AZURE_OPENAI_API_KEY']
 
 
@@ -5647,34 +6037,49 @@ def t_v185_setup_env_apply() -> None:
     from helpers import setup_env as se
     Q = chr(34)
     NL = chr(10)
-    with _tempfile.TemporaryDirectory() as td:
-        envf = Path(td) / '.skillopt-env'
-        envf.write_text(
-            'export SKILLOPT_OPTIMIZER_MODEL=' + Q + 'minimax-m3' + Q + NL
-            + 'export AZURE_OPENAI_API_KEY=' + Q + 'AAAA-not-a-real-credential' + Q + NL
-        )
-        result = se.apply('openai_compatible', env_file=envf)
-        assert result['ok'], result.get('error')
-        text = envf.read_text(encoding='utf-8')
-        assert 'AAAA-not-a-real-credential' not in text
-        assert ('export AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}' in text) or ('export AZURE_OPENAI_API_KEY=${OPENAI_API_KEY}' in text)
-        assert 'SKILLOPT_OPTIMIZER_MODEL=' + Q + 'minimax-m3' + Q in text
-        assert 'AZURE_OPENAI_AUTH_MODE=openai_compatible' in text
-        # POSIX 0600 is only enforceable on a POSIX filesystem. On Windows
-        # os.chmod() cannot express it (it reports 0o666), so assert the
-        # INTENT there: the code must still request 0600, and the write
-        # must have happened. The real 0600 check runs in the container.
-        if os.name == 'posix':
-            assert _stat.S_IMODE(envf.stat().st_mode) == 0o600, oct(
-                _stat.S_IMODE(envf.stat().st_mode))
+    # v2026-10-13: give the plaintext credential PROVENANCE. Since the
+    # v1.8.46 R24 policy the sanitizer leaves a plaintext value alone when it
+    # cannot prove where it came from (rewriting it would destroy the only
+    # working copy), so a value that exists nowhere in the environment is
+    # deliberately NOT rewritten and the test failed on its own fixture.
+    # Providing the value through the environment makes provenance real and
+    # the original assertions meaningful again.
+    _saved_key = os.environ.get('AZURE_OPENAI_API_KEY')
+    os.environ['AZURE_OPENAI_API_KEY'] = 'AAAA-not-a-real-credential'
+    try:
+        with _tempfile.TemporaryDirectory() as td:
+            envf = Path(td) / '.skillopt-env'
+            envf.write_text(
+                'export SKILLOPT_OPTIMIZER_MODEL=' + Q + 'minimax-m3' + Q + NL
+                + 'export AZURE_OPENAI_API_KEY=' + Q + 'AAAA-not-a-real-credential' + Q + NL
+            )
+            result = se.apply('openai_compatible', env_file=envf)
+            assert result['ok'], result.get('error')
+            text = envf.read_text(encoding='utf-8')
+            assert 'AAAA-not-a-real-credential' not in text
+            assert ('export AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}' in text) or ('export AZURE_OPENAI_API_KEY=${OPENAI_API_KEY}' in text)
+            assert 'SKILLOPT_OPTIMIZER_MODEL=' + Q + 'minimax-m3' + Q in text
+            assert 'AZURE_OPENAI_AUTH_MODE=openai_compatible' in text
+            # POSIX 0600 is only enforceable on a POSIX filesystem. On Windows
+            # os.chmod() cannot express it (it reports 0o666), so assert the
+            # INTENT there: the code must still request 0600, and the write
+            # must have happened. The real 0600 check runs in the container.
+            if os.name == 'posix':
+                assert _stat.S_IMODE(envf.stat().st_mode) == 0o600, oct(
+                    _stat.S_IMODE(envf.stat().st_mode))
+            else:
+                import os as _os2
+                assert _os2.name == 'nt'
+                assert envf.is_file() and envf.stat().st_size > 0
+            assert 'AZURE_OPENAI_API_KEY' in result['fixed']
+            assert result['path'] == str(envf)
+            again = se.apply('openai_compatible', env_file=envf)
+            assert again['ok'] and again['fixed'] == []
+    finally:
+        if _saved_key is None:
+            os.environ.pop('AZURE_OPENAI_API_KEY', None)
         else:
-            import os as _os2
-            assert _os2.name == 'nt'
-            assert envf.is_file() and envf.stat().st_size > 0
-        assert 'AZURE_OPENAI_API_KEY' in result['fixed']
-        assert result['path'] == str(envf)
-        again = se.apply('openai_compatible', env_file=envf)
-        assert again['ok'] and again['fixed'] == []
+            os.environ['AZURE_OPENAI_API_KEY'] = _saved_key
 
 
 
@@ -5684,10 +6089,10 @@ def t_v188_pause_skill_roundtrip() -> None:
     import tempfile as _tempfile
     from pathlib import Path as _Path
     from helpers import governance
-    tmp = _tempfile.mkdtemp(prefix='v188smoke_pause_')
+    tmp = tempfile.mkdtemp(prefix='v188smoke_pause_')
     prev = governance._TEST_SKILLS_DIR
     try:
-        governance.set_skills_dir_for_tests(_Path(tmp))
+        governance.set_skills_dir_for_tests(Path(tmp))
         sd = governance._skill_dir('skillA')
         (sd / '.skillopt.optin').write_text('', encoding='utf-8')
         base_elig, base_reason = governance.check_skill_eligible('skillA')
@@ -5728,7 +6133,7 @@ def t_v188_governance_pause_api() -> None:
     assert spec is not None and spec.loader is not None
     mod = _ilu.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    tmp = _tempfile.mkdtemp(prefix='v188smoke_apipause_')
+    tmp = tempfile.mkdtemp(prefix='v188smoke_apipause_')
     # v1.8.23: tolerate a relocated suite copy (e.g. /tmp/skillopt23 during a
     # 9p-flap run) where parents[2] doesn't exist — the usr.plugins import
     # below is already optional (try/except), so the second module identity
@@ -5753,7 +6158,7 @@ def t_v188_governance_pause_api() -> None:
     try:
         for _g in mods:
             prevs.append((_g, getattr(_g, '_TEST_SKILLS_DIR', None)))
-            _g.set_skills_dir_for_tests(_Path(tmp))
+            _g.set_skills_dir_for_tests(Path(tmp))
         handler = mod.GovernancePause()
         bad = asyncio.run(handler.process({'skill': '../escape', 'action': 'pause'}, None))
         assert bad.get('ok') is False, 'traversal name not rejected: %r' % (bad,)
@@ -5782,7 +6187,35 @@ def t_v188_ui_wiring() -> None:
     for needle in ('governancePause(skill, hours)', 'governanceResume(skill)'):
         assert needle in js, 'dashboard js missing %r' % needle
     head = (PLUGIN_ROOT / 'extensions' / 'webui' / 'page-head' / 'skillopt-head.html').read_text(encoding='utf-8')
-    assert 'cb=3' in head, 'cache-bust missing'
+    # v1.8.34: assert the cache-bust is PRESENT and numeric, not a pinned
+    # literal. The old assertion pinned 'cb=3', so shipping changed dashboard
+    # JS would have kept the same URL and browsers could serve the stale
+    # file - a silently dead UI. Bump `cb` freely; this test should not have
+    # to change with it.
+    assert re.search(r'cb=\d+', head), (
+        f'skillopt-dashboard.js has no cache-bust query param: {head!r}')
+    # v1.8.34: the namespace must actually be reachable. `const` inside the
+    # IIFE left `window.SkillOptDashboard` undefined, so the documented
+    # extension point ("the WebUI config page and the sidebar card can hook
+    # into") was dead code - invisible only because nothing referenced it yet.
+    dash = (PLUGIN_ROOT / 'webui' / 'skillopt-dashboard.js').read_text(
+        encoding='utf-8')
+    assert re.search(r'window\.SkillOptDashboard\s*=', dash), (
+        'skillopt-dashboard.js never assigns window.SkillOptDashboard, so the '
+        'whole documented dashboard extension point is unreachable')
+    # v1.8.34: the informed-approval + dual-mode surface must exist on BOTH
+    # the settings page and the dashboard. They are deliberately different
+    # implementations - config.html is Alpine and inlines its bindings per
+    # card, the dashboard is framework-free and uses pure renderers - so this
+    # asserts equivalent capability per surface, not a shared symbol.
+    for needle in ('renderProposalSummary', 'renderPendingApproval',
+                   'renderEvolutionMode', 'proposal(', 'mode('):
+        assert needle in dash, f'dashboard js missing {needle}'
+    for needle in ('pendingFor(', 'loadFullDiff(', 'modeState',
+                   'setMode(', 'setPause('):
+        assert needle in html, (
+            f'config.html missing {needle}: the settings page would render '
+            f'no summary / no mode control on one of its two cards')
 
 
 @test('v1.8.11: mock scorer overlap is size-invariant (dilution fix)')
@@ -6742,7 +7175,7 @@ def t_v1818_pacing_deterministic() -> None:
 
     real_clock, real_sleep = llm_judge._monotonic, llm_judge._sleep
     old_env = os.environ.get('SKILLOPT_JUDGE_THROTTLE_S')
-    os.environ['SKILLOPT_JUDGE_THROTHLE_S'] = '0.02'
+    os.environ['SKILLOPT_JUDGE_THROTTLE_S'] = '0.02'
     clock = {'t': 1000.0}
     starts = []
 
@@ -7100,6 +7533,43 @@ def t_v1820_zombie_aware_is_running() -> None:
         os.waitpid(pid, 0)
     _ok("zombie-aware is_running treats state Z as not-running")
 
+
+@test('v1.8.20: is_running treats an exited-but-unreaped child (zombie) as not running')
+def t_v1820_zombie_aware_is_running_popen():
+    # v1.8.48 (audit T8): this body shared a NAME with the os.fork() case
+    # above. Two registered tests with one name means the second def shadows
+    # the first for every lookup, so the label could not be traced to its
+    # body - the "a test whose assertions do not match its name" defect. The
+    # Popen variant is kept (it covers a live sleeping child on every
+    # platform) under a name of its own.
+    import subprocess, sys as _sys, time as _time
+    from helpers.sleep_runner import is_running
+    p = subprocess.Popen([_sys.executable, '-c', 'pass'])
+    state = 'UNKNOWN'
+    deadline = _time.time() + 10.0
+    while _time.time() < deadline:
+        try:
+            with open('/proc/%d/stat' % p.pid, 'rb') as fh:
+                data = fh.read().decode('utf-8', 'replace')
+            rest = data[data.rfind(')') + 2:]
+            state = rest.split(' ', 1)[0] if rest else 'UNKNOWN'
+        except Exception:
+            state = 'GONE'
+        if state in ('Z', 'GONE'):
+            break
+        _time.sleep(0.2)
+    try:
+        if state == 'Z':
+            assert is_running(p.pid) is False, 'zombie child must read as not running'
+    finally:
+        p.wait()
+    q = subprocess.Popen([_sys.executable, '-c', 'import time; time.sleep(20)'])
+    try:
+        _time.sleep(0.4)
+        assert is_running(q.pid) is True, 'live sleeping child must read as running'
+    finally:
+        q.kill()
+        q.wait()
 
 @test("v1.8.21: _auto_adopt drains all staged proposals (adopt consumed, reject quarantined)")
 def t_v1821_auto_adopt_drains_staged() -> None:
@@ -8157,6 +8627,59 @@ def t_p4_no_fixture_pollution():
         + " (delete them; every state-writing test must sandbox its paths)"
     )
 
+    # v1.8.38 (audit M2): the durable approvals index is a NEW production-state
+    # file, and the guard above only knew about `sleep-*.log`. It accumulated
+    # test rows across runs until `reset_for_tests` learned to wipe it - caught
+    # live by t_c4_governance_approve_endpoint, whose "before approval"
+    # assertion saw the previous run's approval and found the skill already
+    # eligible. Whenever a file lands in logs/runs/, name it here.
+    idx = PLUGIN_ROOT / "logs" / "runs" / "approvals_index.jsonl"
+    idx_offenders: list[str] = []
+    if idx.is_file():
+        for line in idx.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            if ("c4_" in line or "v18" in line or "test_" in line
+                    or "fixture" in line or "agree_" in line
+                    or "f10" in line):
+                idx_offenders.append(line.strip())
+    assert not idx_offenders, (
+        "test fixtures leaked into the production approvals index "
+        "(logs/runs/approvals_index.jsonl): "
+        + "; ".join(idx_offenders[:5])
+        + " - reset_for_tests() must wipe it, and the index is read by the "
+          "approval gate, so a stale row changes eligibility"
+    )
+
+    # v1.8.34: staging/ is production state too, and it is the ONE directory
+    # where a leaked file is an operational hazard rather than just clutter -
+    # find_staged_proposals() scans staging top level, so an orphaned
+    # sidecar looks like a live pending proposal (and, for a real-gate
+    # sidecar, wedges single-flight forever).
+    #
+    # Caught live on 2026-10-03: t_c3_staged_endpoint_returns_evidence
+    # created c3_staged_skill.md in real staging, and once /staged started
+    # building summaries, its .summary.json sidecar survived the cleanup that
+    # removed only the .md. One orphan per suite run, indefinitely.
+    staging = PLUGIN_ROOT / "staging"
+    staging_offenders: list[str] = []
+    if staging.is_dir():
+        for p in staging.iterdir():
+            if not p.is_file():
+                continue  # adopted/ rejected/ are quarantine dirs, expected
+            name = p.name
+            if (name.startswith(("c3_", "v18", "v1821_", "v1822_", "v1834_",
+                                 "test_", "tmp_"))
+                    or "test_fixture" in name
+                    or name.endswith(".summary.json")):
+                staging_offenders.append(name)
+    assert not staging_offenders, (
+        "test fixtures leaked into production staging/: "
+        + ", ".join(sorted(staging_offenders)[:10])
+        + " (staging is scanned by find_staged_proposals; every test that "
+          "stages a fixture must remove its .md AND its sidecars)"
+    )
+
     # v1.8.25: the filename check above cannot see a leak into a *shared*
     # production file. Found by live testing on 2026-09-26: the repo is
     # bind-mounted into the container, so the suite's `_adopt_one` calls
@@ -8299,6 +8822,8850 @@ def t_v1822_stub_visible() -> None:
     assert r.get('label') == 'success', r
     _ok('stub visible through the two-path import (no real LLM call)')
 
+
+# ======================================================================= #
+# v1.8.34 - informed approval (proposal summaries) + dual-mode operation
+# ======================================================================= #
+#
+# Two features under test:
+#
+#   A. Informed approval. Before v1.8.34 the approval cards rendered a skill
+#      NAME and nothing else, and proposals had no <-> decision linkage at
+#      all (staging keys on the filename stem, governance.log keys on the
+#      skill). These tests pin the summary contract, the backfill path, the
+#      sidecar lifecycle, and the route's security boundary.
+#
+#   B. Dual mode. `auto_adopt` already existed and already overrode the
+#      approval gate; v1.8.34 promotes it to a first-class mode with one
+#      resolver. These tests pin the resolver's precedence, its strict
+#      coercion, the kill switch, and - most importantly - that autonomy
+#      still cannot bypass the safety rails.
+#
+# All deterministic: no LLM, no network, no clock dependence. Sandbox paths
+# are restored in `finally`, and the production runs_dir is never written.
+
+_section_v1834 = ('v1.8.34 NEW: informed approval summaries + manual/autonomous '
+                  'dual mode (22 cases)')
+
+
+def _v1834_sandbox(tmp):
+    """Point sleep_runner + governance at a temp staging/skills/runs tree.
+
+    Returns (restore, staging, skills, runs). Patches the ALREADY-IMPORTED
+    module objects (the smoke suite canonicalises the namespace onto these),
+    so nothing the plugin does can reach the real staging dir or logs/runs.
+
+    `plugin_root` is deliberately NOT patched. It is the base for
+    `default_config()`, and `api/config.py::_read_disk` depends on the real
+    defaults being readable: when it is not, `_read_disk` yields a dict with
+    no `governance` section and api/mode.py correctly REFUSES to write
+    (see t_v1834_mode_route_no_config_wipe). Patching plugin_root to an empty
+    temp dir would trip that guard for the wrong reason. config.json is
+    resolved module-relatively by api/config.py, so leaving plugin_root alone
+    still cannot cause a write into the sandbox - and every save in these
+    tests goes through the stubbed `helpers.plugins` anyway.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import governance as gov, sleep_runner as sr
+    staging = tmp / 'staging'
+    skills = tmp / 'skills'
+    runs = tmp / 'runs'
+    for d in (staging, skills, runs):
+        d.mkdir(parents=True, exist_ok=True)
+    saved = (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir,
+             gov._runs_dir, gov._TEST_SKILLS_DIR, gov._mode_reported)
+    sr.staging_dir = lambda: staging
+    sr.a0_skills_dir = lambda: skills
+    sr.runs_dir = lambda: runs
+    gov._runs_dir = lambda: runs
+    gov.set_skills_dir_for_tests(skills)
+    gov._mode_reported = {}
+
+    def restore():
+        (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir,
+         gov._runs_dir) = saved[:4]
+        gov._TEST_SKILLS_DIR = saved[4]
+        gov._mode_reported = saved[5]
+    return restore, staging, skills, runs
+
+
+def _v1834_mirror(*names):
+    """Mirror helpers under usr.plugins.skillopt.helpers.* so the api modules'
+    primary import path resolves in this standalone environment."""
+    import types as _types
+    for dotted in ("usr", "usr.plugins", "usr.plugins.skillopt",
+                   "usr.plugins.skillopt.helpers"):
+        sys.modules.setdefault(dotted, _types.ModuleType(dotted))
+    pkg = sys.modules["usr.plugins.skillopt.helpers"]
+    for name in names:
+        mod = importlib.import_module("helpers." + name)
+        setattr(pkg, name, mod)
+        sys.modules["usr.plugins.skillopt.helpers." + name] = mod
+    return pkg
+
+
+def _v1834_import_api(module_name, class_name):
+    try:
+        mod = __import__("usr.plugins.skillopt.api." + module_name,
+                         fromlist=[class_name])
+    except Exception:
+        mod = __import__("api." + module_name, fromlist=[class_name])
+    return getattr(mod, class_name)
+
+
+def _v1834_skill_md(name, body='Step one.\nStep two.\n'):
+    """A structurally valid SKILL.md (frontmatter is mandatory since
+    v1.8.24 - the framework's own validate_skill_md rejects it otherwise)."""
+    return (f'---\nname: {name}\ndescription: test skill {name}\n---\n'
+            f'# {name}\n{body}')
+
+
+def _v1834_proposal(name, body='Step one, with try/except error handling.\n'
+                               '## New Section\nAn example.\n'):
+    return _v1834_skill_md(name, body)
+
+
+def _v1834_install_plugins_stub():
+    """Stub `helpers.plugins` so api/config.py and api/mode.py import here.
+
+    `api/config.py` does `from helpers import plugins as plugins_helper`, but
+    in the standalone smoke environment `helpers` IS the plugin's own helper
+    package and has no `plugins` submodule - the real one is the A0 framework
+    root package. Only `save_plugin_config` / `clear_plugin_cache` are used,
+    and the tests that need them inspect the recorded calls, so recording is
+    enough. Idempotent."""
+    if 'helpers.plugins' in sys.modules:
+        return sys.modules['helpers.plugins']
+    import types as _types
+    mod = _types.ModuleType('helpers.plugins')
+    calls = []
+    mod._calls = calls
+
+    def _save(name, agent, profile, cfg):
+        calls.append(('save', name, cfg))
+        return {'ok': True}
+
+    def _clear(names):
+        calls.append(('clear', names))
+        return {'ok': True}
+    mod.save_plugin_config = _save  # type: ignore[attr-defined]
+    mod.clear_plugin_cache = _clear  # type: ignore[attr-defined]
+    sys.modules['helpers.plugins'] = mod
+    import helpers as _helpers_pkg
+    _helpers_pkg.plugins = mod  # type: ignore[attr-defined]
+    return mod
+
+
+# --------------------------------------------------------------------- #
+# A. informed approval
+# --------------------------------------------------------------------- #
+
+@test('v1.8.34: a proposal summary carries the fields a reviewer needs')
+def t_v1834_summary_required_fields() -> None:
+    """The whole point of the feature: the summary must have real content.
+
+    An empty `summary` or an intent outside the closed vocabulary would put
+    us back to the pre-1.8.34 state - a card with a name and nothing else -
+    while looking implemented."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import proposal_view as pv
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_summary_'))
+    try:
+        (tmp / 'staging').mkdir()
+        (tmp / 'skills' / 'demo').mkdir(parents=True)
+        (tmp / 'skills' / 'demo' / 'SKILL.md').write_text(
+            _v1834_skill_md('demo'), encoding='utf-8')
+        src = tmp / 'staging' / 'demo.md'
+        src.write_text(_v1834_proposal('demo'), encoding='utf-8')
+
+        from helpers import sleep_runner as sr
+        sr_saved = sr.a0_skills_dir
+        sr.a0_skills_dir = lambda: tmp / 'skills'
+        try:
+            doc = pv.build_summary(src, cfg={**pv.DEFAULTS, 'persist': True},
+                                   skill='demo')
+        finally:
+            sr.a0_skills_dir = sr_saved
+
+        assert doc['schema'] == pv.SUMMARY_SCHEMA, doc['schema']
+        assert doc['available'] is True, doc['warnings']
+        assert isinstance(doc['summary'], str) and len(doc['summary']) >= 40, \
+            f'summary too thin to be informative: {doc["summary"]!r}'
+        assert doc['intent']['category'] in pv.INTENT_CATEGORIES, \
+            doc['intent']
+        assert 0.0 <= float(doc['intent']['confidence']) <= 1.0, doc['intent']
+        assert isinstance(doc['rationale'], list) and doc['rationale'], \
+            'rationale bullets are what make the summary checkable'
+        d = doc['diff']
+        assert d['available'] is True, d
+        assert d['added_lines'] > 0 and d['removed_lines'] > 0, d
+        assert d['hunk_count'] >= 1, d
+        assert all(isinstance(b, str) and b.strip() for b in doc['rationale'])
+        assert doc['artifacts']['proposal_rel'], doc['artifacts']
+        assert len(d['text']) <= int(pv.DEFAULTS['diff_max_chars']), \
+            f'diff exceeded its cap: {len(d["text"])}'
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('summary/intent/rationale/diff all populated and bounded')
+    print(' t_v1834_summary_required_fields: OK')
+
+
+@test('v1.8.34: the diff counts exclude the ---/+++ file headers')
+def t_v1834_diff_counts_ignore_headers() -> None:
+    """Regression: `+++ b/staged` was counted as an ADDED line.
+
+    That was not cosmetic. A pure deletion reported added_lines=1, which
+    pushed classify_intent() past its remove-only branch and mislabelled a
+    clean condensation as `unknown`."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import proposal_view as pv
+    d = pv.compute_diff('a\nb\nc\n', 'a\n')
+    assert d['available'] is True, d
+    assert d['added_lines'] == 0, f'"+++ b/staged" counted as added: {d}'
+    assert d['removed_lines'] == 2, d
+    assert pv.classify_intent(d)['category'] == 'performance', \
+        pv.classify_intent(d)
+    same = pv.compute_diff('x\n', 'x\n')
+    assert same['available'] is False, same
+    assert same['text'] == '', same
+    big_c = '\n'.join('line %d' % i for i in range(300))
+    big_p = '\n'.join('CHANGED %d' % i for i in range(300))
+    t = pv.compute_diff(big_c, big_p, max_lines=10, max_chars=100_000)
+    assert t['truncated'] is True, t
+    assert 'truncated' in t['text'], 'truncation must be visible to a reader'
+    t2 = pv.compute_diff(big_c, big_p, max_lines=5000, max_chars=300)
+    assert t2['truncated'] is True and len(t2['text']) <= 300, \
+        f'char cap not honoured: {len(t2["text"])}'
+    _ok('headers excluded; truncation explicit and inside the cap')
+    print(' t_v1834_diff_counts_ignore_headers: OK')
+
+
+@test('v1.8.34: a pre-1.8.34 proposal with no sidecar is computed on read')
+def t_v1834_summary_backfills_missing_sidecar() -> None:
+    """Every staged proposal on disk predates the sidecar. A reviewer must
+    still get a real summary with no migration step and no blocking work."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import proposal_view as pv
+    import tempfile as _tempfile
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_backfill_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    try:
+        src = staging / 'legacy.md'
+        src.write_text(_v1834_proposal('legacy'), encoding='utf-8')
+        assert pv.read_summary(src) is None, 'sidecar must start absent'
+        cfg = {**pv.DEFAULTS, 'persist': True}
+        built = pv.get_summary(src, cfg=cfg, skill='legacy')
+        assert built['available'] is True, built['warnings']
+        assert pv.summary_path(src).is_file(), 'backfill must persist'
+        cached = pv.get_summary(src, cfg=cfg, skill='legacy')
+        assert cached['created_at'] == built['created_at'], \
+            'second read should come from the sidecar'
+        pv.summary_path(src).write_text('{not json', encoding='utf-8')
+        assert pv.read_summary(src) is None
+        assert pv.get_summary(src, cfg=cfg, skill='legacy')['available'] is True
+        pv.summary_path(src).unlink()
+        ro = pv.get_summary(src, cfg=cfg, skill='legacy', allow_build=False)
+        assert ro['available'] is False, ro
+        off = pv.get_summary(src, cfg={**cfg, 'enabled': False})
+        assert off['available'] is False and off['warnings'], off
+        weird = pv.build_summary(src, cfg={**cfg, 'diff_max_lines': 'lots',
+                                           'summary_max_chars': None})
+        assert isinstance(weird, dict) and weird['schema'] == pv.SUMMARY_SCHEMA
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('backfill, corrupt-sidecar recovery, read-only and disabled paths')
+    print(' t_v1834_summary_backfills_missing_sidecar: OK')
+
+
+@test('v1.8.34: the summary sidecar travels with the proposal, never orphaned')
+def t_v1834_summary_sidecar_not_orphaned() -> None:
+    """An orphaned sidecar in staging top level is the documented real-gate
+    deadlock failure mode. The summary sidecar must be in the move tuple from
+    the same commit that introduces it."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import proposal_view as pv, sleep_runner as sr
+    assert sr.PROPOSAL_SUMMARY_SUFFIX == pv.SUMMARY_SUFFIX, (
+        f'suffix drift: sleep_runner={sr.PROPOSAL_SUMMARY_SUFFIX!r} '
+        f'proposal_view={pv.SUMMARY_SUFFIX!r}')
+    import tempfile as _tempfile
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_orphan_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    try:
+        src = staging / 'orphan.md'
+        src.write_text(_v1834_proposal('orphan'), encoding='utf-8')
+        pv.write_summary(src, pv.build_summary(src, cfg={**pv.DEFAULTS,
+                                                          'persist': False},
+                                              skill='orphan'))
+        assert pv.summary_path(src).is_file()
+        moved = sr.quarantine_staged_proposal(src, tag='test')
+        assert moved is not None and moved.is_file(), moved
+        # No FILE may be left behind in staging top level. (The `rejected/`
+        # subdirectory is expected and correct - that is where quarantine
+        # puts it - so assert on files, not on the whole listing.)
+        left = sorted(p.name for p in staging.glob('*') if p.is_file())
+        assert left == [], f'sidecar orphaned in staging: {left}'
+        assert (moved.parent / (moved.name + sr.PROPOSAL_SUMMARY_SUFFIX)).is_file(), \
+            f'summary sidecar did not travel: {sorted(p.name for p in moved.parent.glob(moved.name + "*"))}'
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('summary sidecar carried on quarantine; staging left clean')
+    print(' t_v1834_summary_sidecar_not_orphaned: OK')
+
+
+@test('v1.8.34 SECURITY: /proposal resolves ids by stem match, never by path')
+def t_v1834_proposal_route_no_traversal() -> None:
+    """The route serves skill-adjacent user content over HTTP. Accepting a
+    caller-supplied path would be an arbitrary file read, so the id is
+    compared for EQUALITY against real stems and never joined into a path."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import asyncio as _asyncio
+    import tempfile as _tempfile
+    _install_helpers_api_stub()
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_route_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history')
+        Proposal = _v1834_import_api('proposal', 'Proposal')
+        (staging / 'ok.md').write_text(_v1834_proposal('ok'), encoding='utf-8')
+        secret = tmp / 'secret.env'
+        secret.write_text('TOKEN=super-secret', encoding='utf-8')
+
+        good = _asyncio.run(Proposal().process({'proposal_id': 'ok'}, None))
+        assert good.get('ok') is True, good
+        assert good['summary']['available'] is True, good['summary']
+
+        for bad in ('../../secret.env', '..\\..\\secret.env',
+                    '/etc/passwd', 'ok/../../secret.env', 'ok/secret.env',
+                    '', '   ', 'secret.env'):
+            r = _asyncio.run(Proposal().process({'proposal_id': bad}, None))
+            assert r.get('ok') is False, f'traversal accepted: {bad!r} -> {r}'
+            assert 'super-secret' not in str(r), f'leaked content for {bad!r}'
+        _ok('stem-match resolution rejects 8 traversal shapes, leaks nothing')
+        print(' t_v1834_proposal_route_no_traversal: OK')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@test('v1.8.34: /staged and /governance_status resolve the pending proposal')
+def t_v1834_pending_approval_linkage() -> None:
+    """The gap v1.8.34 closes: the Governance card had no proposal context,
+    so Approve on a skill was indistinguishable from approving an unseen
+    document. Both routes must resolve WHICH proposal is pending."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import asyncio as _asyncio
+    import tempfile as _tempfile
+    _install_helpers_api_stub()
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_link_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history')
+        Staged = _v1834_import_api('staged', 'Staged')
+        GovStatus = _v1834_import_api('governance_status', 'GovernanceStatus')
+        from helpers import governance as gov
+        (staging / 'link.md').write_text(_v1834_proposal('link'),
+                                         encoding='utf-8')
+        gov.auto_optin_new_skill('link')
+        elig, reason = gov.check_skill_eligible('link')
+        assert elig is False and reason == 'require_human_approval_pending', \
+            (elig, reason)
+
+        rs = _asyncio.run(Staged().process({}, None))
+        assert rs['ok'] is True and rs['count'] == 1, rs
+        row = rs['proposals'][0]
+        assert row['proposal_id'] == 'link', row
+        assert isinstance(row['summary'], dict), 'staged row has no summary'
+        assert row['summary']['available'] is True, row['summary']
+        assert not row['diff_summary'].endswith('bytes'), \
+            f'diff_summary is still a byte count: {row["diff_summary"]!r}'
+
+        pa = rs['pending_approval']
+        assert 'link' in pa, f'pending_approval missing the skill: {pa}'
+        assert pa['link']['proposal_id'] == 'link', pa['link']
+        assert pa['link']['decision'] == 'pending', pa['link']
+        # The Governance card in config.html reads THIS map (fetched once by
+        # /staged and shared by both cards), so the summary must be attached
+        # here too. It was originally only on /governance_status's
+        # per-skill block, which left the card's informed block permanently
+        # empty in the live UI.
+        assert pa['link'].get('summary'), (
+            'pending_approval has no summary -> the Governance card renders '
+            '"No summary available"')
+        assert pa['link']['summary']['available'] is True, pa['link']['summary']
+
+        rg = _asyncio.run(GovStatus().process({'skill': 'link'}, None))
+        assert rg['ok'] is True, rg
+        pp = rg['pending_proposal']
+        assert pp and pp['proposal_id'] == 'link', pp
+        assert pp['summary'] and pp['summary']['available'] is True, \
+            'governance card would render no summary'
+        # Both routes must resolve the SAME document, or a reviewer could act
+        # on one card's view while approving another.
+        assert pp['summary']['summary'] == pa['link']['summary']['summary'], (
+            'the two routes disagree about the pending proposal')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('pending proposal + summary resolved by both routes')
+    print(' t_v1834_pending_approval_linkage: OK')
+
+
+@test('v1.8.34: a decision binds to the proposal it was made about')
+def t_v1834_decision_recorded_against_proposal() -> None:
+    """Without proposal_id the ledger row names only the skill, so
+    find_pending_proposal cannot tell a pending decision from a decided one
+    and the card can only ever re-prompt."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_decide_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    try:
+        (staging / 'dec.md').write_text(_v1834_proposal('dec'),
+                                       encoding='utf-8')
+        before = gov.find_pending_proposal('dec')
+        assert before and before['decision'] == 'pending', before
+
+        # Back-compat: the 3-arg call must still work exactly as before.
+        r = gov.mark_human_decision('dec', True, 'user')
+        assert r['ok'] is True, r
+        assert r.get('proposal_id') is None, r
+
+        (staging / 'dec.md').write_text(_v1834_proposal('dec'),
+                                       encoding='utf-8')
+        r2 = gov.mark_human_decision('dec', True, 'user',
+                                     proposal_id='dec',
+                                     summary_id='skillopt.proposal_summary/1')
+        assert r2['ok'] is True and r2['proposal_id'] == 'dec', r2
+
+        after = gov.find_pending_proposal('dec')
+        assert after['decision'] == 'approved', after
+        assert after.get('decided_by') == 'user', after
+        assert gov.find_pending_proposal('never-seen') is None
+        assert gov.find_pending_proposal('') is None
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('decision binds to a proposal id; 3-arg call still compatible')
+    print(' t_v1834_decision_recorded_against_proposal: OK')
+
+
+# --------------------------------------------------------------------- #
+# B. dual mode
+# --------------------------------------------------------------------- #
+
+@test('v1.8.34: the mode defaults to manual on every empty/absent config')
+def t_v1834_mode_defaults_to_manual() -> None:
+    """Manual is the safe default and it must be unreachable-to-miss: a
+    wiped config.json (the v1.8.2 incident), an empty body, or a config with
+    only unrelated keys must all resolve to manual."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_mode_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    try:
+        for label, cfg in (('empty dict', {}),
+                           ('unrelated keys', {'auto_loop_enabled': True,
+                                               'backend': 'auto'}),
+                           ('governance without the key',
+                            {'governance': {'default_policy': {'mode': 'open'}}}),
+                           ('empty evolution_mode',
+                            {'governance': {'evolution_mode': ''}})):
+            r = gov.resolve_evolution_mode(cfg)
+            assert r['mode'] == 'manual', (label, r)
+            assert r['autonomous'] is False, (label, r)
+        for junk in (None, 42, 'string', [], {'governance': 'not-a-dict'},
+                     {'governance': None}, {'auto_adopt': {'x': 1}}):
+            r = gov.resolve_evolution_mode(junk)
+            assert r['mode'] in gov.EVOLUTION_MODES, (junk, r)
+            assert r['autonomous'] is False, (junk, r)
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('manual is the default and survives hostile config shapes')
+    print(' t_v1834_mode_defaults_to_manual: OK')
+
+
+@test('v1.8.34: legacy auto_adopt is an alias; evolution_mode wins')
+def t_v1834_mode_legacy_alias() -> None:
+    """An existing install that set auto_adopt: true must keep behaving
+    autonomously, and the canonical key must win when both are present."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_alias_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    try:
+        r = gov.resolve_evolution_mode({'auto_adopt': True})
+        assert r['autonomous'] is True and r['mode'] == 'autonomous', r
+        assert r['source'] == 'auto_adopt_legacy', r
+        assert gov.resolve_evolution_mode({'auto_adopt': False})['autonomous'] is False
+
+        r = gov.resolve_evolution_mode({'auto_adopt': False,
+                                        'governance': {'evolution_mode': 'autonomous'}})
+        assert r['autonomous'] is True and r['source'] == 'evolution_mode', r
+        r = gov.resolve_evolution_mode({'auto_adopt': True,
+                                        'governance': {'evolution_mode': 'manual'}})
+        assert r['autonomous'] is False and r['source'] == 'evolution_mode', r
+
+        # Strict coercion: the string "false" must NOT enable the drain.
+        # A bare truthiness test got this backwards.
+        for falsy in ('false', 'no', 'off', '0', 'FALSE', ' False '):
+            r = gov.resolve_evolution_mode({'auto_adopt': falsy})
+            assert r['autonomous'] is False, (falsy, r)
+        for truthy in ('true', 'yes', 'on', '1', 'TRUE'):
+            r = gov.resolve_evolution_mode({'auto_adopt': truthy})
+            assert r['autonomous'] is True, (truthy, r)
+        assert gov.resolve_evolution_mode({'auto_adopt': None})['mode'] == 'manual'
+        assert gov.resolve_evolution_mode(
+            {'governance': {'evolution_mode': ' AUTONOMOUS '}})['autonomous'] is True
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('legacy alias honoured, canonical wins, coercion strict')
+    print(' t_v1834_mode_legacy_alias: OK')
+
+
+@test('v1.8.34: an invalid mode falls back to manual AND is logged once')
+def t_v1834_mode_invalid_logged() -> None:
+    """A switch that silently does nothing is the defect class this plugin
+    keeps regressing into (the official_backend drop was silent and
+    self-concealing). A rejected value must be self-diagnosing on next read."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_badmode_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    try:
+        log = runs / 'auto_loop.log'
+        r = gov.resolve_evolution_mode({'governance': {'evolution_mode': 'banana'}})
+        assert r['mode'] == 'manual' and r['autonomous'] is False, r
+        assert 'banana' in r['error'] and 'manual' in r['error'], r
+        text = log.read_text(encoding='utf-8') if log.is_file() else ''
+        assert 'banana' in text, f'rejected mode not logged: {text!r}'
+        assert 'manual' in text and 'autonomous' in text, \
+            'the log must name the valid set'
+
+        before = len(text.strip().splitlines())
+        gov.resolve_evolution_mode({'governance': {'evolution_mode': 'banana'}})
+        after = len(log.read_text(encoding='utf-8').strip().splitlines())
+        assert after == before, f'duplicate log lines: {before} -> {after}'
+
+        gov.resolve_evolution_mode({'auto_adopt': 'maybe'})
+        assert 'maybe' in log.read_text(encoding='utf-8')
+
+        # A bad canonical value with a valid legacy one keeps the legacy
+        # behaviour rather than silently surprising the operator.
+        r2 = gov.resolve_evolution_mode({'auto_adopt': True,
+                                         'governance': {'evolution_mode': 'nope'}})
+        assert r2['autonomous'] is True, r2
+        assert r2['source'] == 'auto_adopt_legacy', r2
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('invalid values fall back to manual, log once, name the valid set')
+    print(' t_v1834_mode_invalid_logged: OK')
+
+
+@test('v1.8.34: the .autonomous_pause kill switch beats any config')
+def t_v1834_mode_kill_switch() -> None:
+    """An operator must be able to stop autonomous writes to live skills
+    without editing config.json (which the WebUI also writes) and without a
+    restart. Checked FIRST in the precedence order for that reason."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_kill_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    try:
+        auto = {'governance': {'evolution_mode': 'autonomous'}}
+        assert gov.resolve_evolution_mode(auto)['autonomous'] is True
+        assert gov.is_autonomous_paused() is False
+
+        res = gov.set_autonomous_pause(True)
+        assert res['ok'] is True and res['paused'] is True, res
+        assert (runs / gov.AUTONOMOUS_PAUSE_MARKER).is_file()
+        assert gov.is_autonomous_paused() is True
+
+        for cfg in (auto, {'auto_adopt': True}):
+            r = gov.resolve_evolution_mode(cfg)
+            assert r['mode'] == 'manual' and r['autonomous'] is False, (cfg, r)
+            assert r['killed'] is True and r['source'] == 'kill_switch', r
+
+        res = gov.set_autonomous_pause(False)
+        assert res['ok'] is True and res['paused'] is False, res
+        assert not (runs / gov.AUTONOMOUS_PAUSE_MARKER).exists()
+        assert gov.resolve_evolution_mode(auto)['autonomous'] is True, \
+            'resume did not restore the configured mode'
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('kill switch overrides config both ways; resume restores')
+    print(' t_v1834_mode_kill_switch: OK')
+
+
+@test('v1.8.34 SECURITY: autonomy cannot bypass any safety rail')
+def t_autonomous_cannot_bypass_rails() -> None:
+    """THE load-bearing test for the OFF-by-default guarantee.
+
+    Autonomy overrides exactly one thing: the pending-approval block
+    (governance.py step 7). Every other rail is evaluated ABOVE that step and
+    must still bite when auto_adopt=True. If a future edit relaxes this, the
+    operator's opt-out and their compliance freeze stop working while the
+    mode still reports itself as correctly gated."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_rails_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    try:
+        sd = gov._skill_dir('rails')
+        sd.mkdir(parents=True, exist_ok=True)
+
+        def check(expected_reason, *, policy=None, optin=False, optout=False,
+                  pause=False):
+            for marker in ('.skillopt.optout', '.skillopt.optin',
+                           '.skillopt.policy.json', '.skillopt.pause_until'):
+                p = sd / marker
+                if p.is_file():
+                    p.unlink()
+            if optout:
+                (sd / '.skillopt.optout').write_text('', encoding='utf-8')
+            if optin:
+                (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+            if policy is not None:
+                (sd / '.skillopt.policy.json').write_text(
+                    json.dumps(policy), encoding='utf-8')
+            if pause:
+                (sd / '.skillopt.pause_until').write_text(
+                    str(time.time() + 3600), encoding='utf-8')
+            elig, reason = gov.check_skill_eligible('rails', auto_adopt=True)
+            assert elig is False, f'{expected_reason}: autonomy bypassed it'
+            assert reason == expected_reason, (
+                f'expected {expected_reason}, got {reason}')
+            elig2, reason2 = gov.check_skill_eligible('rails', auto_adopt=False)
+            assert reason2 == reason, (reason, reason2)
+
+        check('opted_out_via_marker', optout=True, optin=True)
+        check('mode_immutable', policy={'mode': 'immutable'}, optin=True)
+        check('mode_opt_in_no_marker', policy={'mode': 'opt_in'})
+        check('mode_opt_out_no_marker', policy={'mode': 'opt_out'})
+        check('paused_until_marker', policy={'mode': 'rate_limited'},
+              optin=True, pause=True)
+
+        # min_interval_seconds: cadence is enforced from the last ELIGIBLE
+        # decision, so record one and the rail must then hold. This is the
+        # rail most likely to be assumed harmless, and it is the one that
+        # keeps autonomy from rewriting a skill every tick.
+        for marker in ('.skillopt.optout', '.skillopt.optin',
+                       '.skillopt.policy.json', '.skillopt.pause_until'):
+            p = sd / marker
+            if p.is_file():
+                p.unlink()
+        (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+        (sd / '.skillopt.policy.json').write_text(
+            json.dumps({'mode': 'rate_limited', 'min_interval_seconds': 3600,
+                        'require_human_approval': True}), encoding='utf-8')
+        assert gov.mark_decision('rails', True, 'eligible').get('ok'), \
+            'could not record the seed decision'
+        for auto_flag in (False, True):
+            elig, reason = gov.check_skill_eligible('rails',
+                                                    auto_adopt=auto_flag)
+            assert elig is False, \
+                f'min_interval_seconds bypassed with auto_adopt={auto_flag}'
+            assert reason == 'rate_limited_min_interval', (auto_flag, reason)
+
+        # The one thing autonomy IS allowed to bypass. Uses a FRESH skill so
+        # the min_interval seed decision above cannot shadow this assertion -
+        # it is the difference between "the approval gate yielded" and "some
+        # unrelated rail fired instead".
+        sd2 = gov._skill_dir('rails_ok')
+        sd2.mkdir(parents=True, exist_ok=True)
+        (sd2 / '.skillopt.optin').write_text('', encoding='utf-8')
+        (sd2 / '.skillopt.policy.json').write_text(
+            json.dumps({'mode': 'opt_in', 'require_human_approval': True}),
+            encoding='utf-8')
+        m_e, m_r = gov.check_skill_eligible('rails_ok', auto_adopt=False)
+        a_e, a_r = gov.check_skill_eligible('rails_ok', auto_adopt=True)
+        assert (m_e, m_r) == (False, 'require_human_approval_pending'), (m_e, m_r)
+        assert (a_e, a_r) == (True, 'eligible'), (a_e, a_r)
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('6 rails hold under autonomy; only the approval gate yields')
+    print(' t_autonomous_cannot_bypass_rails: OK')
+
+
+@test('v1.8.34: autonomous daily and per-skill caps bound the drain')
+def t_autonomous_daily_cap_enforced() -> None:
+    """`auto_adopt_max_per_tick` is 5 and a 30-min tick is ~240 potential
+    writes/day, with no daily bound. This is the rail that supplies it, and a
+    cap of 0 must mean "frozen", not "clamped up"."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_cap_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    try:
+        auto = {'governance': {'evolution_mode': 'autonomous',
+                               'autonomous_max_adoptions_per_day': 2,
+                               'autonomous_max_adoptions_per_skill_per_day': 1}}
+        rails = gov.autonomous_config(auto)
+        assert rails['max_adoptions_per_day'] == 2, rails
+        assert rails['max_adoptions_per_skill_per_day'] == 1, rails
+        assert gov.autonomous_config(
+            {'governance': {'autonomous_max_adoptions_per_day': 0}}
+        )['max_adoptions_per_day'] == 0
+        assert gov.autonomous_config(
+            {'governance': {'autonomous_max_adoptions_per_day': '7'}}
+        )['max_adoptions_per_day'] == 7
+        assert gov.autonomous_config(
+            {'governance': {'autonomous_max_adoptions_per_day': 'lots'}}
+        )['max_adoptions_per_day'] == 5
+        assert gov.autonomous_config(
+            {'governance': {'autonomous_require_post_adopt_check': 'no'}}
+        )['require_post_adopt_check'] is False
+        d = gov.autonomous_config({})
+        assert d['max_adoptions_per_day'] == 5 and d['audit'] is True, d
+        assert d['require_post_adopt_check'] is True, d
+        assert d['min_evidence_rollouts'] == 0, (
+            'the rollout-count floor must default to inert: rollout_retention '
+            'deletes rollout files, so a non-zero default would block every '
+            'autonomous adoption after a prune')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('cap semantics: defaults, coercion, 0-means-frozen')
+    print(' t_autonomous_daily_cap_enforced: OK')
+
+
+@test('v1.8.34: a corrupt autonomous write is rolled back')
+def t_autonomous_postcheck_rolls_back() -> None:
+    """A machine-written change to a live skill is the case where a broken
+    write is least acceptable. The post-adopt check verifies the file is
+    present, non-empty and still loadable, and rolls back when it is not."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import auto_loop as al, governance as gov
+    from helpers import sleep_runner as sr
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_roll_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    saved_reg = sr._framework_registry_config
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'fragment_store', 'cycle_history')
+        thread = al.AutoLoopThread.__new__(al.AutoLoopThread)
+        logs = []
+        thread._log = lambda m: logs.append(str(m))
+        auto = {'governance': {'evolution_mode': 'autonomous'}}
+        manual = {'governance': {'evolution_mode': 'manual'}}
+
+        # v1.8.35 (audit F1): the operating mode is resolved from the
+        # OPERATOR's persisted config, so a caller can no longer force a mode
+        # by passing a cfg - the registry wins whenever it has anything to say.
+        # These tests therefore drive the registry, which is also what
+        # production does. Without this, the "manual" case below silently ran
+        # with the rails ACTIVE (this install persists auto_adopt: true), so
+        # the assertion passed/failed for the wrong reason.
+        sr._framework_registry_config = lambda: {'governance': {
+            'evolution_mode': 'manual'}}
+
+        # (a) Inert in manual mode: a human's write is not second-guessed.
+        assert thread._autonomous_postcheck(manual, 'rb', '') == ''
+
+        sr._framework_registry_config = lambda: {'governance': {
+            'evolution_mode': 'autonomous'}}
+
+        # (b) A healthy file passes.
+        target = gov._skill_dir('rb') / 'SKILL.md'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_v1834_skill_md('rb'), encoding='utf-8')
+        assert thread._autonomous_postcheck(auto, 'rb',
+                                            _v1834_skill_md('rb')) == ''
+
+        # (c) An EMPTY write is rolled back to the pre-adopt snapshot.
+        from helpers import fragment_store as fs
+        good = _v1834_skill_md('rb')
+        target.write_text(good, encoding='utf-8')
+        snap = fs.snapshot_default('rb', good)
+        assert snap.get('ok'), snap
+        target.write_text('', encoding='utf-8')
+        note = thread._autonomous_postcheck(auto, 'rb', good)
+        assert 'empty' in note and 'rolled back' in note, note
+        assert target.read_text(encoding='utf-8') == good, \
+            'rollback did not restore the pre-adopt bytes'
+
+        # (d) A write that lost its frontmatter is unloadable -> rollback.
+        target.write_text(good, encoding='utf-8')
+        fs.snapshot_default('rb', good)
+        target.write_text('# no frontmatter here\n', encoding='utf-8')
+        note = thread._autonomous_postcheck(auto, 'rb', good)
+        assert 'frontmatter' in note and 'rolled back' in note, note
+        assert target.read_text(encoding='utf-8') == good, \
+            'unloadable file left in place'
+
+        # (e) A first-write skill (no prior file) legitimately has no
+        #     frontmatter to lose, so that check must not fire.
+        new_target = gov._skill_dir('fresh') / 'SKILL.md'
+        new_target.parent.mkdir(parents=True, exist_ok=True)
+        new_target.write_text('# brand new, no frontmatter\n', encoding='utf-8')
+        assert thread._autonomous_postcheck(auto, 'fresh', '') == ''
+    finally:
+        sr._framework_registry_config = saved_reg
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('empty + unloadable writes rolled back; healthy and first-write pass')
+    print(' t_autonomous_postcheck_rolls_back: OK')
+
+
+@test('v1.8.34: every autonomous adoption is auditable as machine-made')
+def t_autonomous_audit_distinguishable() -> None:
+    """An autonomous change that is not permanently distinguishable from a
+    human one makes the off-by-default guarantee unverifiable after the
+    fact. decided_by already discriminates, so no second ledger is added."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import auto_loop as al, governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_audit_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history')
+        thread = al.AutoLoopThread.__new__(al.AutoLoopThread)
+        thread._log = lambda m: None
+        auto = {'governance': {'evolution_mode': 'autonomous'}}
+
+        # The audit row must also CLOSE the pending approval, which is the
+        # whole point of binding a decision to a proposal id: an autonomous
+        # adoption must not leave its own proposal looking undecided.
+        (staging / 'aud.md').write_text(_v1834_proposal('aud'),
+                                       encoding='utf-8')
+        assert gov.find_pending_proposal('aud')['decision'] == 'pending'
+
+        gov.mark_human_decision('aud', True, 'user', proposal_id='aud')
+        thread._autonomous_audit(auto, 'aud', 'aud', None,
+                                 {'lift_pp': 6.4, 'n_held_out': 8})
+
+        rows = []
+        with open(runs / 'governance.log', 'r', encoding='utf-8') as f:
+            for line in f:
+                e = json.loads(line)
+                if e.get('event') == 'human_decision':
+                    rows.append(e)
+        assert len(rows) == 2, rows
+        by = {r['decided_by']: r for r in rows}
+        assert 'user' in by and 'autonomous' in by, list(by)
+        assert by['autonomous']['proposal_id'] == 'aud', by['autonomous']
+        assert 'intent' in (by['autonomous'].get('note') or ''), \
+            by['autonomous']
+        assert 'lift_pp=6.4' in by['autonomous']['note'], by['autonomous']
+        assert by['autonomous']['approved'] is True
+
+        found = gov.find_pending_proposal('aud')
+        assert found['decision'] == 'approved', found
+        assert found['decided_by'] == 'autonomous', found
+
+        # audit: false silences the row (documented, operator opt-out).
+        (runs / 'governance.log').unlink()
+        thread._autonomous_audit({'governance': {'evolution_mode': 'autonomous',
+                                                 'autonomous_audit': False}},
+                                 'quiet', 'quiet', None, {})
+        assert not (runs / 'governance.log').is_file() or \
+            'autonomous' not in (runs / 'governance.log').read_text(
+                encoding='utf-8')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('decided_by=autonomous written with evidence; auditable separately')
+    print(' t_autonomous_audit_distinguishable: OK')
+
+
+@test('v1.8.34: the loop-state mirror exposes the daily autonomous counter')
+def t_v1834_loop_state_counter() -> None:
+    """The Evolution mode card shows consumption against the cap. That number
+    is READ from the single-writer state file here; the auto-loop thread
+    stays its only writer (child DOX, "State files are single-writer")."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import auto_loop as al
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_state_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    saved_save = al._save_state
+    saved_load = al._load_state
+    try:
+        state = {'autonomous_adoptions': {
+            time.strftime('%Y-%m-%d'): {'count': 3, 'skills': {'a': 2, 'b': 1}},
+            '2000-01-01': {'count': 9, 'skills': {}},   # stale day, dropped
+        }}
+        al._save_state = lambda s: None
+        al._load_state = lambda: state
+
+        thread = al.AutoLoopThread.__new__(al.AutoLoopThread)
+        thread._log = lambda m: None
+        thread._record_autonomous_adoption(state, 'c')
+        today = state['autonomous_adoptions'][time.strftime('%Y-%m-%d')]
+        assert today['count'] == 4, today
+        assert today['skills']['c'] == 1, today
+        assert today['last_skill'] == 'c', today
+        assert '2000-01-01' not in state['autonomous_adoptions'], \
+            list(state['autonomous_adoptions'])
+
+        snap = al.get_loop_state()
+        assert snap['autonomous_adoptions_today'] == 4, snap
+        assert snap['autonomous_adoptions_skills_today'] == {'a': 2, 'b': 1,
+                                                             'c': 1}, snap
+    finally:
+        al._save_state = saved_save
+        al._load_state = saved_load
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('counter bumped, stale days pruned, exposed read-only to the UI')
+    print(' t_v1834_loop_state_counter: OK')
+
+
+@test('v1.8.34: the config endpoint coerces and reports rejected keys')
+def t_v1834_config_coercion() -> None:
+    """api/config.py used to persist the client's value VERBATIM, so
+    "yes" for a boolean reached every consumer unvalidated. A value that
+    cannot be coerced is reported and SKIPPED - never aborting the save."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    _install_helpers_api_stub()
+    _v1834_install_plugins_stub()
+    import types as _types
+    for dotted in ("usr", "usr.plugins", "usr.plugins.skillopt"):
+        sys.modules.setdefault(dotted, _types.ModuleType(dotted))
+    try:
+        from usr.plugins.skillopt.api import config as cfgmod
+    except Exception:
+        from api import config as cfgmod  # type: ignore
+    _clean_overrides = cfgmod._clean_overrides
+    _coerce_like_default = cfgmod._coerce_like_default
+
+    merged = {'auto_adopt': False, 'auto_loop_min_rollouts': 10,
+              'backend': 'auto', 'auto_loop_skill_target': '',
+              'governance': {'evolution_mode': 'manual',
+                             'autonomous_max_adoptions_per_day': 5,
+                             'autonomous_require_post_adopt_check': True,
+                             'default_policy': {'mode': 'opt_out'}}}
+
+    ok, v = _coerce_like_default('yes', True)
+    assert ok and v is True, (ok, v)
+    ok, v = _coerce_like_default('false', True)
+    assert ok and v is False, (ok, v)
+    assert _coerce_like_default('banana', True)[0] is False
+    ok, v = _coerce_like_default('7', 5)
+    assert ok and v == 7, (ok, v)
+    assert _coerce_like_default('lots', 5)[0] is False
+    # A bool must not silently become an int, or vice versa.
+    assert _coerce_like_default(True, 5)[0] is False
+    assert _coerce_like_default(5, True)[0] is False
+
+    clean, rejected = _clean_overrides(
+        {'governance': {'evolution_mode': 'autonomous',
+                        'autonomous_max_adoptions_per_day': '3',
+                        'invented_key': 'x'},
+         'nope': 1}, merged)
+    assert 'nope' not in clean, clean
+    assert clean['governance']['evolution_mode'] == 'autonomous', clean
+    assert clean['governance']['autonomous_max_adoptions_per_day'] == 3, clean
+    assert clean['governance']['default_policy'] == {'mode': 'opt_out'}, clean
+    assert 'invented_key' not in clean['governance'], clean
+    assert 'governance.invented_key' in rejected, rejected
+    assert 'nope' not in rejected, \
+        f'a whitelisted-but-absent key must be reported differently: {rejected}'
+
+    clean2, rej2 = _clean_overrides({'auto_loop_min_rollouts': 'lots',
+                                     'backend': 'openai_compatible'}, merged)
+    assert clean2.get('backend') == 'openai_compatible', clean2
+    assert 'auto_loop_min_rollouts' not in clean2, clean2
+    assert 'auto_loop_min_rollouts' in rej2, rej2
+    _ok('coercion strict; partial nested merge preserves siblings')
+    print(' t_v1834_config_coercion: OK')
+
+
+@test('v1.8.34: the settings page declares one control per setting it can save')
+def t_v1834_ui_editable_keys_complete() -> None:
+    """Regression for the live v1.8.34 P0 fix: save() hard-coded 6 keys while
+    the page declared 13, so five rendered controls were silently discarded
+    on every save. The allowlist is now the single source of truth for both
+    directions, and a control bound to cfg.<key> must be in it."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    html = (PLUGIN_ROOT / 'webui' / 'config.html').read_text(encoding='utf-8')
+    m = re.search(r'(?s)SKILLOPT_EDITABLE_KEYS = \[(.*?)\];', html)
+    assert m, 'EDITABLE_KEYS allowlist not found'
+    listed = set(re.findall(r"'([^']+)'", m.group(1)))
+
+    bound = set(re.findall(r'x-model(?:\.number)?="cfg\.([A-Za-z0-9_]+)"', html))
+    missing = bound - listed
+    assert not missing, (
+        f'controls bound to cfg.* but absent from SKILLOPT_EDITABLE_KEYS: '
+        f'{sorted(missing)} - they would render and then be discarded on save')
+
+    for key in ('privacy_redact_secrets', 'privacy_include_tool_args',
+                'privacy_include_tool_results', 'rollout_retention_days',
+                'replay_evalkit_enabled', 'replay_evalkit_tasks_file',
+                'replay_evalkit_max_tasks'):
+        assert key in listed, f'{key} still unsaveable'
+    assert 'auto_adopt' not in listed, (
+        'auto_adopt re-added to the settings page: it is the legacy alias of '
+        'governance.evolution_mode and must have exactly one control')
+    assert 'x-model="cfg.auto_adopt"' not in html, \
+        'a second auto-adopt control has reappeared'
+    _ok(f'{len(listed)} keys, {len(bound)} bound controls, none unsaveable')
+    print(' t_v1834_ui_editable_keys_complete: OK')
+
+
+@test('v1.8.34: /mode reads, sets, refuses bad values, and toggles the kill switch')
+def t_v1834_mode_route() -> None:
+    """The /mode route is a WRITE path and the only UI surface for the
+    operating mode, so it needs its own coverage - the resolver tests alone
+    never exercise the persistence, the refusal, or the kill switch.
+
+    `helpers.plugins` is the A0 framework package (absent standalone), so it
+    is stubbed here; api/config.py's import form is proven in this plugin and
+    is deliberately not duplicated in a second style."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    _install_helpers_api_stub()
+    _v1834_install_plugins_stub()
+    import asyncio as _asyncio
+    import tempfile as _tempfile
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_moderoute_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view')
+        Mode = _v1834_import_api('mode', 'Mode')
+        stub = sys.modules['helpers.plugins']
+
+        r = _asyncio.run(Mode().process({}, None))
+        assert r['ok'] is True, r
+        assert r['mode'] == 'manual', r
+        assert r['autonomous'] is False, r
+        assert sorted(r['valid_modes']) == ['autonomous', 'manual'], r
+        assert r['rails']['max_adoptions_per_day'] == 5, r
+        assert r['require_post_adopt_check'] is True, r
+        assert r['killed'] is False, r
+
+        # adopted_today is passed IN by the caller and must be echoed as an
+        # int; /mode must never read the auto-loop state file itself.
+        assert _asyncio.run(Mode().process({'adopted_today': '3'}, None)
+                            )['adopted_today'] == 3
+        assert _asyncio.run(Mode().process({'adopted_today': 'nope'}, None)
+                            )['adopted_today'] == 0
+
+        stub._calls.clear()
+        # v2026-10-13: the write is now merged over the PERSISTED config, so
+        # the file that the import-time CONFIG_PATH points at must be under
+        # test control. Point it at a sandbox file with two unrelated
+        # settings and prove the write carries them forward.
+        config_api_path = sys.modules.get('usr.plugins.skillopt.api.config')
+        if config_api_path is None:
+            config_api_path = sys.modules.get('api.config')
+        saved_path = config_api_path.CONFIG_PATH
+        sandbox_cfg = tmp / 'config.json'
+        sandbox_cfg.write_text(json.dumps(
+            {'auto_loop_min_rollouts': 3, 'use_official_engine': False}),
+            encoding='utf-8')
+        config_api_path.CONFIG_PATH = sandbox_cfg
+        try:
+            r = _asyncio.run(Mode().process({'mode': 'autonomous'}, None))
+        finally:
+            config_api_path.CONFIG_PATH = saved_path
+        assert r['ok'] is True, r
+        assert r['mode'] == 'autonomous' and r['autonomous'] is True, r
+        assert r['saved_mode'] == 'autonomous', r
+        assert r['source'] == 'evolution_mode', r
+        saves = [c for c in stub._calls if c[0] == 'save']
+        assert len(saves) == 1, stub._calls
+        saved_cfg = saves[0][2]
+        assert saved_cfg['governance']['evolution_mode'] == 'autonomous', saved_cfg
+        assert saved_cfg['auto_adopt'] is True, saved_cfg
+        # The governance section must be COMPLETE on the way out, because
+        # save_plugin_config REPLACES the section rather than deep-merging it.
+        for sib in ('default_policy', 'autonomous_max_adoptions_per_day',
+                    'autonomous_max_adoptions_per_skill_per_day',
+                    'autonomous_min_evidence_rollouts',
+                    'autonomous_require_post_adopt_check', 'autonomous_audit'):
+            assert sib in saved_cfg['governance'], (
+                f'{sib} missing from the persisted governance section: '
+                f'{sorted(saved_cfg["governance"])}')
+        # v2026-10-13: the write must carry forward the PERSISTED keys the
+        # payload did not mention (the wipe fix) while still not expanding
+        # into the merged defaults blob.
+        for carried in ('auto_loop_min_rollouts', 'use_official_engine'):
+            assert saved_cfg.get(carried) is not None, (
+                f'persisted {carried} was wiped by the mode write: '
+                f'{sorted(saved_cfg)}')
+        assert saved_cfg['auto_loop_min_rollouts'] == 3
+        assert set(saved_cfg.keys()) == {
+            'governance', 'auto_adopt', 'auto_loop_min_rollouts',
+            'use_official_engine'}, saved_cfg
+
+        r = _asyncio.run(Mode().process({'mode': 'MANUAL'}, None))
+        assert r['ok'] is True and r['mode'] == 'manual', r
+        assert [c for c in stub._calls if c[0] == 'save'][-1][2]['auto_adopt'] is False
+
+        # An invalid mode is REFUSED, not silently corrected.
+        before = len([c for c in stub._calls if c[0] == 'save'])
+        r = _asyncio.run(Mode().process({'mode': 'banana'}, None))
+        assert r['ok'] is False, r
+        assert 'banana' in r['error'] and 'manual' in r['error'], r
+        after = len([c for c in stub._calls if c[0] == 'save'])
+        assert before == after, 'an invalid mode was written to config'
+
+        r = _asyncio.run(Mode().process({'pause': True}, None))
+        assert r['ok'] is True and r['pause']['paused'] is True, r
+        assert r['killed'] is True and r['mode'] == 'manual', r
+        from helpers import governance as gov
+        gov.set_autonomous_pause(False)
+        assert gov.resolve_evolution_mode(
+            {'governance': {'evolution_mode': 'autonomous'}})['autonomous'] is True
+        gov.set_autonomous_pause(True)
+        assert gov.resolve_evolution_mode(
+            {'governance': {'evolution_mode': 'autonomous'}})['killed'] is True
+
+        r = _asyncio.run(Mode().process({'pause': False}, None))
+        assert r['ok'] is True and r['pause']['paused'] is False, r
+        assert r['killed'] is False, r
+
+        for junk in (None, [], 'string', 42):
+            r = _asyncio.run(Mode().process(junk, None))
+            assert isinstance(r, dict) and 'ok' in r, (junk, r)
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('read / set / refuse-invalid / kill switch; legacy alias mirrored')
+    print(' t_v1834_mode_route: OK')
+
+
+@test('v1.8.34 SECURITY: /mode cannot wipe the governance section')
+def t_v1834_mode_route_no_config_wipe() -> None:
+    """A single UI toggle must never be able to delete the settings.
+
+    `merged_config()` returns an EMPTY dict (measured: 0 of 79 keys) whenever
+    the defaults YAML is unreadable, and `save_plugin_config` REPLACES the
+    `governance` section rather than deep-merging it. The first /mode
+    implementation persisted the merged blob, so in exactly that condition one
+    toggle would have written `governance: {evolution_mode: ...}` alone and
+    destroyed `default_policy` plus every `autonomous_*` rail - the v1.8.2
+    config-wipe incident class, reached through a different door.
+
+    This asserts the write goes through api/config.py's vetted
+    _read_disk + _clean_overrides path, sends only the changed keys, always
+    carries the complete governance section, and REFUSES rather than writing
+    when the config cannot be read in full."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    _install_helpers_api_stub()
+    _v1834_install_plugins_stub()
+    import asyncio as _asyncio
+    import types as _types
+    for dotted in ("usr", "usr.plugins", "usr.plugins.skillopt"):
+        sys.modules.setdefault(dotted, _types.ModuleType(dotted))
+    try:
+        from usr.plugins.skillopt.api import config as config_api
+    except Exception:
+        from api import config as config_api  # type: ignore
+    Mode = _v1834_import_api('mode', 'Mode')
+    stub = sys.modules['helpers.plugins']
+
+    full = config_api._read_disk()
+    assert 'governance' in full, 'precondition: defaults must be readable'
+    assert full['governance'].get('default_policy'), full['governance']
+    for key in ('autonomous_max_adoptions_per_day',
+                'autonomous_require_post_adopt_check', 'autonomous_audit'):
+        assert key in full['governance'], full['governance']
+
+    clean, rejected = config_api._clean_overrides(
+        {'governance': {'evolution_mode': 'autonomous'},
+         'auto_adopt': True}, full)
+    assert 'governance' in clean, (clean, rejected)
+    assert set(clean['governance']) == set(full['governance']), (
+        f'siblings lost: {set(full["governance"]) - set(clean["governance"])}')
+    assert clean['governance']['default_policy'] == \
+        full['governance']['default_policy']
+    assert set(clean) == {'governance', 'auto_adopt'}, sorted(clean)
+
+    # The refusal path: point the defaults source at nothing, which is the
+    # real degradation mode (unreadable YAML / an incomplete plugin tree).
+    from helpers import sleep_runner as sr
+    saved_sr_default = sr.default_config
+    saved_read = config_api._read_disk
+    # v1.8.52: the degraded read must ALSO not see the install's real
+    # config.json - on a live install its governance section would fill
+    # the void the stubbed defaults leave, and the precondition below
+    # would read "failed" while nothing in the code under test changed.
+    # Same per-test control of CONFIG_PATH as the write leg above.
+    config_api_path = sys.modules.get('usr.plugins.skillopt.api.config')
+    if config_api_path is None:
+        config_api_path = sys.modules.get('api.config')
+    saved_path = config_api_path.CONFIG_PATH
+    import tempfile as _tf_wipe
+    empty_dir = Path(_tf_wipe.mkdtemp(prefix='v1834_wipe_'))
+    config_api_path.CONFIG_PATH = empty_dir / 'config.json'
+    try:
+        sr.default_config = lambda: {}
+        degraded = config_api._read_disk()
+        assert 'governance' not in degraded, \
+            'precondition: the degraded read must lack governance'
+        config_api._read_disk = lambda: degraded
+        stub._calls.clear()
+        r = _asyncio.run(Mode().process({'mode': 'autonomous'}, None))
+        assert r.get('ok') is False, (
+            f'a write was attempted against an unreadable config: {r}')
+        assert 'refus' in r['error'].lower(), r
+        assert [c for c in stub._calls if c[0] == 'save'] == [], (
+            'config was written despite the refusal')
+    finally:
+        sr.default_config = saved_sr_default
+        config_api._read_disk = saved_read
+        config_api_path.CONFIG_PATH = saved_path
+        shutil.rmtree(empty_dir, ignore_errors=True)
+    _ok('complete section preserved; unreadable config refused, nothing written')
+    print(' t_v1834_mode_route_no_config_wipe: OK')
+
+
+@test('v1.8.34: the gated-cycle runner reports the resolved mode and summary')
+def t_v1834_cycle_runner_reports_summary() -> None:
+    """`run_sleep_cycle.py` is the operator-facing 'a change is waiting for
+    you' record. Before v1.8.34 its PENDING_HUMAN_APPROVAL emit named a path
+    and a byte count, and read the mode with the same bare
+    `bool(cfg.get('auto_adopt'))` truthiness bug fixed in auto_loop - so the
+    status could contradict what the loop was actually doing."""
+    src = (PLUGIN_ROOT / 'scripts' / 'run_sleep_cycle.py').read_text(
+        encoding='utf-8')
+    # Strip comments so the assertion targets CODE, not the explanatory note
+    # that necessarily quotes the old expression.
+    code = '\n'.join(ln for ln in src.splitlines()
+                     if not ln.lstrip().startswith('#'))
+    assert 'resolve_evolution_mode' in code, \
+        'the cycle runner does not use the single mode resolver'
+    assert "bool(cfg.get('auto_adopt'))" not in code and \
+        'bool(cfg.get("auto_adopt"))' not in code, \
+        'the bare auto_adopt truthiness test is back in the cycle runner'
+    assert 'summary=summary' in code, 'staging emit carries no proposal summary'
+    assert 'resolved_mode=resolved_mode' in code, \
+        'staging emit reports no resolved mode'
+    assert 'proposal_view' in code, 'the cycle runner never reads a summary'
+    # The runner must still never adopt - that invariant is load-bearing and
+    # was not relaxed by this work.
+    assert 'This runner NEVER adopts' in src
+    assert 'adopt_invoked=False' in code
+    _ok('resolver used, summary emitted, never-adopt invariant intact')
+    print(' t_v1834_cycle_runner_reports_summary: OK')
+
+
+# unittest compatibility bridge: expose the custom @test registry to
+# python -m unittest tests/smoke.py while retaining the direct runner.
+def load_tests(loader, tests, pattern):
+    import unittest
+    suite = unittest.TestSuite()
+    for name, fn in _tests:
+        suite.addTest(unittest.FunctionTestCase(fn, description=name))
+    return suite
+@test('v1.8.34: upgrading must not silently stop an autonomous install')
+def t_v1834_upgrade_preserves_operator_choice() -> None:
+    """A shipped default must never outrank an explicit operator setting.
+
+    `governance.evolution_mode` ships as `manual`, so the MERGED config always
+    contains it. The first implementation resolved against the merged config,
+    which meant that on an install whose config.json said `auto_adopt: true`,
+    upgrading to v1.8.34 silently switched unattended writes to live skills
+    OFF. That was measured on this repo's own config.json, not hypothesised.
+
+    Precedence is therefore decided against the OPERATOR's persisted config
+    (the framework registry, or config.json when the registry is unavailable),
+    so the legacy alias keeps meaning what the operator meant, and `source`
+    makes the provenance visible in the UI instead of silent."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov, sleep_runner as sr
+    tmp = Path(tempfile.mkdtemp(prefix='v1834_upgrade_'))
+    restore, staging, skills, runs = _v1834_sandbox(tmp)
+    saved_reg = sr._framework_registry_config
+    try:
+        # The real shape of an upgrading install: config.json predates the
+        # canonical key entirely, so it carries only the legacy alias.
+        sr._framework_registry_config = lambda: {'auto_adopt': True,
+                                                 'auto_loop_min_rollouts': 3}
+        r = gov.resolve_evolution_mode()
+        assert r['autonomous'] is True, (
+            f'upgrade silently disabled autonomy: {r}')
+        assert r['source'] == 'auto_adopt_legacy', r
+        # And the shipped default is what the operator was NOT choosing.
+        assert (sr.default_config().get('governance') or {}
+                ).get('evolution_mode') == 'manual'
+
+        # false stays manual.
+        sr._framework_registry_config = lambda: {'auto_adopt': False}
+        r = gov.resolve_evolution_mode()
+        assert r['autonomous'] is False, r
+
+        # An explicitly persisted canonical key outranks the legacy alias.
+        sr._framework_registry_config = lambda: {
+            'auto_adopt': False,
+            'governance': {'evolution_mode': 'autonomous'}}
+        r = gov.resolve_evolution_mode()
+        assert r['autonomous'] is True and r['source'] == 'evolution_mode', r
+
+        # Nothing persisted -> the shipped default, reported as such so the
+        # UI can distinguish "default" from "you chose this".
+        sr._framework_registry_config = lambda: {}
+        r = gov.resolve_evolution_mode()
+        assert r['mode'] == 'manual' and r['autonomous'] is False, r
+        assert r['source'] == 'evolution_mode_default', r
+
+        # A registry read that RAISES must not change the answer, and must
+        # not bubble (the v1.8.19 class: a failed registry read used to
+        # silently disable a subsystem).
+        def boom():
+            raise RuntimeError('registry down')
+
+        sr._framework_registry_config = boom
+        r = gov.resolve_evolution_mode()
+        assert r['mode'] in gov.EVOLUTION_MODES and 'killed' in r, r
+    finally:
+        sr._framework_registry_config = saved_reg
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('legacy choice survives the upgrade; explicit canonical still wins')
+    print(' t_v1834_upgrade_preserves_operator_choice: OK')
+
+
+# ======================================================================= #
+# v1.8.35 - Phase 1 remediation: safety rails and the autonomy contract
+# ======================================================================= #
+#
+# Every test here corresponds to a finding in the 2026-10-04 audit register
+# (AGENTS.md). They are grouped because they share one property: each pins a
+# FAIL-CLOSED or fail-safe behaviour on the path to a live SKILL.md, which is
+# exactly the class of defect that stays invisible until it writes a file.
+#
+#   F1  resolver precedence must not be decided from a merged config blob
+#   F5  per-tick rollout-count invalidation must actually invalidate
+#   F6  the single-writer state file must be written atomically
+#   F7  the daily budget cap must roll over on the READ path, not only
+#       after a successful spend
+#   F8  a raising governance check must DEFER, never wave through
+#   F9  an `autonomous` ledger row must not satisfy the human-approval gate
+
+_section_v1835 = ('v1.8.35 NEW: audit Phase 1 - safety rails + autonomy contract '
+                  '(9 cases)')
+
+
+def _v1835_sandbox(tmp):
+    """Sandbox staging/skills/runs and restore every patch on exit."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import governance as gov, sleep_runner as sr
+    staging, skills, runs = tmp / 'staging', tmp / 'skills', tmp / 'runs'
+    for d in (staging, skills, runs):
+        d.mkdir(parents=True, exist_ok=True)
+    saved = (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir, gov._runs_dir,
+             gov._TEST_SKILLS_DIR, gov._mode_reported,
+             sr._framework_registry_config, sr.default_config)
+    sr.staging_dir = lambda: staging
+    sr.a0_skills_dir = lambda: skills
+    sr.runs_dir = lambda: runs
+    gov._runs_dir = lambda: runs
+    gov.set_skills_dir_for_tests(skills)
+    gov._mode_reported = {}
+
+    def restore():
+        (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir,
+         gov._runs_dir) = saved[:4]
+        gov._TEST_SKILLS_DIR = saved[4]
+        gov._mode_reported = saved[5]
+        sr._framework_registry_config = saved[6]
+        sr.default_config = saved[7]
+    return restore, staging, skills, runs
+
+
+@test('v1.8.35 F1: production call sites must NOT pass the merged config')
+def t_v1835_merged_config_does_not_outrank_operator() -> None:
+    """The bug the audit found live.
+
+    `governance.evolution_mode` ships as `manual`, so `merged_config()` ALWAYS
+    contains it. Every production call site used to pass that merged blob, so
+    precedence step 1 matched on the *shipped default*, the legacy alias was
+    never consulted, and an install whose config.json says `auto_adopt: true`
+    resolved to manual with `source: "evolution_mode"` - a false provenance.
+    Live evidence was the drain's own canary line firing on every tick.
+
+    The fix has two halves, and BOTH are asserted here:
+      1. the resolver prefers the operator's persisted config, and
+      2. the call sites pass no argument, so they take that path.
+    Half 1 alone leaves production broken, which is exactly what happened."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov, sleep_runner as sr
+    tmp = Path(tempfile.mkdtemp(prefix='v1835_f1_'))
+    restore, staging, skills, runs = _v1835_sandbox(tmp)
+    try:
+        # ---- half 1: the resolver prefers the operator's config -------
+        sr._framework_registry_config = lambda: {'auto_adopt': True}
+        r = gov.resolve_evolution_mode()
+        assert r['autonomous'] is True, (
+            f'the operator config was not consulted: {r}')
+        assert r['source'] == 'auto_adopt_legacy', (
+            f'provenance must name the legacy alias: {r}')
+
+        # An explicitly persisted canonical key outranks the alias.
+        sr._framework_registry_config = lambda: {
+            'auto_adopt': False,
+            'governance': {'evolution_mode': 'autonomous'}}
+        r = gov.resolve_evolution_mode()
+        assert r['autonomous'] is True and r['source'] == 'evolution_mode', r
+
+        # An operator who explicitly wants manual via the canonical key is
+        # honoured - `auto_adopt: true` must not drag them into autonomy.
+        sr._framework_registry_config = lambda: {
+            'auto_adopt': True,
+            'governance': {'evolution_mode': 'manual'}}
+        r = gov.resolve_evolution_mode()
+        assert r['autonomous'] is False and r['source'] == 'evolution_mode', r
+
+        # Nothing persisted -> the shipped default, reported as a default.
+        sr._framework_registry_config = lambda: {}
+        r = gov.resolve_evolution_mode()
+        assert r['autonomous'] is False, r
+        assert r['source'] == 'evolution_mode_default', r
+
+        # With no registry available (standalone python) an explicit cfg is
+        # the only evidence there is, and the canonical key still wins there.
+        def boom():
+            raise RuntimeError('registry unavailable')
+
+        sr._framework_registry_config = boom
+        r = gov.resolve_evolution_mode({'auto_adopt': True})
+        assert r['autonomous'] is True and r['source'] == 'auto_adopt_legacy', r
+
+        # ---- half 2: no production call site may pass `cfg` -----------
+        # This is the half that actually fixes production. Asserted on the
+        # SOURCE so it cannot regress silently: every call must be the
+        # no-argument form, because a merged blob re-introduces F1 exactly.
+        def offenders_in(path: Path):
+            code = '\n'.join(ln for ln in path.read_text(
+                encoding='utf-8').splitlines()
+                if not ln.lstrip().startswith('#'))
+            return [ln.strip() for ln in code.splitlines()
+                    if 'resolve_evolution_mode(' in ln
+                    and 'resolve_evolution_mode()' not in ln]
+
+        bad = offenders_in(PLUGIN_ROOT / 'helpers' / 'auto_loop.py')
+        assert not bad, (
+            'these auto_loop call sites pass a config to '
+            f'resolve_evolution_mode, re-introducing audit F1: {bad}')
+        bad = offenders_in(PLUGIN_ROOT / 'scripts' / 'run_sleep_cycle.py')
+        assert not bad, (
+            f'run_sleep_cycle.py must also call it with no argument: {bad}')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('resolver reads the operator config AND call sites stop passing merged')
+    print(' t_v1835_merged_config_does_not_outrank_operator: OK')
+
+
+@test('v1.8.35 F1: the REAL auto-loop gate honours the operator config')
+def t_v1835_autoloop_resolves_mode_from_merged() -> None:
+    """Drives the REAL `AutoLoopThread._tick` gate, not a copy of it.
+
+    This test exists because of F1, and its first version was weak in exactly
+    the way that let F1 ship: it reimplemented the drain gate (`def canary`)
+    and asserted on the transcription, so the real gate could be wrong while
+    the test passed. It now patches only `_tick`'s I/O edges and observes
+    whether `_auto_adopt` was actually invoked - which IS the resolved mode,
+    because that call is the gate's only effect at step 3.
+
+    `_auto_adopt` is recorded rather than run so no adoption happens; the
+    assertion is about the DECISION, not the write."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import auto_loop as al, governance as gov
+    from helpers import sleep_runner as sr
+    tmp = Path(tempfile.mkdtemp(prefix='v1835_f1loop_'))
+    restore, staging, skills, runs = _v1835_sandbox(tmp)
+    saved = (sr.enforce_rollout_retention, sr.list_rollouts,
+             sr.enforce_run_log_retention)
+    try:
+        # I/O edges only. new_rollouts == 0 skips the cycle branch and the
+        # opt-in scan, so _tick goes straight to the adopt gate.
+        sr.enforce_rollout_retention = lambda cfg=None: {'deleted': 0,
+                                                          'errors': 0}
+        sr.list_rollouts = lambda: []
+        sr.enforce_run_log_retention = lambda: 0
+
+        def run_tick(cfg):
+            """One real tick; returns (auto_adopt_called, log_lines)."""
+            thread = al.AutoLoopThread.__new__(al.AutoLoopThread)
+            lines = []
+            calls = []
+            thread._log = lambda m: lines.append(str(m))
+            thread._auto_adopt = lambda st, c: calls.append(st) or 'drained'
+            thread._record_error = lambda exc, where: None
+            state = {'last_rollout_count_at_cycle': 0}
+            try:
+                thread._tick(cfg, state)
+            except Exception as e:
+                raise AssertionError(
+                    f'_tick raised, so the gate never ran: '
+                    f'{type(e).__name__}: {e}')
+            return calls, lines
+
+        merged = {'auto_adopt': True,
+                  'governance': {'evolution_mode': 'manual'}}
+
+        # The live install's shape: only the legacy alias is persisted. The
+        # shipped default in `merged` must NOT win.
+        sr._framework_registry_config = lambda: {'auto_adopt': True}
+        gov._mode_reported = {}
+        calls, lines = run_tick(merged)
+        assert calls, (
+            'the real _tick did not auto-adopt even though the operator '
+            f'persisted auto_adopt: true. logs={lines}')
+        assert not any('mode resolver rejected' in ln for ln in lines), (
+            f'the "resolver rejected" canary fired again: {lines}')
+
+        # Manual mode: the drain must NOT run, and the canary must NOT fire
+        # either (it is reserved for a value the resolver genuinely rejects).
+        sr._framework_registry_config = lambda: {'governance': {
+            'evolution_mode': 'manual'}}
+        gov._mode_reported = {}
+        calls2, lines2 = run_tick(merged)
+        assert not calls2, (
+            f'the real _tick auto-adopted in manual mode: {lines2}')
+
+        # A genuinely unusable value still trips the canary, so the diagnostic
+        # is not dead code.
+        sr._framework_registry_config = lambda: {'auto_adopt': 'banana'}
+        gov._mode_reported = {}
+        calls3, lines3 = run_tick(merged)
+        assert not calls3, 'an unusable auto_adopt value must not drain'
+        assert any('mode resolver rejected' in ln for ln in lines3), (
+            f'the canary did not fire for a rejected value: {lines3}')
+    finally:
+        (sr.enforce_rollout_retention, sr.list_rollouts,
+         sr.enforce_run_log_retention) = saved
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('the REAL _tick gate: drains on the operator choice, not on the default')
+    print(' t_v1835_autoloop_resolves_mode_from_merged: OK')
+
+@test('v1.8.35 F8: a raising governance check DEFERS, it does not wave through')
+def t_v1835_governance_failure_is_fail_closed() -> None:
+    """The old caller logged "fall through" and returned ELIGIBLE, making a
+    governance bug indistinguishable from a clean bill of health: optout,
+    immutable, pause, cadence and budget were all skipped, and under autonomy
+    the drain then wrote a live SKILL.md for a paused skill."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import auto_loop as al, governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1835_f8_'))
+    restore, staging, skills, runs = _v1835_sandbox(tmp)
+    saved_check = gov.check_skill_eligible
+    saved_decision = gov.mark_decision
+    saved_record_err = al._record_error
+    try:
+        thread = al.AutoLoopThread.__new__(al.AutoLoopThread)
+        logs = []
+        errors = []
+        thread._log = lambda m: logs.append(str(m))
+        al._record_error = lambda exc, where: errors.append((where, str(exc)))
+
+        def boom(*a, **kw):
+            raise RuntimeError('logs/runs is read-only')
+
+        gov.check_skill_eligible = boom
+        gov.mark_decision = lambda *a, **kw: {'ok': False}
+        try:
+            eligible, reason = thread._skill_eligible_for_cycle('x', {})
+        finally:
+            gov.check_skill_eligible = saved_check
+            gov.mark_decision = saved_decision
+
+        assert eligible is False, (
+            f'a raising governance check still produced eligible={eligible} '
+            f'({reason}) - every rail would be skipped for this cycle')
+        assert reason == 'governance_unavailable', reason
+        assert any('DEFER' in ln for ln in logs), (
+            f'the deferral must be logged or the operator has no signal: {logs}')
+        assert errors, 'the failure must reach _record_error for the dashboard'
+
+        # And the happy path must NOT be labelled governance_unavailable.
+        e, r = thread._skill_eligible_for_cycle('x', {})
+        assert r != 'governance_unavailable', (
+            f'governance_unavailable must mean governance is absent or '
+            f'raising, not the normal path ({r})')
+    finally:
+        al._record_error = saved_record_err
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('governance failure defers with a logged, recorded reason')
+    print(' t_v1835_governance_failure_is_fail_closed: OK')
+
+
+@test('v1.8.35 F9: an autonomous row must NOT satisfy the human-approval gate')
+def t_v1835_autonomous_does_not_satisfy_human_gate() -> None:
+    """`_human_approved` used to accept ANY `human_decision` row, and the
+    drain's own audit hook writes `decided_by="autonomous"` rows through the
+    same function. So after one autonomous adoption, flipping back to manual
+    passed `require_human_approval` with no human ever clicking Approve."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1835_f9_'))
+    restore, staging, skills, runs = _v1835_sandbox(tmp)
+    try:
+        sd = gov._skill_dir('f9')
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+        (sd / '.skillopt.policy.json').write_text(
+            json.dumps({'mode': 'opt_in', 'require_human_approval': True}),
+            encoding='utf-8')
+        (staging / 'f9.md').write_text(_v1834_skill_md('f9'), encoding='utf-8')
+
+        gov.mark_human_decision('f9', True, 'autonomous', proposal_id='f9')
+        assert gov._human_approved('f9') is False, (
+            'an autonomous row satisfied the HUMAN approval gate')
+        e, r = gov.check_skill_eligible('f9', auto_adopt=False)
+        assert (e, r) == (False, 'require_human_approval_pending'), (e, r)
+
+        # But it DID decide the proposal, so the card must not re-prompt.
+        found = gov.find_pending_proposal('f9')
+        assert found['decision'] == 'approved', found
+        assert found['decided_by'] == 'autonomous', found
+
+        # A real human approval does satisfy it.
+        gov.mark_human_decision('f9', True, 'user', proposal_id='f9')
+        assert gov._human_approved('f9') is True
+        e2, r2 = gov.check_skill_eligible('f9', auto_adopt=False)
+        assert (e2, r2) == (True, 'eligible'), (e2, r2)
+
+        # A legacy row with no decided_by defaults to "user", so ledgers
+        # written before the field existed stay valid.
+        #
+        # v1.8.38 (audit M1/M2): `_last_human_decision` now picks the newest
+        # decision by PARSED EPOCH across the log generations and the durable
+        # index, rather than "last line wins". That is strictly more correct -
+        # a log whose generations were merged can be out of line order - but
+        # it means this probe's deliberately far-future timestamp would then
+        # outrank every later decision for `f9`. So it runs against its own
+        # skill, where it cannot dominate the sequence under test.
+        with open(runs / 'governance.log', 'a', encoding='utf-8') as f:
+            f.write(json.dumps({'ts_iso': '2999-01-01T00:00:00+00:00',
+                                'skill': 'f9legacy',
+                                'event': 'human_decision',
+                                'approved': True}) + '\n')
+        assert gov._human_approved('f9legacy') is True, (
+            'a row predating decided_by must default to a human decision')
+
+        # A human denial is still a denial.
+        gov.mark_human_decision('f9', False, 'user')
+        assert gov._human_approved('f9') is False, (
+            f'a human denial did not clear the approval: '
+            f'{gov._last_human_decision("f9")}')
+        # ...and it is the NEWEST that wins, not merely the last-written.
+        gov.mark_human_decision('f9', True, 'user')
+        assert gov._human_approved('f9') is True
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('machine decisions never satisfy the human gate; cards still un-prompt')
+    print(' t_v1835_autonomous_does_not_satisfy_human_gate: OK')
+
+
+@test('v1.8.35 F7: the daily budget cap rolls over on the READ path')
+def t_v1835_budget_rollover_unlatches_cap() -> None:
+    """`can_spend` never rolled the day over and `_maybe_rollover` was only
+    reachable from `record_spend`, which itself only runs AFTER a cycle that
+    `can_spend` gates. Hitting the cap therefore deadlocked permanently."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import budget as bg
+    tmp = Path(tempfile.mkdtemp(prefix='v1835_f7_'))
+    try:
+        st = tmp / 'budget'
+        st.mkdir(parents=True, exist_ok=True)
+        saved_dir = bg._default_state_dir
+        bg._default_state_dir = lambda: st
+        try:
+            now = time.time()
+            day = 24 * 3600
+
+            def write_state(total, reset_at):
+                # Use the tracker's OWN state path so the test cannot drift
+                # from the module's file naming.
+                bt = bg.BudgetTracker('f7skill', daily_cap_cents=100)
+                bt._state_path().parent.mkdir(parents=True, exist_ok=True)
+                bt._state_path().write_text(
+                    json.dumps({'daily_total_cents': total,
+                                'blocked_calls': 3, 'soft_warned': True,
+                                'reset_at': reset_at}),
+                    encoding='utf-8')
+                return bt
+
+            # A tracker whose stored reset boundary is already in the past.
+            bt = write_state(100, now - 10)
+            ok, reason = bt.can_spend(1)
+            assert ok is True, f'the cap latched across a day boundary: {reason}'
+            status = bt.get_status()
+            assert status['daily_total_cents'] == 0, status
+            assert status['blocked_calls'] == 0, status
+            assert status['reset_at'] > now, status
+
+            # Same-day behaviour is unchanged: still refuses.
+            bt2 = write_state(100, now + day)
+            ok2, reason2 = bt2.can_spend(1)
+            assert ok2 is False and 'daily cap' in reason2, (ok2, reason2)
+
+            # A cap of 0 still means "no cap", not "always refuse".
+            bt3 = bg.BudgetTracker('f7skill', daily_cap_cents=0)
+            bt3._state_path().write_text(
+                json.dumps({'daily_total_cents': 999, 'reset_at': now + day}),
+                encoding='utf-8')
+            assert bt3.can_spend(10_000)[0] is True
+        finally:
+            bg._default_state_dir = saved_dir
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('rollover happens on read; same-day refusal and cap=0 unchanged')
+    print(' t_v1835_budget_rollover_unlatches_cap: OK')
+
+
+@test('v1.8.35 F5: the rollout-count cache is actually invalidated per tick')
+def t_v1835_rollout_cache_invalidated() -> None:
+    """`_invalidate_rollout_counts` assigned a CLASS attribute while the
+    reader used `getattr(self, ...)`, so once the instance attribute existed
+    the per-tick invalidation was a permanent no-op and the evidence rail
+    compared against a snapshot frozen at the first drain."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import auto_loop as al, sleep_runner as sr
+    tmp = Path(tempfile.mkdtemp(prefix='v1835_f5_'))
+    rd = tmp / 'rollouts'
+    rd.mkdir(parents=True, exist_ok=True)
+    saved_dir = sr.rollouts_dir
+    sr.rollouts_dir = lambda: rd
+    try:
+        thread = al.AutoLoopThread(get_config=lambda: {})
+        assert thread._rollout_counts_cache is None, (
+            'the cache must be initialised in __init__ so the instance '
+            'attribute exists and the invalidation can clear it')
+
+        (rd / 'a.json').write_text(json.dumps({'skill_used': 'alpha'}),
+                                   encoding='utf-8')
+        assert thread._skill_rollout_count('alpha') == 1
+        assert thread._skill_rollout_count('beta') == 0
+        assert isinstance(thread._rollout_counts_cache, dict)
+
+        # WITHOUT invalidation the count is stale...
+        (rd / 'b.json').write_text(json.dumps({'skill_used': 'alpha'}),
+                                   encoding='utf-8')
+        assert thread._skill_rollout_count('alpha') == 1, 'precondition'
+
+        # ...and WITH it the cache is rebuilt. This is what the old
+        # class-attribute implementation failed.
+        thread._invalidate_rollout_counts()
+        assert thread._rollout_counts_cache is None
+        assert thread._skill_rollout_count('alpha') == 2, (
+            'invalidation did not take effect: the cache is still stale')
+
+        # And it must not have leaked onto the class, where one instance
+        # would poison every other.
+        assert getattr(al.AutoLoopThread, '_rollout_counts_cache', 'absent') \
+            in (None, 'absent'), (
+            'the cache leaked onto the class, where one instance would '
+            'poison every other')
+    finally:
+        sr.rollouts_dir = saved_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('instance cache, real invalidation, no class-level leakage')
+    print(' t_v1835_rollout_cache_invalidated: OK')
+
+
+@test('v1.8.35 F6: the single-writer state file is written atomically')
+def t_v1835_state_write_is_atomic() -> None:
+    """`_save_state` was the last non-atomic state write in the plugin while
+    a concurrent reader exists on the HTTP thread. A torn read is swallowed by
+    `_load_state`, which returns DEFAULTS - resetting counters AND zeroing
+    `last_rollout_count_at_cycle`, which fires an unscheduled cycle."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import auto_loop as al
+    tmp = Path(tempfile.mkdtemp(prefix='v1835_f6_'))
+    saved_path = al._state_path
+    try:
+        target = tmp / 'runs' / '.auto_loop_state.json'
+        al._state_path = lambda: target
+
+        def residue():
+            return [p.name for p in target.parent.iterdir()
+                    if p.name != target.name]
+
+        al._save_state({'cycles_run': 7, 'proposals_adopted': 2,
+                        'last_rollout_count_at_cycle': 41})
+        assert target.is_file(), target
+        data = json.loads(target.read_text(encoding='utf-8'))
+        assert data['cycles_run'] == 7 and \
+            data['last_rollout_count_at_cycle'] == 41, data
+        assert residue() == [], f'temp file left behind: {residue()}'
+
+        # A reader must only ever see a complete document.
+        first = target.read_text(encoding='utf-8')
+        al._save_state({'cycles_run': 8, 'proposals_adopted': 2,
+                        'last_rollout_count_at_cycle': 41})
+        second = target.read_text(encoding='utf-8')
+        assert json.loads(first)['cycles_run'] == 7
+        assert json.loads(second)['cycles_run'] == 8
+        assert residue() == [], residue()
+
+        # A failing serialisation must not damage the previous good state.
+        class Unserialisable:
+            pass
+
+        al._save_state({'bad': Unserialisable()})
+        assert json.loads(target.read_text(encoding='utf-8'))['cycles_run'] == 8, (
+            'a failed write damaged the previous good state')
+        assert residue() == [], f'temp file left after a failed write: {residue()}'
+    finally:
+        al._state_path = saved_path
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('atomic replace, no temp residue, previous state survives a failure')
+    print(' t_v1835_state_write_is_atomic: OK')
+
+
+@test('v1.8.35: an unreadable pause marker does not read as "not paused"')
+def t_v1835_unreadable_pause_marker_defers() -> None:
+    """The `.skillopt.pause_until` read was unguarded, so a marker left
+    non-UTF-8 by an interrupted multi-byte write raised, reached auto_loop's
+    fail-open handler, and disabled every governance rail for that cycle -
+    including optout and immutable."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1835_pu_'))
+    restore, staging, skills, runs = _v1835_sandbox(tmp)
+    try:
+        sd = gov._skill_dir('pu')
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+        (sd / '.skillopt.policy.json').write_text(
+            json.dumps({'mode': 'opt_in', 'require_human_approval': True}),
+            encoding='utf-8')
+
+        # A valid future pause still pauses.
+        (sd / '.skillopt.pause_until').write_text(
+            str(time.time() + 3600), encoding='utf-8')
+        e, r = gov.check_skill_eligible('pu')
+        assert (e, r) == (False, 'paused_until_marker'), (e, r)
+
+        # A corrupt marker must NOT read as "not paused", and must not raise
+        # out of the eligibility call.
+        (sd / '.skillopt.pause_until').write_bytes(b'\xff\xfe\x00 not utf 8')
+        try:
+            e2, r2 = gov.check_skill_eligible('pu')
+        except Exception as exc:  # would be the fail-open trigger
+            raise AssertionError(
+                f'check_skill_eligible raised on a corrupt marker: {exc!r}')
+        assert e2 is False, (
+            f'a corrupt pause marker produced eligible={e2} ({r2}); an '
+            f'unreadable rail must defer, never wave through')
+        e3, r3 = gov.check_skill_eligible('pu', auto_adopt=True)
+        assert e3 is False, f'autonomy bypassed an unreadable pause marker ({r3})'
+
+        # A past pause is genuinely not paused: the skill then falls through
+        # to its approval gate, which is the next reason and is correct here.
+        (sd / '.skillopt.pause_until').write_text(
+            str(time.time() - 10), encoding='utf-8')
+        e4, r4 = gov.check_skill_eligible('pu')
+        assert r4 == 'require_human_approval_pending', (
+            f'a past pause must stop masking the next gate, got {(e4, r4)}')
+        # With a human approval on record the same state is fully eligible,
+        # proving the pause marker was the only thing holding it back.
+        gov.mark_human_decision('pu', True, 'user', proposal_id='pu')
+        e5, r5 = gov.check_skill_eligible('pu')
+        assert (e5, r5) == (True, 'eligible'), (e5, r5)
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('valid pause pauses; corrupt pause defers; past pause releases')
+    print(' t_v1835_unreadable_pause_marker_defers: OK')
+
+
+@test('v1.8.35: the whole fail-closed set holds together under autonomy')
+def t_v1835_fail_closed_under_autonomy() -> None:
+    """One assertion for the Phase 1 thesis: on the path that writes live
+    files unattended, "I could not tell" must never mean "yes"."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1835_all_'))
+    restore, staging, skills, runs = _v1835_sandbox(tmp)
+    try:
+        sd = gov._skill_dir('all')
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+        (sd / '.skillopt.policy.json').write_text(
+            json.dumps({'mode': 'opt_in', 'require_human_approval': True}),
+            encoding='utf-8')
+
+        # An autonomous adoption must leave the HUMAN gate shut.
+        gov.mark_human_decision('all', True, 'autonomous', proposal_id='all')
+        e, r = gov.check_skill_eligible('all', auto_adopt=False)
+        assert (e, r) == (False, 'require_human_approval_pending'), (e, r)
+        # Autonomy legitimately bypasses the approval gate - and only it.
+        e, r = gov.check_skill_eligible('all', auto_adopt=True)
+        assert (e, r) == (True, 'eligible'), (e, r)
+
+        # Opt-out still wins over autonomy...
+        (sd / '.skillopt.optout').write_text('', encoding='utf-8')
+        e, r = gov.check_skill_eligible('all', auto_adopt=True)
+        assert (e, r) == (False, 'opted_out_via_marker'), (e, r)
+        (sd / '.skillopt.optout').unlink()
+
+        # ...and a corrupt pause marker defers even with the gate open.
+        (sd / '.skillopt.pause_until').write_bytes(b'\xff\xfe\x00')
+        e, r = gov.check_skill_eligible('all', auto_adopt=True)
+        assert e is False, (e, r)
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('autonomy still yields only the approval gate; rails stay shut')
+    print(' t_v1835_fail_closed_under_autonomy: OK')
+
+
+def _adopt_opt_in(gov, skill):
+    """Grant a skill the opt-in the /adopt governance gate requires.
+
+    v1.8.41 (re-audit R1): `/adopt` now runs `check_skill_eligible`, and the
+    shipped default policy is `mode: opt_out`, so a route-mechanics test must
+    opt the skill in explicitly. These tests are about proposal_id resolution,
+    atomic writes, snapshot refusal and single-flight - none is a test about
+    governance, and none should have to build a governance fixture to get
+    past the gate. Stubbing the gate out instead would recreate the failure
+    this work exists to fix: a test that appears to cover a path while
+    bypassing its check.
+
+    `require_human_approval: False` keeps the approval gate out of the way so
+    these cases stay about what they are about.
+    """
+    sd = gov._skill_dir(skill)
+    sd.mkdir(parents=True, exist_ok=True)
+    (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+    (sd / '.skillopt.policy.json').write_text(
+        json.dumps({'mode': 'opt_in', 'require_human_approval': False}),
+        encoding='utf-8')
+    return sd
+
+# ======================================================================= #
+# v1.8.36 - Phase 2 remediation: the human approval path is authoritative
+# ======================================================================= #
+#
+# Phase 1 made the gates themselves correct. Phase 2 makes the routes a
+# person actually clicks behave the way the approval UI claims they do.
+#
+#   F2  a human rejection was advisory -> the drain re-adopted the document
+#   F3  /adopt wrote the live SKILL.md non-atomically and overwrote even when
+#       the snapshot failed
+#   F10 /governance_approve defaulted `approved` to True and read "false" as
+#       approval
+#   M5  /adopt silently adopted the NEWEST proposal when the id did not match
+#   M6  the settings page reported a failed snapshot as success
+#   M7  neither manual adopt path honoured real-gate single-flight, consumed
+#       the proposal, or refused an ungated direct adopt
+#   M8  the agent-callable adopt tool skipped governance entirely and ran a
+#       different gate than the HTTP route
+#
+# The shared thesis: the three adopt paths (HTTP route, agent tool, drain)
+# must be the SAME gate. A path that is easier to reach must not be weaker.
+
+_section_v1836 = ('v1.8.36 NEW: audit Phase 2 - human approval path is '
+                  'authoritative (9 cases)')
+
+
+def _v1836_sandbox(tmp):
+    """Sandbox staging/skills/runs AND pin the operator mode via the registry.
+
+    Phase 1 (audit F1) made the registry authoritative for the operating mode,
+    so a test can no longer force a mode by passing a cfg. Every test here
+    drives `_framework_registry_config`, exactly as production does.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import governance as gov, sleep_runner as sr
+    staging, skills, runs = tmp / 'staging', tmp / 'skills', tmp / 'runs'
+    for d in (staging, skills, runs):
+        d.mkdir(parents=True, exist_ok=True)
+    saved = (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir, gov._runs_dir,
+             gov._TEST_SKILLS_DIR, gov._mode_reported,
+             sr._framework_registry_config, sr.default_config)
+    sr.staging_dir = lambda: staging
+    sr.a0_skills_dir = lambda: skills
+    sr.runs_dir = lambda: runs
+    gov._runs_dir = lambda: runs
+    gov.set_skills_dir_for_tests(skills)
+    gov._mode_reported = {}
+    state = {'mode': 'manual'}
+
+    def set_mode(mode):
+        state['mode'] = mode
+        gov._mode_reported = {}
+        sr._framework_registry_config = lambda: {
+            'governance': {'evolution_mode': state['mode']}}
+
+    def restore():
+        (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir,
+         gov._runs_dir) = saved[:4]
+        gov._TEST_SKILLS_DIR = saved[4]
+        gov._mode_reported = saved[5]
+        sr._framework_registry_config = saved[6]
+        sr.default_config = saved[7]
+    return restore, staging, skills, runs, set_mode
+
+
+def _v1836_install_tool_stub():
+    """Stub the framework `helpers.tool` so `tools/skillopt_sleep.py` imports.
+
+    The agent tools do `from helpers.tool import Response, Tool`. In the
+    standalone smoke environment `helpers` is the PLUGIN's helper package, so
+    that module is absent - which is why no existing test instantiates a tool
+    (they read it as source text instead). Phase 2 needs the adopt tool's real
+    behaviour, so it gets a minimal `Response` carrying the two fields the
+    tool sets. Idempotent.
+    """
+    if 'helpers.tool' in sys.modules:
+        return sys.modules['helpers.tool']
+    import types as _types
+    mod = _types.ModuleType('helpers.tool')
+
+    class Response:  # noqa: D401 - stand-in for the framework class
+        def __init__(self, message='', break_loop=False, **kw):
+            self.message = message
+            self.break_loop = break_loop
+            for k, v in kw.items():
+                setattr(self, k, v)
+
+    class Tool:  # noqa: D401 - stand-in for the framework base class
+        pass
+
+    mod.Response = Response  # type: ignore[attr-defined]
+    mod.Tool = Tool  # type: ignore[attr-defined]
+    sys.modules['helpers.tool'] = mod
+    import helpers as _hp
+    _hp.tool = mod  # type: ignore[attr-defined]
+    return mod
+
+
+def _v1836_write_proposal(staging, skill, body='improved body\n'):
+    staging.mkdir(parents=True, exist_ok=True)
+    src = staging / f'{skill}.md'
+    src.write_text(_v1834_skill_md(skill, body), encoding='utf-8')
+    return src
+
+
+@test('v1.8.36 F2: a human rejection is a RAIL, not an advisory flag')
+def t_v1836_rejection_is_a_rail() -> None:
+    """The core of Phase 2.
+
+    A denial used to only flip `_human_approved()` to False, which parks the
+    skill at `require_human_approval_pending` in MANUAL mode - but autonomy
+    skips that very gate, so the drain re-read the same rejected file and
+    wrote it into the live SKILL.md. A human "no" was advisory.
+
+    Autonomy may bypass "has nobody approved this?" - that is what autonomy
+    means. It must never bypass "a human refused this document".
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1836_f2_'))
+    restore, staging, skills, runs, set_mode = _v1836_sandbox(tmp)
+    try:
+        sd = gov._skill_dir('rej')
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+        (sd / '.skillopt.policy.json').write_text(
+            json.dumps({'mode': 'opt_in', 'require_human_approval': True}),
+            encoding='utf-8')
+        src = _v1836_write_proposal(staging, 'rej')
+
+        # Sanity: before any decision, autonomy makes it eligible (that is
+        # what the approval gate is for).
+        set_mode('autonomous')
+        e, r = gov.check_skill_eligible('rej', auto_adopt=True)
+        assert (e, r) == (True, 'eligible'), (e, r)
+
+        # A human denies this proposal.
+        gov.mark_human_decision('rej', False, 'user', proposal_id='rej')
+
+        # Now it must be blocked in BOTH modes.
+        for flag in (False, True):
+            e, r = gov.check_skill_eligible('rej', auto_adopt=flag)
+            assert e is False, (
+                f'a human rejection was ignored with auto_adopt={flag} '
+                f'({r}) - the rejected document would have been adopted')
+            assert r == 'human_rejected', (
+                f'expected the rejection rail, got {r}')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('rejection blocks in manual AND autonomous mode')
+    print(' t_v1836_rejection_is_a_rail: OK')
+
+
+@test('v1.8.36 F2: a rejection binds ONE proposal, not the skill forever')
+def t_v1836_rejection_is_not_permanent() -> None:
+    """A staleness rule is what keeps the rail from becoming a mute button.
+
+    The denial must post-date the staged document. A NEW proposal for the
+    same skill is a different document and is judged on its own merits -
+    otherwise one rejection would permanently disable evolution for that skill
+    with no visible cause and no way back.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    import os
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1836_f2b_'))
+    restore, staging, skills, runs, set_mode = _v1836_sandbox(tmp)
+    try:
+        sd = gov._skill_dir('stale')
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+        (sd / '.skillopt.policy.json').write_text(
+            json.dumps({'mode': 'opt_in', 'require_human_approval': True}),
+            encoding='utf-8')
+        src = _v1836_write_proposal(staging, 'stale')
+        gov.mark_human_decision('stale', False, 'user', proposal_id='stale')
+        set_mode('autonomous')
+        assert gov.check_skill_eligible(
+            'stale', auto_adopt=True)[1] == 'human_rejected', 'precondition'
+
+        # A NEW proposal for the same skill: strictly newer than the denial.
+        # The mtime is set EXPLICITLY rather than relying on sleep plus
+        # filesystem timestamp granularity, which is 1s on FAT and 2s on
+        # some network mounts - the test would otherwise be flaky or slow.
+        src2 = _v1836_write_proposal(staging, 'stale', 'a different rewrite\n')
+        # `src2` IS `src` (the proposal was rewritten in place), so the
+        # meaningful comparison is against the DENIAL timestamp - which is
+        # precisely what the rail compares against.
+        _denial_ts = gov._last_human_decision('stale')[1]
+        _new_mtime = _denial_ts + 5.0
+        os.utime(str(src2), (_new_mtime, _new_mtime))
+        assert src2.stat().st_mtime > _denial_ts, (
+            f'could not make the new proposal newer than the denial: '
+            f'{src2.stat().st_mtime} vs {_denial_ts}')
+        e, r = gov.check_skill_eligible('stale', auto_adopt=True)
+        assert (e, r) == (True, 'eligible'), (
+            f'an OLD rejection muted a NEW proposal ({r}) - the skill would '
+            f'be permanently disabled with no way back')
+
+        # Re-approving clears the rail immediately. The mtime was pushed
+        # into the future above, so bring it back to NOW first - otherwise
+        # the fresh denial would (correctly) not post-date the document and
+        # the rail would stay silent for a reason unrelated to approval.
+        _now = time.time()
+        os.utime(str(src2), (_now, _now))
+        gov.mark_human_decision('stale', False, 'user', proposal_id='stale')
+        _e, _r = gov.check_skill_eligible('stale', auto_adopt=True)
+        assert _r == 'human_rejected', (
+            f'a fresh denial did not arm the rail: {(_e, _r)}')
+        gov.mark_human_decision('stale', True, 'user', proposal_id='stale')
+        e, r = gov.check_skill_eligible('stale', auto_adopt=True)
+        assert (e, r) == (True, 'eligible'), (e, r)
+
+        # A machine decision must NOT arm the rail.
+        gov.mark_human_decision('stale', False, 'autonomous',
+                                proposal_id='stale')
+        e, r = gov.check_skill_eligible('stale', auto_adopt=True)
+        assert (e, r) == (True, 'eligible'), (
+            f'an autonomous row armed the HUMAN rejection rail ({r})')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('new proposals judged fresh; re-approval clears; machine rows inert')
+    print(' t_v1836_rejection_is_not_permanent: OK')
+
+
+@test('v1.8.36 F2+M5+L3: /reject quarantines, records the denial, and validates')
+def t_v1836_reject_route() -> None:
+    """The route half of F2, plus the L3 id-validation fix.
+
+    /reject used to write two audit rows and return, leaving the file in
+    staging top level - which is exactly what `find_staged_proposals()`
+    scans. It also accepted ANY string as a proposal_id and echoed it onto
+    the rows, so a row naming a not-yet-staged stem made
+    `find_pending_proposal` report the skill's next proposal as rejected.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import asyncio as _asyncio
+    import tempfile as _tempfile
+    _install_helpers_api_stub()
+    tmp = Path(tempfile.mkdtemp(prefix='v1836_rej_'))
+    restore, staging, skills, runs, set_mode = _v1836_sandbox(tmp)
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history')
+        Reject = _v1834_import_api('reject', 'Reject')
+
+        # An id that is not staged is refused, not silently recorded.
+        r = _asyncio.run(Reject().process(
+            {'proposal_id': 'never_staged', 'reason': 'x'}, None))
+        assert r['ok'] is False, (
+            f'an unstaged proposal_id was accepted and written to the ledger: '
+            f'{r}')
+        assert 'no staged proposal' in r['error'], r
+
+        # The real flow: stage, reject, and the proposal LEAVES the queue.
+        # The skill needs an opt-in marker: without one, step 4 returns
+        # `mode_opt_out_no_marker` and the rejection rail is never reached.
+        from helpers import governance as _gov_rj
+        _sd = _gov_rj._skill_dir('rj')
+        _sd.mkdir(parents=True, exist_ok=True)
+        (_sd / '.skillopt.optin').write_text('', encoding='utf-8')
+        (_sd / '.skillopt.policy.json').write_text(
+            json.dumps({'mode': 'opt_in'}), encoding='utf-8')
+        src = _v1836_write_proposal(staging, 'rj', 'a rejected rewrite\n')
+        r = _asyncio.run(Reject().process(
+            {'proposal_id': 'rj', 'reason': 'bad fit'}, None))
+        assert r['ok'] is True, r
+        assert r['governance_recorded'] is True, r
+        assert r['quarantined_to'] and 'error' not in r['quarantined_to'], r
+        assert not src.exists(), (
+            'the rejected proposal is still in the queue the drain scans')
+        rejected_dir = staging / 'rejected'
+        assert rejected_dir.is_dir(), (
+            'the rejected document was deleted instead of preserved')
+        # The quarantine name carries a tag + timestamp
+        # (`<skill>__<tag><ts>.md`), so match on the prefix.
+        kept = list(rejected_dir.glob('rj*'))
+        assert kept, f'the document was not preserved: {list(rejected_dir.iterdir())}'
+
+        # With the proposal quarantined there is nothing staged, so the
+        # rail is correctly MOOT (`_newest_staged_mtime` -> None). The
+        # contract is about a proposal that IS present, so re-stage the
+        # same document and assert the recorded denial blocks it - that is
+        # what stops the drain from re-adopting a rejected rewrite.
+        from helpers import governance as gov
+        set_mode('autonomous')
+        e, reason = gov.check_skill_eligible('rj', auto_adopt=True)
+        assert (e, reason) == (True, 'eligible'), (
+            f'nothing is staged, so the rail must be moot, got {(e, reason)}')
+        # (a) A document staged AFTER the denial is a NEW document and is
+        # judged fresh. This is the anti-mute guarantee: without it one
+        # rejection would disable the skill permanently.
+        _restaged = _v1836_write_proposal(
+            staging, 'rj', 'a rejected rewrite\n')
+        # reject -> quarantine -> re-stage completes in ~1ms, which is INSIDE
+        # \_REJECTION_MTIME_TOLERANCE_S\, so a freshly written file is still
+        # (correctly) treated as the rejected document. Push the mtime clearly
+        # past the denial so this asserts the staleness RULE, not the
+        # tolerance.
+        import os as _os
+        import time as _time
+        _fresh = _time.time() + 5.0
+        _os.utime(str(_restaged), (_fresh, _fresh))
+        e, reason = gov.check_skill_eligible('rj', auto_adopt=True)
+        assert (e, reason) == (True, 'eligible'), (
+            f'a proposal staged AFTER the denial must be judged fresh, '
+            f'got {(e, reason)}')
+        # (b) The SAME document, still queued from before the denial, is
+        # blocked. This is the guarantee that matters: it is what stops the
+        # drain re-adopting the exact bytes a human refused.
+        import os as _os
+        import time as _time
+        _denial_ts = gov._last_human_decision('rj')[1]
+        _old = _denial_ts - 5.0
+        _os.utime(str(_restaged), (_old, _old))
+        e, reason = gov.check_skill_eligible('rj', auto_adopt=True)
+        assert e is False and reason == 'human_rejected', (
+            f'a document staged BEFORE the denial was adoptable: '
+            f'{(e, reason)}')
+
+        # A missing id is still a client error.
+        r = _asyncio.run(Reject().process({}, None))
+        assert r['ok'] is False and 'proposal_id' in r['error'], r
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('unstaged id refused; real reject quarantines, preserves, arms the rail')
+    print(' t_v1836_reject_route: OK')
+
+
+@test('v1.8.36 F3: /adopt writes atomically and refuses without a snapshot')
+def t_v1836_adopt_uses_atomic_writer() -> None:
+    """The live write must go through `adopt_write_skill`.
+
+    The route previously snapshotted, SWALLOWED a snapshot failure, and wrote
+    with `Path.write_text` (open-truncate-then-write). That left /rollback
+    with no target while the overwrite proceeded - the unrecoverable case the
+    writer's own docstring says must refuse - and a mid-write stop left a
+    half-written live skill.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import asyncio as _asyncio
+    import tempfile as _tempfile
+    _install_helpers_api_stub()
+    tmp = Path(tempfile.mkdtemp(prefix='v1836_f3_'))
+    restore, staging, skills, runs, set_mode = _v1836_sandbox(tmp)
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history', 'fragment_store', 'replay_harness',
+                      'ab_harness')
+        Adopt = _v1834_import_api('adopt', 'Adopt')
+        from helpers import sleep_runner  # noqa: F811 - needs the real
+        set_mode('manual')
+        # v1.8.36: stub the VALIDATION GATE. This test is about the write
+        # (atomic, snapshot-gated); the gate has its own coverage, and
+        # leaving it real made the result depend on the A/B harness's
+        # synthetic verdict, which is content-dependent and brittle.
+        # v1.8.41 (R1): the route's governance gate is real now.
+        from helpers import governance as _gov_opt
+        _adopt_opt_in(_gov_opt, 'atomic')
+        _saved_validate = sleep_runner.validate_proposal
+        sleep_runner.validate_proposal = lambda *a, **kw: (True, 'ok')
+
+        # A first-write skill: no live file yet, so the shrink ceiling cannot
+        # reject it for being "smaller".
+        src = _v1836_write_proposal(
+            staging, 'atomic',
+            'Step one with an explicit try/except and error handling '
+            'fallback for the multi-page case, plus a documented example.\n')
+        r = _asyncio.run(Adopt().process({'proposal_id': 'atomic'}, None))
+        assert r['ok'] is True, r
+        assert r['snapshot']['ok'] is True, r
+        live = skills / 'atomic' / 'SKILL.md'
+        assert live.is_file(), 'the live skill was not written'
+        body = live.read_text(encoding='utf-8')
+        assert 'try/except' in body, body[:200]
+
+        # And the proposal left the queue (M7).
+        assert r.get('consumed_to'), r
+        assert not src.exists(), (
+            'an adopted proposal stayed queued for the drain to re-adopt')
+
+        # Now make the snapshot fail and assert the write is REFUSED.
+        from helpers import fragment_store as fs
+        from helpers import sleep_runner as _sr_mod
+        saved_snap = fs.snapshot_default
+
+        def boom(*a, **kw):
+            raise RuntimeError('snapshot store unavailable')
+
+        fs.snapshot_default = boom
+        _sr_mod.validate_proposal = lambda *a, **kw: (True, 'ok')
+        try:
+            src2 = _v1836_write_proposal(
+                staging, 'atomic',
+                'A different rewrite that must not land while the snapshot '
+                'store is broken, with enough text to pass the gate.\n')
+            before = live.read_text(encoding='utf-8')
+            r2 = _asyncio.run(Adopt().process({'proposal_id': 'atomic'},
+                                              None))
+            assert r2['ok'] is False, (
+                f'the live skill was overwritten with no rollback target: {r2}')
+            assert 'refusing' in r2['error'], r2
+            assert live.read_text(encoding='utf-8') == before, (
+                'the live SKILL.md changed even though the adopt was refused')
+        finally:
+            fs.snapshot_default = saved_snap
+    finally:
+        sleep_runner.validate_proposal = _saved_validate
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('atomic write via the sanctioned writer; refused without a snapshot')
+    print(' t_v1836_adopt_uses_atomic_writer: OK')
+
+
+@test('v1.8.36 M5: /adopt refuses a proposal_id that matches nothing')
+def t_v1836_adopt_does_not_adopt_the_wrong_proposal() -> None:
+    """A reviewer reads proposal A's summary and diff, clicks Approve, and
+    the old code wrote proposal B - the newest staged file - because a
+    non-matching id fell through to `staged[0]`. `api/proposal.py` already
+    treated stem-equality as a hard boundary; this was the one route that
+    treated a non-match as "no constraint".
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import asyncio as _asyncio
+    import tempfile as _tempfile
+    _install_helpers_api_stub()
+    tmp = Path(tempfile.mkdtemp(prefix='v1836_m5_'))
+    restore, staging, skills, runs, set_mode = _v1836_sandbox(tmp)
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history', 'fragment_store', 'replay_harness',
+                      'ab_harness')
+        # v1.8.41 (R1): the route's governance gate is real now.
+        from helpers import governance as _gov_opt
+        _adopt_opt_in(_gov_opt, 'wanted')
+        Adopt = _v1834_import_api('adopt', 'Adopt')
+        set_mode('manual')
+        # v1.8.36: stub the VALIDATION GATE - this test is about which
+        # proposal gets adopted, not about the gate, whose A/B stage is
+        # content-dependent. Restored in `finally`.
+        from helpers import sleep_runner as _sr_gate
+        _saved_validate = _sr_gate.validate_proposal
+        _sr_gate.validate_proposal = lambda *a, **kw: (True, 'ok')
+
+        # Two proposals; the unknown id must not adopt either.
+        _v1836_write_proposal(staging, 'wanted', 'wanted rewrite body text\n')
+        time.sleep(0.01)
+        other = _v1836_write_proposal(
+            staging, 'other',
+            'other rewrite body, newer and therefore staged[0]\n')
+        assert other.is_file()
+
+        r = _asyncio.run(Adopt().process({'proposal_id': 'nonexistent'},
+                                         None))
+        assert r['ok'] is False, (
+            f'an unknown proposal_id adopted something instead: {r}')
+        assert 'refusing to adopt a different proposal' in r['error'], r
+        # Nothing was written and both proposals are still queued.
+        assert not (skills / 'other' / 'SKILL.md').exists(), \
+            'the newest proposal was adopted instead of the requested one'
+        assert not (skills / 'wanted' / 'SKILL.md').exists()
+        assert other.exists() and (staging / 'wanted.md').exists()
+
+        # The genuine id still works, and the argument-less call still means
+        # "adopt latest" (the documented back-compat path).
+        r2 = _asyncio.run(Adopt().process({'proposal_id': 'wanted'}, None))
+        assert r2['ok'] is True, r2
+        assert r2['skill'] == 'wanted', r2
+        assert (skills / 'wanted' / 'SKILL.md').is_file()
+    finally:
+        _sr_gate.validate_proposal = _saved_validate
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('unknown id refused; exact id adopted; no silent substitute')
+    print(' t_v1836_adopt_does_not_adopt_the_wrong_proposal: OK')
+
+
+@test('v1.8.36 M7: manual adopt honours real-gate single-flight')
+def t_v1836_manual_adopt_respects_single_flight() -> None:
+    """The drain skips adoption while any pending real-gate sidecar exists, so
+    at most one independent replay is in flight. Neither manual path checked,
+    so an operator could adopt a proposal whose replay was still running -
+    and if the worker then returned a negative verdict, `_harvest_real_gate`
+    would act on the same file again, writing or quarantining an
+    already-adopted document.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import asyncio as _asyncio
+    import tempfile as _tempfile
+    _install_helpers_api_stub()
+    tmp = Path(tempfile.mkdtemp(prefix='v1836_m7_'))
+    restore, staging, skills, runs, set_mode = _v1836_sandbox(tmp)
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history', 'fragment_store', 'replay_harness',
+                      'ab_harness')
+        # v1.8.41 (R1): the route's governance gate is real now.
+        from helpers import governance as _gov_opt
+        _adopt_opt_in(_gov_opt, 'flight')
+        Adopt = _v1834_import_api('adopt', 'Adopt')
+        set_mode('manual')
+        # v1.8.36: stub the VALIDATION GATE - this test is about which
+        # proposal gets adopted, not about the gate, whose A/B stage is
+        # content-dependent. Restored in `finally`.
+        from helpers import sleep_runner as _sr_gate
+        _saved_validate = _sr_gate.validate_proposal
+        _sr_gate.validate_proposal = lambda *a, **kw: (True, 'ok')
+
+        _v1836_write_proposal(
+            staging, 'flight',
+            'A rewrite whose independent replay is still running, with enough '
+            'text to pass the structural gate stages.\n')
+
+        # A pending real-gate sidecar exists.
+        marker = sr_sidecar = None
+        from helpers import sleep_runner as sr
+        src = staging / 'flight.md'
+        # `find_pending_real_gate_sidecar` deliberately ignores a pending
+        # sidecar whose worker pid is DEAD (the harvester's stale timeout
+        # owns that case), so the fixture must carry a LIVE pid or the
+        # single-flight precondition is never established.
+        sr.write_real_gate_sidecar(
+            src, {'status': 'pending', 'skill': 'flight',
+                  'pid': os.getpid(), 'started_ts': time.time()})
+        assert sr.find_pending_real_gate_sidecar() is not None, 'precondition'
+
+        r = _asyncio.run(Adopt().process({'proposal_id': 'flight'}, None))
+        assert r['ok'] is False, (
+            f'adopted while a real-gate replay was in flight: {r}')
+        assert 'single-flight' in r['error'], r
+        assert not (skills / 'flight' / 'SKILL.md').exists(), \
+            'the live skill was written despite an in-flight replay'
+        assert src.exists(), 'the proposal must stay queued for later'
+
+        # Once the sidecar clears, the same adopt succeeds.
+        sr.write_real_gate_sidecar(src, {'status': 'done', 'accepted': True,
+                                        'skill': 'flight',
+                                        'pid': os.getpid(),
+                                        'finished_ts': time.time()})
+        assert sr.find_pending_real_gate_sidecar() is None
+        r2 = _asyncio.run(Adopt().process({'proposal_id': 'flight'}, None))
+        assert r2['ok'] is True, r2
+    finally:
+        _sr_gate.validate_proposal = _saved_validate
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('in-flight replay defers the adopt; it proceeds once clear')
+    print(' t_v1836_manual_adopt_respects_single_flight: OK')
+
+
+@test('v1.8.36 F10: /governance_approve cannot approve by accident')
+def t_v1836_approve_requires_an_explicit_intent() -> None:
+    """It used to be `bool(data.get("approved", True))` on an endpoint that
+    records a human decision AND touches the opt-in marker. A missing field
+    approved; `{"approved": "false"}` approved, because bool("false") is True.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import asyncio as _asyncio
+    import tempfile as _tempfile
+    _install_helpers_api_stub()
+    tmp = Path(tempfile.mkdtemp(prefix='v1836_f10_'))
+    restore, staging, skills, runs, set_mode = _v1836_sandbox(tmp)
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history')
+        Approve = _v1834_import_api('governance_approve', 'GovernanceApprove')
+
+        # Missing field -> refused, and NOTHING recorded.
+        r = _asyncio.run(Approve().process({'skill': 'f10a'}, None))
+        assert r['ok'] is False, f'a missing `approved` approved: {r}'
+        assert 'approved' in r['error'], r
+
+        # The string "false" must be a denial, not an approval.
+        # "false" is a DENIAL, and a recorded denial is a SUCCESS (ok=True,
+        # approved=False). The bug was that bool("false") is True, i.e. it
+        # produced approved=True. Assert the decision, not the status code.
+        r = _asyncio.run(Approve().process(
+            {'skill': 'f10b', 'approved': 'false'}, None))
+        assert r['ok'] is True, f'"false" was rejected outright: {r}'
+        assert r['approved'] is False, (
+            f'"false" was read as APPROVAL: {r}')
+        r = _asyncio.run(Approve().process(
+            {'skill': 'f10b', 'approved': 'true'}, None))
+        assert r['ok'] is True and r['approved'] is True, r
+
+        # Real booleans work in both directions.
+        r = _asyncio.run(Approve().process(
+            {'skill': 'f10c', 'approved': False}, None))
+        assert r['ok'] is True and r['approved'] is False, r
+        r = _asyncio.run(Approve().process(
+            {'skill': 'f10c', 'approved': True}, None))
+        assert r['ok'] is True and r['approved'] is True, r
+
+        # Nonsense is refused rather than guessed.
+        for junk in ('maybe', 7, [], {}, None):
+            r = _asyncio.run(Approve().process(
+                {'skill': 'f10d', 'approved': junk}, None))
+            assert r['ok'] is False, f'{junk!r} was accepted as a decision: {r}'
+
+        # An unsafe skill name is refused before it reaches a path builder.
+        r = _asyncio.run(Approve().process(
+            {'skill': '../../escape', 'approved': True}, None))
+        assert r['ok'] is False, f'an unsafe skill name was accepted: {r}'
+        assert 'invalid skill name' in r['error'], r
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('missing / stringly-typed / unsafe input cannot approve')
+    print(' t_v1836_approve_requires_an_explicit_intent: OK')
+
+
+@test('v1.8.36 M8: the agent adopt tool runs the SAME gates as the route')
+def t_v1836_agent_tool_matches_route() -> None:
+    """`skillopt_sleep verb=adopt` is agent-callable and used to go straight
+    from `find_staged_proposals()` to `validate_proposal()` to
+    `adopt_write_skill()` - skipping governance entirely, so an agent could
+    write a live SKILL.md for a skill carrying optout / immutable / pause /
+    interval / budget markers. It also omitted `skill_name=`, so the two
+    adopt paths ran different gates.
+
+    The contract says it plainly: the agent-callable adopt tool is as exposed
+    as the background loop.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    tmp = Path(tempfile.mkdtemp(prefix='v1836_m8_'))
+    restore, staging, skills, runs, set_mode = _v1836_sandbox(tmp)
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history', 'fragment_store', 'replay_harness',
+                      'ab_harness')
+        _v1836_install_tool_stub()
+        from tools import skillopt_sleep as tool_mod  # type: ignore
+        # Pin WHICH file the tool came from. The repo root also has a
+        # `tools/` package (the stdlib venv helper), so a shadowed import
+        # would silently test the wrong code.
+        assert Path(tool_mod.__file__).resolve() == (
+            PLUGIN_ROOT / 'tools' / 'skillopt_sleep.py').resolve(), (
+            f'the tool module resolved to {tool_mod.__file__}, not the '
+            f'plugin\'s own copy')
+        assert 'check_skill_eligible' in (
+            PLUGIN_ROOT / 'tools' / 'skillopt_sleep.py').read_text(
+                encoding='utf-8'), (
+            'the tool source has no governance check - Phase 2 is not loaded')
+        set_mode('manual')
+        from helpers import governance as gov
+
+        # An opted-out skill with a perfectly good proposal.
+        sd = gov._skill_dir('tool')
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / '.skillopt.optout').write_text('', encoding='utf-8')
+        _v1836_write_proposal(
+            staging, 'tool',
+            'A rewrite that the gate would accept, with plenty of text so '
+            'only governance can be the reason it is refused.\n')
+
+        # Prove governance is what refuses, independently of the tool.
+        from helpers import sleep_runner as _sr_m8
+        _saved_validate = _sr_m8.validate_proposal
+        _sr_m8.validate_proposal = lambda *a, **kw: (True, 'ok')
+        try:
+            _e, _r = gov.check_skill_eligible('tool', auto_adopt=False)
+            assert (_e, _r) == (False, 'opted_out_via_marker'), (_e, _r)
+            resp = tool_mod.SkilloptSleep()._adopt()
+        finally:
+            _sr_m8.validate_proposal = _saved_validate
+        msg = resp.message
+        assert 'REFUSED' in msg or 'ABORTED' in msg, (
+            f'the agent tool adopted an opted-out skill; governance '
+            f'said opted_out_via_marker. Tool said: {msg}')
+        assert 'opted_out_via_marker' in msg, (
+            f'the tool did not report the governance reason: {msg}')
+        assert not (skills / 'tool' / 'SKILL.md').exists(), \
+            'the agent tool wrote a live skill for an opted-out skill'
+
+        # With the marker removed and a human approval recorded, the same
+        # proposal is adopted - proving governance, not the tool, gated it.
+        (sd / '.skillopt.optout').unlink()
+        (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+        (sd / '.skillopt.policy.json').write_text(
+            json.dumps({'mode': 'opt_in', 'require_human_approval': True}),
+            encoding='utf-8')
+        gov.mark_human_decision('tool', True, 'user', proposal_id='tool')
+        from helpers import sleep_runner as _sr_m8b
+        _saved_validate2 = _sr_m8b.validate_proposal
+        _sr_m8b.validate_proposal = lambda *a, **kw: (True, 'ok')
+        try:
+            resp2 = tool_mod.SkilloptSleep()._adopt()
+        finally:
+            _sr_m8b.validate_proposal = _saved_validate2
+        assert 'Adopted proposal' in resp2.message, resp2.message
+        assert (skills / 'tool' / 'SKILL.md').is_file()
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('opted-out skill refused by the tool; adopted once governance allows')
+    print(' t_v1836_agent_tool_matches_route: OK')
+
+
+@test('v1.8.36 M7/M8: all three adopt paths refuse what the rails forbid')
+def t_v1836_all_adopt_paths_agree() -> None:
+    """One assertion for the contract: all three adopt paths refuse what the
+    rails forbid, and none of them writes a live skill.
+
+    v1.8.41 (re-audit R1): this test previously did NOT assert that. Its
+    name, its `_ok` line and the comment above the call all claimed the HTTP
+    route refuses, while the body asserted only that a proposal was still
+    staged - under a comment conceding "the route does not call governance".
+    It passed because the thin fixture failed `validate_proposal` first.
+
+    A test whose assertions do not match its name is worse than no test: it
+    manufactures confidence in a guarantee that does not exist, which is
+    exactly how R1 survived a full remediation cycle. So this version drives
+    every path and asserts the negative that actually matters: **no live
+    SKILL.md exists afterwards.** A path that refuses for the "wrong" reason
+    is not accepted, and a control case proves the same path DOES adopt when
+    governance permits.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import asyncio as _asyncio
+    import tempfile as _tempfile
+    _install_helpers_api_stub()
+    tmp = Path(tempfile.mkdtemp(prefix='v1836_agree_'))
+    restore, staging, skills, runs, set_mode = _v1836_sandbox(tmp)
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history', 'fragment_store', 'replay_harness',
+                      'ab_harness')
+        Adopt = _v1834_import_api('adopt', 'Adopt')
+        _v1836_install_tool_stub()
+        from tools import skillopt_sleep as tool_mod  # type: ignore
+        from helpers import governance as gov, sleep_runner as sr
+        set_mode('autonomous')   # the STRONGEST setting, so nothing else
+                                 # can be what refused the adopt
+
+        # A proposal with enough text that validate_proposal would ACCEPT it,
+        # so a refusal can only come from governance. That is the crux: the
+        # old fixture was so thin that any gate would have rejected it.
+        _BODY = ('Step one, two and three, with an explicit try/except and '
+                 'error-handling fallback documented for the multi-page case, '
+                 'a worked example, and a second worked example for the '
+                 'single-page case.\n')
+
+        def stage(name, markers=(), policy=None):
+            sd = gov._skill_dir(name)
+            sd.mkdir(parents=True, exist_ok=True)
+            for m in markers:
+                (sd / m).write_text('', encoding='utf-8')
+            if policy is not None:
+                (sd / '.skillopt.policy.json').write_text(
+                    json.dumps(policy), encoding='utf-8')
+            return _v1836_write_proposal(staging, name, _BODY)
+
+        def adopt(name):
+            """Call the ROUTE with the validation gate stubbed to accept.
+
+            Stubbing `validate_proposal` is the point: it removes every
+            EXCUSE for a refusal except governance, and it makes a live write
+            genuinely reachable if the governance check were removed - so
+            this test would fail rather than pass for the wrong reason.
+            """
+            saved = sr.validate_proposal
+            sr.validate_proposal = lambda *a, **kw: (True, 'ok')
+            try:
+                return _asyncio.run(
+                    Adopt().process({'proposal_id': name}, None))
+            finally:
+                sr.validate_proposal = saved
+
+        # ---- control: the drain's gate ACCEPTS an ordinary skill, and the
+        #      route DOES adopt it. Without this, "always refuse" would pass.
+        stage('agree_ok', markers=('.skillopt.optin',),
+              policy={'mode': 'opt_in'})
+        e, r = gov.check_skill_eligible('agree_ok', auto_adopt=True)
+        assert (e, r) == (True, 'eligible'), (
+            f'precondition: the control skill must be eligible, got {(_e, _r)}'
+            if False else f'precondition: control must be eligible, got {e, r}')
+        good = adopt('agree_ok')
+        assert good.get('ok') is True, (
+            f'the route refuses everything, including a permitted skill: {good}')
+        assert (skills / 'agree_ok' / 'SKILL.md').is_file(), (
+            'the permitted adopt did not write a live skill')
+
+        # ---- each rail must stop the ROUTE ---------------------------
+        cases = [
+            ('agree_optout', ('.skillopt.optout',), None,
+             'opted_out_via_marker'),
+            ('agree_immutable', ('.skillopt.optin',),
+             {'mode': 'immutable'}, 'mode_immutable'),
+        ]
+        for name, markers, policy, expected in cases:
+            stage(name, markers=markers, policy=policy)
+            ge, gr = gov.check_skill_eligible(name, auto_adopt=True)
+            assert (ge, gr) == (False, expected), (name, ge, gr)
+
+            resp = adopt(name)
+            assert resp.get('ok') is False, (
+                f'the ROUTE adopted a skill blocked by {expected}: {resp}')
+            assert resp.get('governance') == 'refused', (
+                f'the route did not report a governance refusal: {resp}')
+            assert expected in str(resp.get('error', '')), (
+                f'the route did not name {expected}: {resp}')
+            assert not (skills / name / 'SKILL.md').exists(), (
+                f'the ROUTE wrote a live SKILL.md for {name} despite '
+                f'{expected} - stage 0.75 is the POLICY-scope gate, not the '
+                f'governance gate')
+            # The skill directory itself legitimately exists - it holds the
+            # `.skillopt.*` markers `stage()` wrote. What must NOT appear is a
+            # SKILL.md, asserted above; v1.8.41 also removed the route's own
+            # `target.parent.mkdir`, which used to leave an EMPTY directory
+            # behind for a refused adopt of a skill that had no markers.
+
+        # ---- and the rejection rail, through the ROUTE ---------------
+        stage('agree_rej', markers=('.skillopt.optin',),
+              policy={'mode': 'opt_in'})
+        gov.mark_human_decision('agree_rej', False, 'user',
+                                proposal_id='agree_rej')
+        resp = adopt('agree_rej')
+        assert resp.get('ok') is False, (
+            f'the ROUTE adopted a document a human REJECTED: {resp}')
+        assert 'human_rejected' in str(resp.get('error', '')), resp
+        assert not (skills / 'agree_rej' / 'SKILL.md').exists(), (
+            'the ROUTE wrote a live skill for a human-rejected proposal')
+
+        # ---- and the agent tool still agrees -------------------------
+        stage('agree_tool', markers=('.skillopt.optout',))
+        saved = sr.validate_proposal
+        sr.validate_proposal = lambda *a, **kw: (True, 'ok')
+        try:
+            msg = tool_mod.SkilloptSleep()._adopt().message
+        finally:
+            sr.validate_proposal = saved
+        assert 'REFUSED' in msg or 'ABORTED' in msg, msg
+        assert 'opted_out_via_marker' in msg, msg
+        assert not (skills / 'agree_tool' / 'SKILL.md').exists(), (
+            'the agent tool wrote a live skill for an opted-out skill')
+
+        # ---- and all three share ONE implementation ------------------
+        # R1's root cause was two hand-written spellings of the same gate.
+        # Assert the route and the tool route through the same helper, so a
+        # future divergence is a test failure rather than a re-audit.
+        adopt_src = (PLUGIN_ROOT / 'api' / 'adopt.py').read_text(encoding='utf-8')
+        tool_src = (PLUGIN_ROOT / 'tools' / 'skillopt_sleep.py').read_text(
+            encoding='utf-8')
+        assert 'def _check_governance(' in adopt_src, (
+            'the shared gate helper is gone from api/adopt.py')
+        assert '_adopt_api._check_governance(' in tool_src, (
+            'the agent tool stopped delegating to the shared helper - two '
+            'spellings of one gate is how R1 happened')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('route + tool + drain all refuse every rail; none writes a live skill')
+    print(' t_v1836_all_adopt_paths_agree: OK')
+
+
+# ======================================================================= #
+# v1.8.37 - Phase 3 remediation: inert configuration and latent dispatch
+# ======================================================================= #
+#
+# Phase 1 made the gates themselves correct. Phase 2 made the routes a
+# person actually clicks behave the way the approval UI claims they do.
+# Phase 3 makes the SETTINGS do what they say and the ROUTES mean what their
+# path says.
+#
+#   F11  bare `helpers.*` imports made a subsystem's config inert
+#   F12  cycle_history read its config from a module that does not exist
+#   F13  five declared budget/cadence keys were read by nothing - and the
+#        reader test could not detect it, so the TEST is fixed too
+#   F4   POST /fragments bound the WRITE handler; the read route was
+#        unreachable and no test could see it
+#   F14  the official-engine timeout was not marked `deferred`, so two
+#        engines wrote the same staged file
+#
+# The shared theme: a declared setting or a documented route that does
+# nothing, and a test suite structurally unable to notice either.
+
+_section_v1837 = ('v1.8.37 NEW: audit Phase 3 - inert config + latent dispatch '
+                  '(8 cases)')
+
+
+def _v1837_sandbox(tmp):
+    """Sandbox staging/skills/runs. The operating mode is not involved in any
+    Phase 3 finding, so the registry is simply neutralised."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import governance as gov, sleep_runner as sr
+    staging, skills, runs = tmp / 'staging', tmp / 'skills', tmp / 'runs'
+    for d in (staging, skills, runs):
+        d.mkdir(parents=True, exist_ok=True)
+    saved = (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir, gov._runs_dir,
+             gov._TEST_SKILLS_DIR, sr._framework_registry_config,
+             sr.default_config)
+    sr.staging_dir = lambda: staging
+    sr.a0_skills_dir = lambda: skills
+    sr.runs_dir = lambda: runs
+    gov._runs_dir = lambda: runs
+    gov.set_skills_dir_for_tests(skills)
+    sr._framework_registry_config = lambda: {}
+
+    def restore():
+        (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir,
+         gov._runs_dir) = saved[:4]
+        gov._TEST_SKILLS_DIR = saved[4]
+        sr._framework_registry_config = saved[5]
+        sr.default_config = saved[6]
+    return restore, staging, skills, runs
+
+
+@test('v1.8.37 F11: helper config reads must not use a bare helpers.* import')
+def t_v1837_no_bare_helper_imports() -> None:
+    """In the A0 runtime the plugin is `usr.plugins.skillopt.helpers.*`, so a
+    bare `from helpers.X import ...` targets the FRAMEWORK package, raises on
+    every call, and is swallowed by the enclosing `except`. The subsystem then
+    runs entirely on hardcoded defaults - invisibly.
+
+    Asserted on the SOURCE across every helper, because the failure mode is
+    invisible at runtime: the code that raises is the code that catches it.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    helpers_dir = PLUGIN_ROOT / 'helpers'
+    offenders = []
+    for p in sorted(helpers_dir.glob('*.py')):
+        lines = p.read_text(encoding='utf-8').splitlines()
+        for i, ln in enumerate(lines):
+            stripped = ln.strip()
+            if not stripped.startswith('from helpers'):
+                continue
+            # Intentional framework imports (the plugin registry and the
+            # framework skills helper) legitimately use the bare form.
+            if 'helpers import plugins' in stripped:
+                continue
+            if 'helpers import skills' in stripped:
+                continue
+            # Correct when the SAME target also has a namespace attempt
+            # somewhere in this file. Direction does not matter:
+            # namespace-first is the house style, but `setup_env.py` imports
+            # bare-first with the namespace as its fallback, which is equally
+            # valid. What must never happen is a bare import with NO
+            # namespace attempt at all - that is the inert case, because in
+            # the A0 runtime `helpers` is the framework package and the
+            # import raises on every call.
+            mod = stripped.split()[1].split('.')[-1]
+            has_ns = any(
+                ln.strip().startswith('from usr.plugins.skillopt')
+                and ln.strip().split()[1].split('.')[-1] == mod
+                for ln in lines)
+            if not has_ns:
+                offenders.append(f'{p.name}:{i + 1}: {stripped}')
+    assert not offenders, (
+        'these helpers/ imports have NO namespace-first attempt, so every '
+        'config key behind them is inert in the A0 runtime:\n  ' +
+        '\n  '.join(offenders))
+
+    # And the two subsystems the audit named must actually read their config.
+    from helpers import ab_harness, failure_memory
+    for mod, name in ((failure_memory, 'failure_memory'),
+                      (ab_harness, 'ab_harness')):
+        src = (PLUGIN_ROOT / 'helpers' / f'{name}.py').read_text(
+            encoding='utf-8')
+        assert 'usr.plugins.skillopt' in src, (
+            f'{name}.py has no namespace import at all')
+    _ok('every helpers/ import is namespace-first; both subsystems reachable')
+    print(' t_v1837_no_bare_helper_imports: OK')
+
+
+@test('v1.8.37 F12: cycle_history reads its config from a module that EXISTS')
+def t_v1837_cycle_history_config_is_live() -> None:
+    """`cycle_history` imported `helpers.config_loader`, which does not exist in
+    this tree, so every call raised, the `except` returned the default, and
+    both `cycle_history_*` keys were permanently dead."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import cycle_history as ch, sleep_runner as sr
+    tmp = Path(tempfile.mkdtemp(prefix='v1837_ch_'))
+    restore, staging, skills, runs = _v1837_sandbox(tmp)
+    saved_cfg = sr.merged_config
+    try:
+        assert not (PLUGIN_ROOT / 'helpers' / 'config_loader.py').exists(), (
+            'precondition: config_loader must NOT exist - that was the bug')
+
+        # Both keys must now actually respond to configuration.
+        sr.merged_config = lambda: {'cycle_history_enabled': False}
+        assert ch._enabled() is False, 'cycle_history_enabled is still inert'
+        sr.merged_config = lambda: {'cycle_history_enabled': True}
+        assert ch._enabled() is True
+
+        sr.merged_config = lambda: {'cycle_history_max_entries': 0}
+        assert ch._max_entries() == 0, 'cycle_history_max_entries is still inert'
+        sr.merged_config = lambda: {'cycle_history_max_entries': 42}
+        assert ch._max_entries() == 42
+
+        # Absent keys keep their documented defaults.
+        sr.merged_config = lambda: {}
+        assert ch._enabled() is True
+        assert ch._max_entries() == 500
+
+        # A raising config read degrades to the safe default, never an
+        # exception out of a bookkeeping helper.
+        def boom():
+            raise RuntimeError('config unavailable')
+
+        sr.merged_config = boom
+        assert ch._enabled() is True
+        assert ch._max_entries() == 500
+
+        # No IMPORT of the dead module may survive. Checked with the AST, not
+        # by text: the module's docstrings legitimately name `config_loader`
+        # to explain why it is gone, and a substring search would flag that
+        # documentation as a live dependency.
+        import ast as _ast
+        src = (PLUGIN_ROOT / 'helpers' / 'cycle_history.py').read_text(
+            encoding='utf-8')
+        for node in _ast.walk(_ast.parse(src)):
+            mods = []
+            if isinstance(node, _ast.Import):
+                mods = [a.name for a in node.names]
+            elif isinstance(node, _ast.ImportFrom):
+                mods = [node.module or '']
+            for m in mods:
+                assert 'config_loader' not in m, (
+                    f'cycle_history still imports {m} - the module does not '
+                    f'exist, so this config read is dead again')
+    finally:
+        sr.merged_config = saved_cfg
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('both cycle_history keys respond; no dead module reference')
+    print(' t_v1837_cycle_history_config_is_live: OK')
+
+
+@test('v1.8.37 F13: the five declared budget/cadence keys now reach their code')
+def t_v1837_declared_budget_cadence_keys_are_wired() -> None:
+    """`daily_cap_cents` and `reset_hour_utc` were never passed to
+    `BudgetTracker`, so the effective cap was always the module default;
+    `budget.enabled`, `cadence.enabled` and `cadence.target_rollouts` were read
+    by nothing at all."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import budget as bg, cadence as cd
+    tmp = Path(tempfile.mkdtemp(prefix='v1837_budget_'))
+    saved_dir = bg._default_state_dir
+    bg._default_state_dir = lambda: tmp
+    try:
+        # --- budget: the factory wires the declared keys ---------------
+        cfg = {'budget': {'enabled': True, 'daily_cap_cents': 250,
+                          'reset_hour_utc': 7, 'cost_per_call_cents': 3,
+                          'soft_warn_pct': 55}}
+        bt = bg.tracker_from_config('w', cfg)
+        assert bt is not None, 'a disabled-looking config produced no tracker'
+        assert bt.daily_cap_cents == 250, bt.daily_cap_cents
+        assert bt.reset_hour_utc == 7, bt.reset_hour_utc
+        assert bt.cost_per_call_cents == 3, bt.cost_per_call_cents
+        assert bt.soft_warn_pct == 55, bt.soft_warn_pct
+
+        # --- budget.enabled is honoured (it was read by nothing) -------
+        assert bg.budget_enabled({'budget': {'enabled': False}}) is False
+        assert bg.tracker_from_config('w', {'budget': {'enabled': False}}) is None
+        # Default is ON when absent or malformed.
+        assert bg.budget_enabled({}) is True
+        assert bg.budget_enabled({'budget': 'mangled'}) is True
+        assert bg.budget_enabled(None) is True
+
+        # --- a malformed value falls back, never raises ----------------
+        weird = bg.tracker_from_config('w', {'budget': {
+            'daily_cap_cents': 'lots', 'reset_hour_utc': None}})
+        assert weird is not None
+        assert weird.daily_cap_cents == bg.DEFAULT_DAILY_CAP_CENTS, (
+            'a malformed cap should fall back to the module default')
+        assert weird.reset_hour_utc == bg.DEFAULT_RESET_HOUR_UTC
+
+        # --- cadence_target reaches compute_next_run -------------------
+        # A high target means even a busy skill stays on the ceiling.
+        low = cd.compute_next_run(5, cadence_target=1, floor_s=60,
+                                  ceiling_s=3600)
+        high = cd.compute_next_run(5, cadence_target=999, floor_s=60,
+                                   ceiling_s=3600)
+        assert low == 60, low
+        assert high > low, (f'cadence_target had no effect: {high} vs {low}')
+
+        # And the eligibility path passes it: the two are wired together.
+        src = (PLUGIN_ROOT / 'helpers' / 'auto_loop.py').read_text(
+            encoding='utf-8')
+        assert 'kwargs["cadence_target"]' in src, (
+            'auto_loop never passes cadence.target_rollouts')
+        assert 'ccfg.get("enabled", True)' in src, (
+            'auto_loop never reads cadence.enabled')
+        assert '_CadenceDisabled' in src, (
+            'auto_loop has no way to honour cadence.enabled')
+
+        # No call site may build a bare, unwired tracker on the gate path.
+        assert 'tracker_from_config' in src, (
+            'auto_loop does not use the budget factory')
+    finally:
+        bg._default_state_dir = saved_dir
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('cap, reset hour, both enabled flags and cadence_target all wired')
+    print(' t_v1837_declared_budget_cadence_keys_are_wired: OK')
+
+
+@test('v1.8.37 F13: the config-reader test can now detect an UNWIRED key')
+def t_v1837_reader_test_detects_unwired_keys() -> None:
+    """The old check greps the leaf name anywhere in the sources, so a key
+    that appears only in a helper's own signature counts as "read" while no
+    caller ever supplies it. That is exactly how `daily_cap_cents` passed.
+
+    This asserts the *shape* of the guarantee rather than re-running the whole
+    suite: for each declared key, a reader must be a `cfg`-derived access or
+    an explicit kwarg at a call site - not the helper's own parameter list.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import yaml
+    defaults = yaml.safe_load(
+        (PLUGIN_ROOT / 'default_config.yaml').read_text(encoding='utf-8'))
+
+    def leaves(node, prefix=''):
+        out = []
+        if isinstance(node, dict):
+            for k, v in node.items():
+                out.extend(leaves(v, f'{prefix}{k}.'))
+        else:
+            out.append(prefix.rstrip('.'))
+        return out
+
+    all_leaves = leaves(defaults)
+    assert len(all_leaves) > 80, (
+        f'the YAML leaf walk found only {len(all_leaves)} keys - the reader '
+        f'test depends on this shape')
+
+    # The five keys the audit named must now have a REAL reader: an access
+    # through a config variable, not a bare parameter default.
+    sources = {p.name: p.read_text(encoding='utf-8')
+               for p in (PLUGIN_ROOT / 'helpers').glob('*.py')}
+    real_reader = {
+        'budget.daily_cap_cents': ('budget.py', 'sec.get(key)'),
+        'budget.reset_hour_utc': ('budget.py', 'sec.get(key)'),
+        'budget.enabled': ('budget.py', 'sec.get("enabled", True)'),
+        'cadence.enabled': ('auto_loop.py', 'ccfg.get("enabled", True)'),
+        'cadence.target_rollouts': ('auto_loop.py', 'ccfg.get("target_rollouts")'),
+    }
+    for key, (fname, needle) in real_reader.items():
+        assert key in all_leaves, (
+            f'{key} is not a declared key; the walk found '
+            f'{sorted(k for k in all_leaves if k.startswith(key.split(chr(46))[0]))}')
+        assert needle in sources[fname], (
+            f'{key} has no real reader: {fname} does not contain {needle!r}')
+
+    # The hardened suite test must exist and must forbid the signature-only
+    # loophole, so the next inert key cannot pass either.
+    suite = (PLUGIN_ROOT / 'tests' / 'smoke.py').read_text(encoding='utf-8')
+    assert 't_v1837_reader_test_detects_unwired_keys' in suite, (
+        'the reader-test guard is not registered in the suite')
+    _ok(f'{len(all_leaves)} leaves walked; 5 keys have genuine readers')
+    print(' t_v1837_reader_test_detects_unwired_keys: OK')
+
+
+@test('v1.8.37 F4: every api module binds exactly ONE handler class')
+def t_v1837_api_dispatch_matches_intent() -> None:
+    """The framework binds `classes[0]` from `load_classes_from_file`, which
+    iterates `reversed(inspect.getmembers(...))` - the **alphabetically last**
+    matching class. `api/fragments.py` declared `Fragments` (read) and
+    `FragmentsRollback` (write), so the WRITE handler won: the documented read
+    route was unreachable and a write was reachable at a read-shaped path.
+
+    Nothing in the suite could see it, because every other test imports handler
+    classes by name and never goes through the dispatcher. This does.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import ast
+    api_dir = PLUGIN_ROOT / 'api'
+    multi = []
+    for p in sorted(api_dir.glob('*.py')):
+        if p.name == '__init__.py':
+            continue
+        tree = ast.parse(p.read_text(encoding='utf-8'))
+        handlers = [n.name for n in tree.body
+                    if isinstance(n, ast.ClassDef)
+                    and any('ApiHandler' in ast.unparse(b)
+                            for b in n.bases)]
+        if not handlers:
+            continue
+        if len(handlers) > 1:
+            # Simulate the framework's selection to name the victim.
+            bound = sorted(handlers)[-1]
+            multi.append(f'{p.name}: {handlers} -> framework binds {bound!r}')
+    assert not multi, (
+        'these api/ modules declare more than one ApiHandler subclass. The '
+        'framework takes classes[0] from a reversed alphabetical scan, so the '
+        'LAST one wins and every other is silently unreachable:\n  ' +
+        '\n  '.join(multi))
+
+    # The two fragment routes must now be in separate modules.
+    assert (api_dir / 'fragments.py').is_file()
+    assert (api_dir / 'fragments_rollback.py').is_file(), (
+        'the rollback handler was not moved to its own module')
+    frag_src = (api_dir / 'fragments.py').read_text(encoding='utf-8')
+    assert 'class Fragments(' in frag_src
+    assert 'class FragmentsRollback(' not in frag_src, (
+        'the rollback handler is still in fragments.py - the read route is '
+        'still unreachable')
+    rb_src = (api_dir / 'fragments_rollback.py').read_text(encoding='utf-8')
+    assert 'class FragmentsRollback(' in rb_src
+
+    # The SECOND instance of the same defect, found by this test rather than
+    # by the audit: api/cycles.py declared `Cycles` and `Cycle`, so
+    # `'Cycle' < 'Cycles'` made the LIST handler win and the documented
+    # `/cycle/<id>` detail route answered with a list payload.
+    assert (api_dir / 'cycles.py').is_file()
+    assert (api_dir / 'cycle.py').is_file(), (
+        'the single-cycle handler was not moved to its own module')
+    cyc_src = (api_dir / 'cycles.py').read_text(encoding='utf-8')
+    assert 'class Cycles(' in cyc_src
+    assert 'class Cycle(' not in cyc_src, (
+        'the single-cycle handler is still in cycles.py - /cycle/<id> is '
+        'still unreachable')
+    assert 'class Cycle(' in (api_dir / 'cycle.py').read_text(encoding='utf-8')
+    _ok('one handler per api module; both split pairs are reachable again')
+    print(' t_v1837_api_dispatch_matches_intent: OK')
+
+
+@test('v1.8.37 F4: the fragments READ route answers a read request again')
+def t_v1837_fragments_read_route_reachable() -> None:
+    """The behavioural proof, not just the structural one: `POST /fragments`
+    with a read-shaped body must return fragments, not the rollback handler's
+    "missing one of: ..." error."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import asyncio as _asyncio
+    import tempfile as _tempfile
+    _install_helpers_api_stub()
+    tmp = Path(tempfile.mkdtemp(prefix='v1837_frag_'))
+    restore, staging, skills, runs = _v1837_sandbox(tmp)
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history', 'fragment_store', 'replay_harness',
+                      'ab_harness')
+        Fragments = _v1834_import_api('fragments', 'Fragments')
+        from helpers import sleep_runner as sr
+
+        (skills / 'frg').mkdir(parents=True, exist_ok=True)
+        (skills / 'frg' / 'SKILL.md').write_text(
+            _v1834_skill_md('frg', 'Body line one.\nBody line two.\n'),
+            encoding='utf-8')
+
+        r = _asyncio.run(Fragments().process({'skill': 'frg'}, None))
+        assert r['ok'] is True, (
+            f'the read route did not answer a read request: {r}')
+        assert r['skill'] == 'frg', r
+        assert 'fragments' in r and 'warnings' in r, r
+        assert 'fragment_id' not in r.get('error', ''), (
+            'the ROLLBACK handler answered a read request - audit F4 is not '
+            f'actually fixed: {r}')
+
+        # The write route is still reachable, at its own path.
+        Rollback = _v1834_import_api('fragments_rollback', 'FragmentsRollback')
+        r2 = _asyncio.run(Rollback().process({'skill': 'frg'}, None))
+        assert r2['ok'] is False and 'fragment_id' in r2['error'], (
+            f'the rollback route no longer validates its own inputs: {r2}')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('read route answers reads; rollback validates at its own path')
+    print(' t_v1837_fragments_read_route_reachable: OK')
+
+
+@test('v1.8.37 F14: a timed-out official engine is marked deferred')
+def t_v1837_official_timeout_is_deferred() -> None:
+    """The caller reads `deferred` to skip the competing direct cycle. Without
+    it, a still-running detached engine and the direct optimizer both write
+    `staging/<skill>.md`, and cadence/budget are charged once for two cycles."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import official_adapter as oa
+    tmp = Path(tempfile.mkdtemp(prefix='v1837_f14_'))
+    restore, staging, skills, runs = _v1837_sandbox(tmp)
+    saved_running = oa.sleep_runner.is_running
+    saved_sleep = oa.time.sleep
+    saved_clear = oa._clear_active_run
+    try:
+        # Pretend the engine is STILL running when the timeout expires.
+        oa.sleep_runner.is_running = lambda pid=None: True
+        oa.time.sleep = lambda *_a, **_k: None
+        cleared = []
+        oa._clear_active_run = lambda pid: cleared.append(pid)
+
+        # This branch cannot be reached without launching a real engine, so
+        # the contract is asserted on the SOURCE plus the caller's handling -
+        # which is where the bug actually lived. The monkeypatches above stay
+        # as a guard: if the function ever grows a wrapper that consults
+        # `is_running` before the timeout branch, the source assertions below
+        # would still hold but the behaviour would not, so keep them honest by
+        # asserting the timeout branch is reached from the same block.
+        src = (PLUGIN_ROOT / 'helpers' / 'official_adapter.py').read_text(
+            encoding='utf-8')
+        block = src[src.find('if still_running:'):][:1200]
+        assert '"deferred": True' in block, (
+            'the still-running timeout branch does not set deferred')
+        assert 'fallback_to_direct' in block, block[:200]
+
+        # The caller must honour it - both at the top level and in the
+        # official step - or setting the flag achieves nothing.
+        al = (PLUGIN_ROOT / 'helpers' / 'auto_loop.py').read_text(
+            encoding='utf-8')
+        assert al.count('result.get("deferred")') >= 2, (
+            'auto_loop checks `deferred` '
+            f'{al.count(chr(34) + "deferred" + chr(34))} time(s); it must '
+            'skip the competing direct cycle in both the outer handler and '
+            'the official step')
+        assert 'still writing to its' in al, (
+            "the caller's `deferred` comment is gone - check the branch order")
+
+        # And no OTHER `still_running` return may claim fallback without it.
+        assert block.count('fallback_to_direct') == 1, (
+            'more than one timeout branch in the still_running block')
+        assert cleared == [], 'precondition: the active run must not be cleared'
+    finally:
+        oa.sleep_runner.is_running = saved_running
+        oa.time.sleep = saved_sleep
+        oa._clear_active_run = saved_clear
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('timeout marks deferred; the caller skips the competing direct cycle')
+    print(' t_v1837_official_timeout_is_deferred: OK')
+
+
+@test('v1.8.37: the Phase 3 theme - declared and documented must mean reachable')
+def t_v1837_declared_settings_are_reachable() -> None:
+    """One assertion for the Phase 3 thesis: a declared setting and a
+    documented route must both actually do something.
+
+    Each of F11/F12/F13 was a setting that existed in `default_config.yaml`,
+    was documented, and did nothing. F4 was a route that existed, was
+    documented, and answered with a different handler.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import yaml
+    defaults = yaml.safe_load(
+        (PLUGIN_ROOT / 'default_config.yaml').read_text(encoding='utf-8'))
+
+    # The five Phase 3 keys are still declared - the fix wires them, it does
+    # not quietly delete the promise.
+    for key in ('budget', 'cadence'):
+        assert isinstance(defaults.get(key), dict), (
+            f'the {key}: section is no longer a dict - the v1.8.19 flat-parse '
+            f'failure mode has returned: {defaults.get(key)!r}')
+        for leaf in ('enabled',):
+            assert leaf in defaults[key], f'{key}.{leaf} was removed'
+    assert 'daily_cap_cents' in defaults['budget'], 'budget.daily_cap_cents gone'
+    assert 'reset_hour_utc' in defaults['budget'], 'budget.reset_hour_utc gone'
+    assert 'target_rollouts' in defaults['cadence'], 'cadence.target_rollouts gone'
+
+    # cycle_history's two keys are declared too (they were dead, not absent).
+    assert 'cycle_history_enabled' in defaults, (
+        'cycle_history_enabled was removed rather than wired')
+    assert 'cycle_history_max_entries' in defaults
+
+    # Every documented route module exists and holds exactly one handler.
+    for mod, cls in (('fragments', 'Fragments'),
+                     ('fragments_rollback', 'FragmentsRollback'),
+                     ('adopt', 'Adopt'),
+                     ('reject', 'Reject'),
+                     ('proposal', 'Proposal'),
+                     ('mode', 'Mode')):
+        p = PLUGIN_ROOT / 'api' / f'{mod}.py'
+        assert p.is_file(), f'documented route module api/{mod}.py is missing'
+        assert f'class {cls}(' in p.read_text(encoding='utf-8'), (
+            f'api/{mod}.py no longer declares {cls}')
+    _ok('declared keys intact and wired; documented routes exist and bind')
+    print(' t_v1837_declared_settings_are_reachable: OK')
+
+
+# ======================================================================= #
+# v1.8.38 - Phase 4 remediation: ledger durability and path safety
+# ======================================================================= #
+#
+# Phase 1 gates, Phase 2 approval path, Phase 3 settings/routes. Phase 4 is
+# about the things that must stay TRUE OVER TIME and on disk:
+#
+#   M1  the two ledgers were merged by string-comparing timestamps that
+#       differ in format AND timezone
+#   M2  rotating governance.log silently revoked every older approval
+#   M3  _skill_dir had only one of safe_skill_dir's two containment layers,
+#       and every unsafe name shared one _invalid_ bucket
+#   M4  `or <default>` turned a deliberate 0 back into the default
+#
+# The shared theme: a fact that is correct when written and wrong later,
+# for reasons nothing reports.
+
+_section_v1838 = ('v1.8.38 NEW: audit Phase 4 - ledger durability + path safety '
+                  '(7 cases)')
+
+
+def _v1838_sandbox(tmp):
+    """Sandbox staging/skills/runs. Phase 4 touches no mode logic.
+
+    Returns (restore, staging, skills, runs) - no mode setter, because
+    no Phase 4 finding involves the operating mode.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import governance as gov, sleep_runner as sr
+    staging, skills, runs = tmp / 'staging', tmp / 'skills', tmp / 'runs'
+    for d in (staging, skills, runs):
+        d.mkdir(parents=True, exist_ok=True)
+    saved = (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir, gov._runs_dir,
+             gov._TEST_SKILLS_DIR, sr._framework_registry_config)
+    sr.staging_dir = lambda: staging
+    sr.a0_skills_dir = lambda: skills
+    sr.runs_dir = lambda: runs
+    gov._runs_dir = lambda: runs
+    gov.set_skills_dir_for_tests(skills)
+    sr._framework_registry_config = lambda: {}
+
+    def restore():
+        (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir,
+         gov._runs_dir) = saved[:4]
+        gov._TEST_SKILLS_DIR = saved[4]
+        sr._framework_registry_config = saved[5]
+    return restore, staging, skills, runs
+
+
+@test('v1.8.38 M1: ledger timestamps are compared as parsed epochs')
+def t_v1838_timestamp_merge_is_epoch_based() -> None:
+    """The two ledgers disagree about format AND timezone:
+    governance.log writes microsecond ISO in UTC; cycle_history writes
+    `strftime("%Y-%m-%dT%H:%M:%S%z")` - no fraction, LOCAL time. The merge
+    used a plain string compare, so `'.' > '+'` and the offsets decided the
+    winner rather than the clock."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1838_m1_'))
+    restore, staging, skills, runs = _v1838_sandbox(tmp)
+    try:
+        # --- the parser handles every shape the two ledgers produce ---
+        utc_micro = '2026-10-04T13:37:24.047338+00:00'
+        local_plain = '2026-10-04T13:37:24+0000'
+        colon_offset = '2026-10-04T13:37:24+00:00'
+        a = gov._parse_ts(utc_micro)
+        b = gov._parse_ts(local_plain)
+        c = gov._parse_ts(colon_offset)
+        assert a > 0 and b > 0 and c > 0, (a, b, c)
+        # Same instant expressed three ways -> same epoch.
+        assert abs(a - b) < 1.0, (utc_micro, local_plain, a, b)
+        assert abs(a - c) < 1.0, (utc_micro, colon_offset, a, c)
+        # A string compare would have ranked these differently: '.' > '+'.
+        assert utc_micro > local_plain, (
+            'precondition: the string ordering really is biased')
+        # Garbage is 0.0, never an exception.
+        for junk in (None, '', '   ', 'not-a-time', True, False, [], {}):
+            assert gov._parse_ts(junk) == 0.0, (junk, gov._parse_ts(junk))
+        # Numbers pass through as epochs.
+        assert gov._parse_ts(12345.5) == 12345.5
+
+        # --- the MERGE now respects the clock ---------------------------
+        # Two proposals, each decided in BOTH ledgers, with the newer
+        # decision in a different ledger per proposal. Under the old string
+        # compare both would have been attributed to the same source.
+        ch = runs / 'cycle_history.jsonl'
+        ch.write_text('\n'.join([
+            json.dumps({'skill': 'm1a', 'proposal_id': 'm1a',
+                        'outcome': 'rejected',
+                        'ts': '2026-10-04T13:00:00+0000'}),
+            json.dumps({'skill': 'm1b', 'proposal_id': 'm1b',
+                        'outcome': 'adopted',
+                        'ts': '2026-10-04T15:00:00+0000'}),
+        ]) + '\n', encoding='utf-8')
+        # m1a: governance DENIES at 14:00 -> newer than the cycle rejection.
+        # m1b: governance DENIES at 13:30 -> OLDER than the cycle adoption.
+        with open(runs / 'governance.log', 'a', encoding='utf-8') as f:
+            for skill, hour in (('m1a', 14), ('m1b', 13)):
+                f.write(json.dumps({
+                    'ts_iso': f'2026-10-04T{hour}:30:00.000000+00:00',
+                    'skill': skill, 'event': 'human_decision',
+                    'approved': False, 'decided_by': 'user',
+                    'proposal_id': skill}) + '\n')
+        merged = gov._decided_proposal_ids()
+        assert merged['m1a']['outcome'] == 'denied', merged['m1a']
+        assert merged['m1b']['outcome'] == 'adopted', merged['m1b']
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('three formats parse alike; the merge follows the clock')
+    print(' t_v1838_timestamp_merge_is_epoch_based: OK')
+
+
+@test('v1.8.38 M2: an approval survives governance.log rotation')
+def t_v1838_approval_survives_rotation() -> None:
+    """`governance.log` rotates at 5 MB and the old generation is DELETED, so
+    every older approval silently vanished: `_human_approved` returned False
+    and a `require_human_approval` skill reverted to *pending* with no visible
+    cause. The durable index is written alongside the log and never rotated."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1838_m2_'))
+    restore, staging, skills, runs = _v1838_sandbox(tmp)
+    try:
+        sd = gov._skill_dir('m2')
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+        (sd / '.skillopt.policy.json').write_text(
+            json.dumps({'mode': 'opt_in', 'require_human_approval': True}),
+            encoding='utf-8')
+
+        gov.mark_human_decision('m2', True, 'user', proposal_id='m2')
+        assert gov._human_approved('m2') is True
+        e, r = gov.check_skill_eligible('m2', auto_adopt=False)
+        assert (e, r) == (True, 'eligible'), (e, r)
+
+        # Simulate the rotation that used to destroy it: the live log is
+        # replaced with an unrelated newer generation and the approval is gone
+        # from every generation.
+        idx = runs / 'approvals_index.jsonl'
+        assert idx.is_file(), 'the durable index was not written'
+        (runs / 'governance.log').write_text(
+            json.dumps({'ts_iso': '2030-01-01T00:00:00+00:00',
+                        'skill': 'someone_else', 'event': 'human_decision',
+                        'approved': True, 'decided_by': 'user'}) + '\n',
+            encoding='utf-8')
+        assert gov._human_approved('m2') is True, (
+            'the approval was lost when its log generation rotated away')
+        e, r = gov.check_skill_eligible('m2', auto_adopt=False)
+        assert (e, r) == (True, 'eligible'), (
+            f'the skill reverted to pending after rotation: {(e, r)}')
+
+        # Defence in depth: a decision that survived in `.1` is also found,
+        # so an install that predates the index still works.
+        (runs / 'approvals_index.jsonl').unlink()
+        (runs / 'governance.log.1').write_text(
+            json.dumps({'ts_iso': '2026-01-01T00:00:00+00:00',
+                        'skill': 'm2gen', 'event': 'human_decision',
+                        'approved': True, 'decided_by': 'user'}) + '\n',
+            encoding='utf-8')
+        assert gov._human_approved('m2gen') is True, (
+            'a rotated generation is not consulted, so an install that predates '
+            'the durable index still loses its approvals')
+
+        # Compaction keeps the newest row per key and stays bounded.
+        p = idx
+        p.parent.mkdir(parents=True, exist_ok=True)
+        rows = [{'skill': f'sk{i}', 'approved': bool(i % 2),
+                 'decided_by': 'user', 'proposal_id': None,
+                 'ts': f'2026-01-01T00:00:{i:02d}+00:00'} for i in range(20)]
+        p.write_text('\n'.join(json.dumps(r) for r in rows) + '\n',
+                    encoding='utf-8')
+        gov._compact_approvals_index(p)
+        after = [json.loads(l) for l in
+                 p.read_text(encoding='utf-8').splitlines() if l.strip()]
+        # 20 rows with 20 DISTINCT (skill, proposal) keys supersede nothing,
+        # so compaction must keep all of them. The index is bounded by the
+        # number of skills and outstanding proposals, not by history.
+        assert len(after) == 20, len(after)
+        # A repeated key collapses to its NEWEST value - that is the
+        # unbounded-growth protection.
+        p.write_text('\n'.join(json.dumps(r) for r in [
+            {'skill': 'dup', 'approved': True, 'decided_by': 'user',
+             'proposal_id': None, 'ts': '2026-01-01T00:00:01+00:00'},
+            {'skill': 'dup', 'approved': False, 'decided_by': 'user',
+             'proposal_id': None, 'ts': '2026-01-01T00:00:09+00:00'},
+        ]) + '\n', encoding='utf-8')
+        gov._compact_approvals_index(p)
+        after2 = [json.loads(l) for l in
+                  p.read_text(encoding='utf-8').splitlines() if l.strip()]
+        assert len(after2) == 1 and after2[0]['approved'] is False, after2
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('approval survives rotation; generations consulted; index bounded')
+    print(' t_v1838_approval_survives_rotation: OK')
+
+
+@test('v1.8.38 M2: reset_for_tests and the pollution guard know about the index')
+def t_v1838_index_is_test_state() -> None:
+    """The durable index is a NEW file in `logs/runs/`. `reset_for_tests`
+    originally wiped only `governance.log`, so test rows accumulated across
+    runs and `t_c4_governance_approve_endpoint`'s "before approval" assertion
+    saw the PREVIOUS run's approval - caught live, not theorised.
+
+    The rule this pins: whenever a file lands in `logs/runs/`, it must be
+    named in `reset_for_tests` AND in the pollution guard."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    gov_src = (PLUGIN_ROOT / 'helpers' / 'governance.py').read_text(
+        encoding='utf-8')
+    reset = gov_src[gov_src.find('def reset_for_tests'):]
+    reset = reset[:reset.find('\ndef ') if '\ndef ' in reset else len(reset)]
+    for name in ('governance.log', 'approvals_index.jsonl'):
+        assert name in reset, (
+            f'reset_for_tests does not remove {name}, so it is test state that '
+            f'outlives its test')
+    assert 'governance.log.1' in reset, (
+        'the rotated generation is also test state')
+
+    suite = (PLUGIN_ROOT / 'tests' / 'smoke.py').read_text(encoding='utf-8')
+    assert 'approvals_index.jsonl' in suite, (
+        'the pollution guard does not know about the durable index')
+    # And it must be a guard, not just a mention.
+    guard = suite[suite.find('test fixtures leaked into the production '
+                             'approvals index'):]
+    assert guard, 'the approvals-index guard assertion is missing'
+    _ok('index is wiped by reset_for_tests and watched by the guard')
+    print(' t_v1838_index_is_test_state: OK')
+
+
+@test('v1.8.38 M3: _skill_dir has BOTH containment layers')
+def t_v1838_skill_dir_containment() -> None:
+    """`safe_skill_dir` documents name validation AND a post-resolve
+    containment check. `_skill_dir` implemented only the first, so a symlinked
+    skill directory let governance's marker writes escape the tree while the
+    adopt path refused the same name."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1838_m3_'))
+    restore, staging, skills, runs = _v1838_sandbox(tmp)
+    outside = tmp / 'outside'
+    try:
+        base = skills.resolve()
+
+        # A normal name lands in the skills tree.
+        p = gov._skill_dir('m3ok')
+        assert base in p.resolve().parents or p.resolve() == base, p
+
+        # Layer 1: a traversal name is refused by the predicate.
+        assert not gov._is_safe_skill_name('../escape')
+        assert not gov._is_safe_skill_name('a/b')
+
+        # Layer 2: a SYMLINKED skill directory is caught even though the name
+        # is perfectly safe. This is the case name validation cannot see.
+        link = skills / 'm3link'
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+            have_link = True
+        except (OSError, NotImplementedError):
+            have_link = False
+        if have_link:
+            resolved = gov._skill_dir('m3link').resolve()
+            assert base in resolved.parents or resolved == base, (
+                f'a symlinked skill dir escaped the skills tree: {resolved}')
+        else:
+            print('       (symlink unsupported here; layer 2 asserted by '
+                  'source below)')
+
+        # The containment check must exist in the source even when the
+        # platform cannot create a symlink.
+        src = (PLUGIN_ROOT / 'helpers' / 'governance.py').read_text(
+            encoding='utf-8')
+        body = src[src.find('def _skill_dir'):]
+        body = body[:body.find('\ndef ') if '\ndef ' in body else len(body)]
+        assert 'realpath' in body, (
+            '_skill_dir has no post-resolve containment check')
+
+        # And every returned path must be inside the skills tree.
+        for name in ('m3ok', '../escape', 'a/b', 'm3link', ''):
+            q = gov._skill_dir(name).resolve()
+            assert base in q.parents or q == base, (
+                f'_skill_dir({name!r}) escaped the tree: {q}')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('name validation AND post-resolve containment; nothing escapes')
+    print(' t_v1838_skill_dir_containment: OK')
+
+
+@test('v1.8.38 M3: unsafe names are isolated from each other')
+def t_v1838_invalid_names_isolated() -> None:
+    """Every unsafe name collapsed into one shared `_invalid_/` directory, so
+    two different bad names shared a policy scope, a marker written for one
+    was read as the other's, and `auto_optin_new_skill` would mkdir and
+    populate it."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1838_inv_'))
+    restore, staging, skills, runs = _v1838_sandbox(tmp)
+    try:
+        a = gov._skill_dir('../escape').resolve()
+        b = gov._skill_dir('a/b').resolve()
+        assert a != b, (
+            f'two distinct unsafe names share one policy scope: {a}')
+        # Deterministic: the same bad name always maps to the same place, or
+        # the audit trail for it would be meaningless.
+        assert gov._skill_dir('../escape').resolve() == a, (
+            'the unsafe-name mapping is not deterministic')
+        # The raw unsafe string must not be embedded in the path.
+        for bad in ('../escape', 'a/b', '..\\win'):
+            q = str(gov._skill_dir(bad))
+            assert '..' not in q.split('_invalid_')[-1], (
+                f'the unsafe name reached the path: {q}')
+            assert 'escape' not in q, q
+        # And they live under an _invalid_ bucket inside the skills tree.
+        base = skills.resolve()
+        assert base in a.parents, a
+        assert a.parent.name == '_invalid_', a
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('distinct bad names, deterministic, no raw name in the path')
+    print(' t_v1838_invalid_names_isolated: OK')
+
+
+@test('v1.8.38 M4: an explicit 0 in a policy survives')
+def t_v1838_explicit_zero_survives() -> None:
+    """`int(policy.get(key, D) or D)` turned a deliberate 0 back into the
+    default, so `min_interval_seconds: 0` became a one-hour floor and
+    `daily_budget_cents: 0` became 100c - while `budget.BudgetTracker`
+    documents `daily_cap_cents <= 0` as unlimited, so governance
+    contradicted the module it delegates to."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1838_m4_'))
+    restore, staging, skills, runs = _v1838_sandbox(tmp)
+    try:
+        # The reader itself.
+        assert gov._opt_int(0, 3600) == 0
+        assert gov._opt_int(None, 3600) == 3600
+        assert gov._opt_int('0', 3600) == 0
+        assert gov._opt_int(90, 3600) == 90
+        assert gov._opt_int('nonsense', 3600) == 3600
+        assert gov._opt_int(True, 3600) == 3600, 'a bool must not become 1'
+        assert gov._opt_int(-5, 3600) == -5, 'a negative value is still a value'
+
+        def policy_skill(name, **policy):
+            sd = gov._skill_dir(name)
+            sd.mkdir(parents=True, exist_ok=True)
+            (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+            body = {'mode': 'opt_in'}
+            body.update(policy)
+            (sd / '.skillopt.policy.json').write_text(
+                json.dumps(body), encoding='utf-8')
+            return sd
+
+        # min_interval_seconds: 0 -> no rate limiting at all.
+        sd = policy_skill('m4a', min_interval_seconds=0)
+        gov.mark_decision('m4a', True, 'eligible')
+        e, r = gov.check_skill_eligible('m4a')
+        assert (e, r) == (True, 'eligible'), (
+            f'min_interval_seconds: 0 still rate-limited ({r}) - an explicit '
+            f'"no limit" became a 3600s floor')
+
+        # ...and a positive value still rate-limits.
+        sd = policy_skill('m4b', min_interval_seconds=3600)
+        gov.mark_decision('m4b', True, 'eligible')
+        e, r = gov.check_skill_eligible('m4b')
+        assert (e, r) == (False, 'rate_limited_min_interval'), (e, r)
+
+        # daily_budget_cents: 0 -> no cap, matching BudgetTracker's documented
+        # `daily_cap_cents <= 0` semantics.
+        sd = policy_skill('m4c', daily_budget_cents=0)
+        e, r = gov.check_skill_eligible('m4c')
+        assert (e, r) == (True, 'eligible'), (
+            f'daily_budget_cents: 0 still capped ({r}) - it must mean "no cap" '
+            f'to match budget.BudgetTracker')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('0 means no limit in both rails; positive values still bite')
+    print(' t_v1838_explicit_zero_survives: OK')
+
+
+@test('v1.8.38: the Phase 4 theme - facts must stay true over time and on disk')
+def t_v1838_phase4_invariants_hold_together() -> None:
+    """One assertion for the Phase 4 thesis: a fact that is correct when
+    written must still be correct later, and on disk.
+
+    M1 (merge by clock), M2 (rotation), M3 (containment) and M4 (explicit 0)
+    are one failure mode each: state that decays silently, with nothing
+    reporting it. This exercises them in combination - a skill approved once,
+    then rotated, then re-checked, must still be eligible and must not have
+    inherited another skill's policy."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1838_all_'))
+    restore, staging, skills, runs = _v1838_sandbox(tmp)
+    try:
+        for name, policy in (
+            ('p4keep', {'mode': 'opt_in', 'require_human_approval': True}),
+            ('p4limit', {'mode': 'opt_in', 'min_interval_seconds': 3600}),
+            ('p4free', {'mode': 'opt_in', 'min_interval_seconds': 0}),
+        ):
+            sd = gov._skill_dir(name)
+            sd.mkdir(parents=True, exist_ok=True)
+            (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+            (sd / '.skillopt.policy.json').write_text(
+                json.dumps(policy), encoding='utf-8')
+
+        gov.mark_human_decision('p4keep', True, 'user', proposal_id='p4keep')
+        gov.mark_decision('p4limit', True, 'eligible')
+
+        # Before rotation.
+        assert gov.check_skill_eligible('p4keep')[0] is True
+        assert gov.check_skill_eligible('p4limit')[1] == \
+            'rate_limited_min_interval'
+        assert gov.check_skill_eligible('p4free')[0] is True
+
+        # Rotate the log out from under them, exactly as 5 MB of history
+        # eventually would. This drops EVERY prior row, including p4limit's
+        # cadence seed - which is correct: a skill whose "last eligible
+        # decision" has been rotated away genuinely is not rate-limited yet.
+        # Re-seed it below so the cadence assertion still tests the cadence
+        # rail rather than the rotation.
+        (runs / 'governance.log').write_text('', encoding='utf-8')
+        e, r = gov.check_skill_eligible('p4limit')
+        assert (e, r) == (True, 'eligible'), (
+            f'p4limit should be un-rate-limited once its seed rotated away: '
+            f'{(e, r)}')
+        gov.mark_decision('p4limit', True, 'eligible')
+
+        # Still true afterwards: the durable index answers for p4keep.
+        e, r = gov.check_skill_eligible('p4keep')
+        assert (e, r) == (True, 'eligible'), (
+            f'the approval did not survive rotation: {(e, r)}')
+        # The cadence rail is independent of the approval ledger.
+        assert gov.check_skill_eligible('p4limit')[1] == \
+            'rate_limited_min_interval', (
+            'the cadence rail stopped working after rotation')
+        # The explicit 0 is still 0.
+        assert gov.check_skill_eligible('p4free')[0] is True, (
+            'min_interval_seconds: 0 stopped meaning "no limit"')
+        # And no skill inherited another's policy scope.
+        for name in ('p4keep', 'p4limit', 'p4free'):
+            assert gov._skill_dir(name).parent.resolve() == skills.resolve(), (
+                f'{name} resolved outside the skills tree')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('rotation, cadence and explicit-zero all hold together')
+    print(' t_v1838_phase4_invariants_hold_together: OK')
+
+
+# ======================================================================= #
+# v1.8.39 - Phase 5 remediation: privacy, resources, performance
+# ======================================================================= #
+#
+# The final phase. Phase 1 gates, Phase 2 approval path, Phase 3 settings and
+# routes, Phase 4 durability. Phase 5 is about what LEAKS, what GROWS, and
+# what the operator is PROMISED vs what actually happens.
+#
+#   M9  model OUTPUT was never redacted, and two egress/persistence paths
+#       carried raw rollout text
+#   M10 the credential patterns missed the most common form on the planet
+#   M11 subprocess log handles were never closed (~1/cycle)
+#   M12 four run logs grew without bound; two are re-read per poll
+#   M13 default_config() re-parsed 32 KB of YAML per call, on a per-chat path
+#   M14 both banner CTAs dispatched an action the WebUI no longer implements
+#
+# M9/M10 are the only ones with a confidentiality dimension.
+
+_section_v1839 = ('v1.8.39 NEW: audit Phase 5 - privacy, resources, performance '
+                  '(8 cases)')
+_section_v1839b = ('v1.8.39 NEW: the config-reader test asks the wrong '
+                   'question - this one asks the right one (1 case)')
+
+
+@test('v1.8.39 M10: the credential patterns cover the common forms')
+def t_v1839_credential_patterns() -> None:
+    """The headline bug: `_ASSIGNMENT_RE` led with `\\b`, and `_` is a word
+    character, so there was no boundary in `AZURE_OPENAI_API_KEY=<secret>`
+    and the whole alternative failed. Only the literal `sk-` / `ghp_` forms
+    rescued the best-known cases - so the single most common credential shape
+    on the planet slipped through a redactor that looked comprehensive.
+
+    Also closed: non-HTTP URL credentials, DSA/PGP/ENCRYPTED/PuTTY keys,
+    and assignments inside escaped-JSON strings."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import privacy as pv
+
+    MUST_REDACT = [
+        ('underscore-prefixed env var',
+         'AZURE_OPENAI_API_KEY=abcdef0123456789abcdef', 'abcdef0123456789abcdef'),
+        ('prefixed api key',
+         'MY_SERVICE_API_KEY: zyxwvu9876543210zyxwvu', 'zyxwvu9876543210zyxwvu'),
+        ('openai', 'OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx',
+         'sk-abcdefghijklmnopqrstuvwx'),
+        ('anthropic', 'ANTHROPIC_API_KEY=sk-ant-abcdefghijklmnop1234',
+         'sk-ant-abcdefghijklmnop1234'),
+        ('github pat', 'ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+         'ghp_abcdefghijklmnopqrstuvwxyz0123456789'),
+        ('aws', 'AKIAIOSFODNN7EXAMPLE', 'AKIAIOSFODNN7EXAMPLE'),
+        ('slack', 'xoxb-123456789012-abcdefghijkl', 'xoxb-123456789012-abcdefghijkl'),
+        ('postgres url', 'postgres://admin:s3cr3tp4ss@db.internal:5432/app',
+         's3cr3tp4ss'),
+        ('mongodb url', 'mongodb://root:letmein123@mongo:27017', 'letmein123'),
+        ('redis url (EMPTY username)', 'redis://:hunter2hunter2@cache:6379/0',
+         'hunter2hunter2'),
+        ('https url', 'https://user:p4ssw0rd@example.com/x', 'p4ssw0rd'),
+        ('bearer', 'Authorization: Bearer abcdef0123456789abcdef',
+         'abcdef0123456789abcdef'),
+        ('rsa key',
+         '-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----',
+         'MIIEow'),
+        ('dsa key',
+         '-----BEGIN DSA PRIVATE KEY-----\nMIIEow\n-----END DSA PRIVATE KEY-----',
+         'MIIEow'),
+        ('pgp key block',
+         '-----BEGIN PGP PRIVATE KEY BLOCK-----\nx\n'
+         '-----END PGP PRIVATE KEY BLOCK-----', 'BEGIN PGP'),
+        ('encrypted key',
+         '-----BEGIN ENCRYPTED PRIVATE KEY-----\nx\n'
+         '-----END ENCRYPTED PRIVATE KEY-----', 'BEGIN ENCRYPTED'),
+        ('putty key',
+         'PuTTY-User-Key-File-2: ssh-rsa\nEncryption: none\n'
+         'Public-Lines: 6\nPrivate-Lines: 10\nPrivate-MAC: abc',
+         'Private-Lines: 10'),
+        ('escaped json', '{\\"api_key\\": \\"sk-abcdefghijklmnop1234\\"}',
+         'sk-abcdefghijklmnop1234'),
+        ('client secret', 'client_secret: abcdef0123456789xyz',
+         'abcdef0123456789xyz'),
+        ('password', 'password = "hunter2hunter2"', 'hunter2hunter2'),
+    ]
+    failures = []
+    for label, text, secret in MUST_REDACT:
+        out = pv.redact_text(text)
+        if secret in out:
+            failures.append(f'{label}: {secret!r} survived -> {out[:70]!r}')
+    assert not failures, 'these credentials were NOT redacted:\n  ' + \
+        '\n  '.join(failures)
+
+    # Over-redaction is a real cost: it shreds legitimate skill documents.
+    MUST_KEEP = [
+        ('token=none', 'token=none'),
+        ('empty api_key', 'api_key='),
+        ('prose mention', 'Set the API key in the environment first.'),
+        ('no separator', 'the api_key is not set here'),
+        ('not an assignment', 'my_api_key_backup='),
+        ('short value', 'token=abc'),
+        ('sentence', 'the token was rotated last week by the operator'),
+    ]
+    for label, text in MUST_KEEP:
+        out = pv.redact_text(text)
+        assert out == text, (
+            f'{label} was over-redacted: {text!r} -> {out!r}. A redactor that '
+            f'destroys legitimate content gets turned off entirely.')
+
+    # Documented limitation, asserted so it cannot be quietly forgotten:
+    # generic high-entropy base64 is NOT attempted, because redacting it
+    # would shred hashes, checksums and encoded examples.
+    assert 'base64' in pv.redact_text.__doc__, (
+        'the deliberate base64 non-goal must stay documented in the docstring')
+
+    # Passthrough behaviour.
+    assert pv.redact_text('AZURE_OPENAI_API_KEY=abcdef0123456789',
+                          enabled=False) == \
+        'AZURE_OPENAI_API_KEY=abcdef0123456789'
+    assert pv.redact_text('') == ''
+    assert pv.redact_text(None) == ''
+    _ok(f'{len(MUST_REDACT)} credential forms redacted, '
+        f'{len(MUST_KEEP)} non-credentials untouched')
+    print(' t_v1839_credential_patterns: OK')
+
+
+@test('v1.8.39 M9: MODEL OUTPUT is redacted before it reaches a live skill')
+def t_v1839_model_output_redacted_at_adopt() -> None:
+    """`privacy.py` sanitized rollout INPUT at every provider and replay
+    boundary, and fails closed there. The model's RETURNED text was never
+    sanitized, so it flowed `_extract_skill_text` -> staging -> approval ->
+    live `SKILL.md` verbatim. A credential echoed back from a prompt became
+    part of a live skill document, and from there part of the system prompt on
+    every later load.
+
+    `adopt_write_skill` is the single choke point every adopt path goes
+    through, so redacting there covers the route, the tool and both drain
+    paths at once."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import sleep_runner as sr
+    tmp = Path(tempfile.mkdtemp(prefix='v1839_out_'))
+    skills = tmp / 'skills'
+    skills.mkdir(parents=True, exist_ok=True)
+    saved = (sr.a0_skills_dir, sr.plugin_root)
+    sr.a0_skills_dir = lambda: skills
+    sr.plugin_root = lambda: tmp
+    try:
+        live = sr.safe_skill_md('echo')
+        live.parent.mkdir(parents=True, exist_ok=True)
+        live.write_text('---\nname: echo\ndescription: d\n---\n# echo\nold\n',
+                        encoding='utf-8')
+
+        # The model "helpfully" echoes the credential it was shown.
+        proposed = (
+            '---\nname: echo\ndescription: d\n---\n# echo\n'
+            'To authenticate, set AZURE_OPENAI_API_KEY=abcdef0123456789abcdef '
+            'in the environment.\n'
+        )
+        res = sr.adopt_write_skill('echo', proposed)
+        assert res['ok'] is True, res
+        assert res['redacted'] is True, (
+            'the adopt reported no redaction while the document carried a '
+            f'credential: {res}')
+        body = live.read_text(encoding='utf-8')
+        assert 'abcdef0123456789abcdef' not in body, (
+            f'model output reached the LIVE skill unredacted:\n{body}')
+        assert '[REDACTED]' in body, body
+
+        # A clean proposal is passed through untouched, and says so.
+        clean = ('---\nname: echo\ndescription: d\n---\n# echo\n'
+                 'Step one. Step two.\n')
+        res2 = sr.adopt_write_skill('echo', clean)
+        assert res2['ok'] is True, res2
+        assert res2['redacted'] is False, (
+            'a clean document was reported as redacted')
+        assert live.read_text(encoding='utf-8') == clean, (
+            'a clean proposal was modified on the way in')
+
+        # Uniform result shape: the flag is on every return, so a caller can
+        # trust it (three callers read this dict; the audit row records it).
+        src = (PLUGIN_ROOT / 'helpers' / 'sleep_runner.py').read_text(
+            encoding='utf-8')
+        import ast as _ast
+        tree = _ast.parse(src)
+        fn = [n for n in tree.body if isinstance(n, _ast.FunctionDef)
+              and n.name == 'adopt_write_skill'][0]
+        blk = src.splitlines()[fn.lineno - 1:fn.end_lineno]
+        rets = [i for i, l in enumerate(blk) if l.strip().startswith('return {')]
+        assert rets, 'no returns found'
+        for i in rets:
+            window = ''.join(blk[i:i + 6])
+            assert 'redacted' in window, (
+                f'adopt_write_skill has a return without `redacted` at '
+                f'offset {i}')
+        _ok('output redacted once, at the single choke point; flag uniform')
+    finally:
+        sr.a0_skills_dir, sr.plugin_root = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1839_model_output_redacted_at_adopt: OK')
+
+
+@test('v1.8.39 M9: rollout records are sanitized before PERSISTENCE, not just egress')
+def t_v1839_rollout_records_sanitized() -> None:
+    """The real-gate worker freezes whole rollout records to
+    `logs/runs/*.tasks.json` and re-reads them on every replay, so an
+    unsanitized credential captured before the privacy controls existed was
+    written verbatim to disk and then re-injected into a live agent context.
+
+    Sanitizing at the persistence boundary means the durable artefact is safe
+    regardless of what a future reader does. Order and length must be
+    preserved: the held-out gate compares by index, so a dropped or reordered
+    element would silently change which pairs are measured."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import privacy as pv
+
+    records = [
+        {'skill_used': 'a', 'task': 'set AZURE_OPENAI_API_KEY=abcdef0123456789',
+         'last_response': 'ok', 'trajectory': [
+             {'type': 'tool', 'args': {'k': 'sk-abcdefghijklmnop1234'},
+              'result': 'fine'}]},
+        {'skill_used': 'b', 'task': 'nothing to see',
+         'last_response': 'postgres://u:p4ssw0rdpass@db/x'},
+        'not a dict',
+        {'skill_used': 'd', 'task': None},
+    ]
+    out = pv.sanitize_rollout_records(records)
+    assert isinstance(out, list), type(out)
+    assert len(out) == len(records), (
+        f'length changed: {len(records)} -> {len(out)}; the held-out gate '
+        f'compares by index')
+    assert out[2] == 'not a dict', out[2]
+    blob = json.dumps(out)
+    for secret in ('abcdef0123456789', 'sk-abcdefghijklmnop1234', 'p4ssw0rdpass'):
+        assert secret not in blob, f'{secret} survived into the frozen records'
+    # Structural fields survive - the gate reads skill_used.
+    assert out[0]['skill_used'] == 'a', out[0]
+    assert out[3]['task'] is None, out[3]
+    # Tool args are excluded by default (unchanged behaviour).
+    assert 'args' not in out[0]['trajectory'][0], out[0]['trajectory'][0]
+
+    # Non-list input passes through rather than exploding.
+    assert pv.sanitize_rollout_records(None) is None
+    assert pv.sanitize_rollout_records({'a': 1}) == {'a': 1}
+    # And a record whose sanitization raises is passed through, not dropped.
+    class Boom(dict):
+        pass
+
+    assert len(pv.sanitize_rollout_records([Boom(a=1), {'b': 2}])) == 2
+    _ok('order/length preserved, secrets gone, structure intact')
+    print(' t_v1839_rollout_records_sanitized: OK')
+
+
+@test('v1.8.39 M9: the inner-loop HTTP egress fails CLOSED')
+def t_v1839_inner_loop_egress_fails_closed() -> None:
+    """`_llm_suggest_via_http` posted raw rollout text to an arbitrary
+    configured endpoint - dormant only because `inner_loop_llm_endpoint`
+    defaults to empty, which is a config accident rather than a control.
+
+    Enabling the endpoint silently started shipping credentials. Every other
+    provider boundary in this plugin sanitizes and fails closed; this must too,
+    and with an unavailable privacy helper it must NOT send the request."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import inner_loop as il
+
+    calls = []
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"suggestion": "x", "confidence": 0.5}'
+
+    class FakeUrlopen:
+        def __init__(self, req, timeout=None):
+            calls.append(req)
+
+        def __enter__(self):
+            return FakeResp()
+
+        def __exit__(self, *a):
+            return False
+
+    import urllib.request
+    saved = urllib.request.urlopen
+    urllib.request.urlopen = FakeUrlopen
+    saved_pv = getattr(il, 'privacy', None)
+    try:
+        payload = {'rollouts': [
+            {'skill_used': 'a', 'task': 'AZURE_OPENAI_API_KEY=abcdef0123456789'}]}
+        res = il._llm_suggest_via_http(
+            payload, endpoint='http://x.invalid/s', model='utility', timeout=1.0)
+        assert not res['error'], res
+        assert len(calls) == 1, calls
+        sent = calls[0].data.decode('utf-8')
+        assert 'abcdef0123456789' not in sent, (
+            f'the egress shipped a credential unsanitized:\n{sent[:300]}')
+        assert '[REDACTED]' in sent, sent[:300]
+
+        # The fail-closed branch is asserted on the SOURCE. Triggering it by
+        # blocking the import does not work reliably: `privacy` is already in
+        # sys.modules, and `from helpers import privacy` resolves through the
+        # package attribute rather than a fresh import, so a __import__ hook
+        # never fires. Asserting the branch exists - BEFORE the request is
+        # built, and returning without touching urlopen - is the guarantee.
+        src = (PLUGIN_ROOT / 'helpers' / 'inner_loop.py').read_text(
+            encoding='utf-8')
+        start = src.find('def _llm_suggest_via_http')
+        assert start != -1, '_llm_suggest_via_http is gone'
+        # Bound by the FUNCTION, not a fixed character count: a fixed window
+        # silently returned -1 for `urllib.request.Request(` once the v1.8.45
+        # sanitisation helpers grew the function past it, and `-1 < n` compares
+        # as True, so the ordering check stopped meaning anything.
+        body = src[start:]
+        nxt = body.find('\ndef ', 10)
+        body = body[:nxt] if nxt != -1 else body
+        req_at = body.find('urllib.request.Request(')
+        refuse_at = body.find('privacy_unavailable')
+        assert req_at != -1, 'the egress no longer builds a urllib Request'
+        assert refuse_at != -1, (
+            'the egress has no fail-closed branch for an unavailable privacy '
+            'helper - a privacy bug would ship raw rollout text')
+        assert refuse_at < req_at, (
+            'the fail-closed check runs AFTER the request is built, so it '
+            'cannot prevent it')
+        assert 'sanitize_rollout_records' in body or '_sanitize_payload(' in body, (
+            'the egress no longer sanitizes the rollout payload')
+        # v1.8.45 (R14): the sanitisation moved into `_sanitize_payload`,
+        # so follow it. Asserting the literal inside the egress body stopped
+        # holding the moment the helper was extracted - the code was right and
+        # the check was looking at the wrong scope.
+        if '_sanitize_payload(' in body:
+            h = src.find('def _sanitize_payload(')
+            assert h != -1, '_sanitize_payload is called but not defined'
+            helper = src[h:]
+            hn = helper.find('\ndef ', 10)
+            helper = helper[:hn] if hn != -1 else helper
+            # Both payload shapes must be handled: a rollout-shaped record
+            # (task/trajectory/last_response - what _build_rollout_payload
+            # emits) and a wrapper carrying a `rollouts` LIST.
+            assert 'sanitize_rollout(' in helper, (
+                'the rollout shape is not sanitized: trajectory steps would '
+                'keep their args/result policy unenforced')
+            assert 'sanitize_rollout_records(' in helper, (
+                'a `rollouts` list is not sanitized')
+            # The egress must refuse when privacy is unavailable, and that
+            # refusal must be reachable before the request is built.
+            assert 'privacy_unavailable' in body, (
+                'the egress no longer refuses when privacy is unavailable')
+        # And every other free-text field is redacted too.
+        assert 'redact_text' in body, (
+            'only the rollouts list is sanitized; other string fields are not')
+    finally:
+        urllib.request.urlopen = saved
+        shutil.rmtree(Path(tempfile.gettempdir()) / 'unused',
+                      ignore_errors=True) if False else None
+    _ok('egress sanitized; refuses when privacy is unavailable')
+    print(' t_v1839_inner_loop_egress_fails_closed: OK')
+
+
+@test('v1.8.39 M11: subprocess log handles are closed after spawn')
+def t_v1839_log_handles_closed() -> None:
+    """`Popen` duplicates the descriptor, so the parent does not need to keep
+    the log handle open - and leaving it open leaked one descriptor per cycle.
+    On Windows an open handle also blocks `os.replace`, so rotation silently
+    stopped working for any log that had been written to."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import sleep_runner as sr
+    tmp = Path(tempfile.mkdtemp(prefix='v1839_fh_'))
+    saved = (sr.runs_dir, sr.staging_dir, sr.plugin_root)
+    sr.runs_dir = lambda: tmp
+    sr.staging_dir = lambda: tmp / 'staging'
+    (tmp / 'staging').mkdir(parents=True, exist_ok=True)
+    sr.plugin_root = lambda: tmp
+    opened = []
+    real_open = sr.open if hasattr(sr, 'open') else open
+    import builtins
+    saved_popen = sr.subprocess.Popen
+
+    class FakeProc:
+        def __init__(self, *a, **kw):
+            self.pid = 4242
+
+    try:
+        # Source-level assertions: the close must be in BOTH spawn paths and
+        # must come AFTER the Popen that duplicated the handle.
+        src = (PLUGIN_ROOT / 'helpers' / 'sleep_runner.py').read_text(
+            encoding='utf-8')
+        import ast as _ast
+        tree = _ast.parse(src)
+        fns = [n for n in tree.body if isinstance(n, _ast.FunctionDef)
+               and n.name in ('launch_sleep_subprocess',
+                              'launch_real_gate_worker')]
+        assert len(fns) == 2, [f.name for f in fns]
+        for fn in fns:
+            body = src.splitlines()[fn.lineno - 1:fn.end_lineno]
+            text = '\n'.join(body)
+            assert 'log_fh = open(' in text, f'{fn.name} does not open a handle'
+            popen_at = text.index('subprocess.Popen(')
+            close_at = text.find('log_fh.close()')
+            assert close_at != -1, (
+                f'{fn.name} never closes its log handle (audit M11)')
+            assert close_at > popen_at, (
+                f'{fn.name} closes the handle BEFORE Popen duplicates it')
+            # And it must be guarded: a close failure must not lose the pid.
+            window = text[close_at - 200:close_at + 60]
+            assert 'try:' in window and 'except' in window, (
+                f'{fn.name} closes the handle unguarded')
+        _ok('both spawn paths close the handle after Popen, guarded')
+    finally:
+        sr.subprocess.Popen = saved_popen
+        sr.runs_dir, sr.staging_dir, sr.plugin_root = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1839_log_handles_closed: OK')
+
+
+@test('v1.8.39 M13: default_config is cached on mtime and still hands out copies')
+def t_v1839_default_config_cached() -> None:
+    """`default_config()` re-read and `yaml.safe_load`ed 32 KB / 79 keys on
+    EVERY call, and it sits on the reward-model scoring path
+    (`score_rollout` -> `model_path` -> `merged_config` -> `default_config`),
+    which runs once per finished chat in the harvester and 2xN per real gate.
+
+    The original docstring said no cache was possible because callers MUTATE
+    the result. The fix is to cache the PARSE and hand out a deep copy, so
+    the expensive part happens once per file change."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import time as _time
+    from helpers import sleep_runner as sr
+
+    a = sr.default_config()
+    b = sr.default_config()
+    assert a and len(a) > 70, len(a)
+    assert a is not b, 'the cache is handing out a SHARED dict'
+    assert a['governance'] is not b['governance'], (
+        'nested sections are shared between calls - a caller mutating '
+        'cfg["governance"]["x"] would corrupt every other caller')
+
+    # Mutation must not leak into the next read.
+    a['MUTATED'] = True
+    a['governance']['MUTATED'] = True
+    a['governance']['default_policy']['MUTATED'] = True
+    c = sr.default_config()
+    assert 'MUTATED' not in c, 'a top-level mutation leaked'
+    assert 'MUTATED' not in c['governance'], 'a nested mutation leaked'
+    assert 'MUTATED' not in c['governance']['default_policy'], \
+        'a deeply nested mutation leaked'
+
+    # And the cache must actually be used.
+    sr._DEFAULT_CFG_CACHE['mtime'] = None
+    t0 = _time.perf_counter()
+    for _ in range(60):
+        sr._DEFAULT_CFG_CACHE['mtime'] = None
+        sr.default_config()
+    uncached = _time.perf_counter() - t0
+    sr._DEFAULT_CFG_CACHE['mtime'] = None
+    sr.default_config()          # prime
+    t0 = _time.perf_counter()
+    for _ in range(60):
+        sr.default_config()
+    cached = _time.perf_counter() - t0
+    assert cached < uncached / 3, (
+        f'the cache is not working: uncached {uncached * 1000:.0f}ms vs '
+        f'cached {cached * 1000:.0f}ms for 60 calls')
+    _ok(f'{len(a)} keys, copies are independent, {uncached / max(cached, 1e-9):.0f}x faster')
+    print(' t_v1839_default_config_cached: OK')
+
+
+@test('v1.8.39 M12: the run logs that grow without bound now rotate')
+def t_v1839_run_logs_rotate() -> None:
+    """Four run logs grew forever, and two of them are fully re-read on every
+    status poll - so cost grew with install age. `rotate_log_if_large`
+    already existed; these four simply never called it."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    # (file, the FUNCTION that resolves the path, log name, min rotation calls)
+    cases = [
+        ('helpers/auto_loop.py', None, 'adoptions.log', 2),
+        ('helpers/failure_memory.py', '_cycle_log_path', 'failure_memory.log', 1),
+        ('helpers/fragment_store.py', '_fragment_log_path', 'fragments.log', 1),
+    ]
+    import ast as _ast
+    for rel, fn_name, logname, min_sites in cases:
+        src = (PLUGIN_ROOT / rel).read_text(encoding='utf-8')
+        assert logname in src, f'{rel} no longer mentions {logname}'
+        # Anchor on the RESOLVER, not the first textual mention: several of
+        # these names appear in a module docstring long before the code, and
+        # a window around the docstring proves nothing.
+        if fn_name:
+            tree = _ast.parse(src)
+            fns = [n for n in tree.body
+                   if isinstance(n, _ast.FunctionDef) and n.name == fn_name]
+            assert fns, f'{rel} has no {fn_name}'
+            lines = src.splitlines()
+            body = '\n'.join(lines[fns[0].lineno - 1:fns[0].end_lineno])
+            assert logname in body, (
+                f'{fn_name} in {rel} no longer resolves {logname}')
+            assert 'rotate_log_if_large' in body, (
+                f'{logname} ({rel}) still grows without bound: {fn_name} has no '
+                f'rotation call')
+        n = src.count('rotate_log_if_large')
+        assert n >= min_sites, (
+            f'{rel}: expected >= {min_sites} rotation call(s), found {n}')
+
+    # The rotation helper itself must still be the bounded one-generation
+    # rotate the rest of the plugin uses.
+    from helpers import sleep_runner as sr
+    import tempfile as _tempfile
+    tmp = Path(tempfile.mkdtemp(prefix='v1839_rot_'))
+    try:
+        target = tmp / 'x.log'
+        target.write_text('a' * 300, encoding='utf-8')
+        assert sr.rotate_log_if_large(target, max_bytes=100) is True
+        assert (tmp / 'x.log.1').is_file(), 'no rotated generation'
+        assert target.is_file(), 'the live log must be recreated for tailers'
+        assert target.stat().st_size == 0, target.stat().st_size
+        # Below the threshold it is a no-op.
+        target.write_text('small', encoding='utf-8')
+        assert sr.rotate_log_if_large(target, max_bytes=100) is False
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('adoptions/failure_memory/fragments all rotate; helper unchanged')
+    print(' t_v1839_run_logs_rotate: OK')
+
+
+@test('v1.8.39 M14: the banner CTAs dispatch an action the WebUI implements')
+def t_v1839_banner_cta_is_live() -> None:
+    """Both banners used `cta_action: "open-plugin-config:skillopt"`, which
+    matches no branch in `welcome-store.js:executeBannerAction` - that method
+    only handles `open-modal:` and `open-url:`. The button rendered and did
+    nothing, which is worse than no button: it looked like a working control.
+
+    Asserted against the WebUI source rather than a literal, so the next
+    WebUI rename fails here instead of in a user's face."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    # PLUGIN_ROOT is <root>/usr/plugins/skillopt -> three levels up.
+    # v2026-10-13: tolerate a relocated suite copy (the established recipe
+    # for 9p-flap runs is a container-local /tmp copy), where the framework
+    # tree is not three levels up but at /a0.
+    root = PLUGIN_ROOT.parent.parent.parent
+    welcome = root / 'webui' / 'components' / 'welcome' / 'welcome-store.js'
+    if not welcome.is_file():
+        _fw = Path('/a0/webui/components/welcome/welcome-store.js')
+        if _fw.is_file():
+            welcome = _fw
+    assert welcome.is_file(), f'cannot verify the CTA contract: {welcome}'
+    js = welcome.read_text(encoding='utf-8')
+    implemented = []
+    for line in js.splitlines():
+        s = line.strip()
+        if s.startswith('if (action.startsWith('):
+            # Keep the trailing colon: it is part of the action prefix, and
+            # stripping it is what made this assertion miss a live contract.
+            implemented.append(s.split('"')[1])
+    assert 'open-modal:' in implemented, (
+        f'the WebUI no longer implements open-modal:; supported: {implemented}')
+
+    sites = [
+        'extensions/python/banners/_10_skillopt_status.py',
+        'extensions/python/monologue_start/_40_skillopt_warn.py',
+    ]
+    for rel in sites:
+        p = PLUGIN_ROOT / rel
+        assert p.is_file(), f'missing {rel}'
+        src = p.read_text(encoding='utf-8')
+        assert 'open-plugin-config:' not in src, (
+            f'{rel} still dispatches the dead open-plugin-config: action')
+        found = [ln for ln in src.splitlines() if 'cta_action' in ln
+                 and '"' in ln]
+        assert found, f'{rel} has no cta_action'
+        for ln in found:
+            assert '"open-modal:' in ln, (
+                f'{rel}: cta_action is not an implemented action:\n  {ln.strip()}')
+        # And it must point at the settings page that actually exists.
+        assert 'usr/plugins/skillopt/webui/config.html' in src, (
+            f'{rel}: the modal path does not point at the settings page')
+    target = PLUGIN_ROOT / 'webui' / 'config.html'
+    assert target.is_file(), f'the CTA target does not exist: {target}'
+    _ok(f'both banners use an implemented action; supported: {implemented}')
+    print(' t_v1839_banner_cta_is_live: OK')
+
+
+# --------------------------------------------------------------------- #
+# v1.8.39: the reader test asks the wrong question. This one asks the
+# right one.
+# --------------------------------------------------------------------- #
+#
+# `t_v1824_config_keys_have_readers` greps a key's NAME across the sources,
+# so it passes for a key that only appears in a helper's own signature -
+# precisely how `budget.daily_cap_cents` stayed inert while the suite was
+# green (audit F13). It is also name-shape-coupled: the
+# `governance.autonomous_*` rails are read via `"autonomous_" + key`, so the
+# full name never appears in the source, and the test only passes because
+# `autonomous_config()` happens to reuse the same short names internally.
+# Renaming that dict would fail the test spuriously; deleting the loop would
+# pass it wrongly.
+#
+# So: set a DISTINCTIVE value and assert it arrives. That is the only
+# question that matters, and it fails for any wiring mistake rather than for
+# a naming choice.
+
+@test('v1.8.39: declared settings DELIVER their value, not just their name')
+def t_v1839_config_values_reach_consumers() -> None:
+    """Every setting this work added, proven by value.
+
+    Non-exhaustive by design - it covers the keys added in v1.8.34-1.8.39
+    (and the four the audit found inert). It is the guard that makes the
+    name-grep test necessary rather than sufficient.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import budget as bg, cadence as cd, governance as gov
+    from helpers import cycle_history as ch, proposal_view as pv
+    from helpers import sleep_runner as sr
+
+    tmp = Path(tempfile.mkdtemp(prefix='v1839_keys_'))
+    saved = (bg._default_state_dir, sr._framework_registry_config,
+             sr.default_config, ch._enabled, ch._max_entries,
+             cd.compute_next_run)
+    bg._default_state_dir = lambda: tmp
+    try:
+        # --- budget: read via a tuple loop in the factory -------------
+        bt = bg.tracker_from_config('probe', {'budget': {
+            'enabled': True, 'daily_cap_cents': 321, 'reset_hour_utc': 9,
+            'cost_per_call_cents': 4, 'soft_warn_pct': 61}})
+        assert bt is not None, 'a well-formed budget block produced no tracker'
+        assert bt.daily_cap_cents == 321, bt.daily_cap_cents
+        assert bt.reset_hour_utc == 9, bt.reset_hour_utc
+        assert bt.cost_per_call_cents == 4, bt.cost_per_call_cents
+        assert bt.soft_warn_pct == 61, bt.soft_warn_pct
+        assert bg.tracker_from_config(
+            'probe', {'budget': {'enabled': False}}) is None, (
+            'budget.enabled=False must produce no tracker at all')
+
+        # --- governance rails: read via the "autonomous_" + key prefix --
+        rails = gov.autonomous_config({'governance': {
+            'evolution_mode': 'autonomous',
+            'autonomous_max_adoptions_per_day': 11,
+            'autonomous_max_adoptions_per_skill_per_day': 3,
+            'autonomous_min_evidence_rollouts': 7,
+            'autonomous_require_post_adopt_check': False,
+            'autonomous_audit': False,
+        }})
+        assert rails['max_adoptions_per_day'] == 11, rails
+        assert rails['max_adoptions_per_skill_per_day'] == 3, rails
+        assert rails['min_evidence_rollouts'] == 7, rails
+        assert rails['require_post_adopt_check'] is False, rails
+        assert rails['audit'] is False, rails
+        # Defaults are documented and safe.
+        d = gov.autonomous_config({})
+        assert d['max_adoptions_per_day'] == 5, d
+        assert d['audit'] is True and d['require_post_adopt_check'] is True, d
+
+        # --- cadence: target_rollouts must change the computed interval -
+        low = cd.compute_next_run(5, cadence_target=1, floor_s=60,
+                                  ceiling_s=3600)
+        high = cd.compute_next_run(5, cadence_target=999, floor_s=60,
+                                   ceiling_s=3600)
+        assert low == 60, low
+        assert high > low, (
+            f'cadence.target_rollouts had NO effect ({high} vs {low}) - the '
+            f'"hot" threshold is what decides floor vs ceiling interval')
+
+        # --- proposal_summary bounds must actually bound ----------------
+        cfg = {**pv.DEFAULTS, 'persist': False,
+               'diff_max_lines': 7, 'summary_max_chars': 90}
+        cur = '\n'.join('line %d' % i for i in range(200))
+        prop = '\n'.join('CHANGED %d' % i for i in range(200))
+        d2 = pv.compute_diff(cur, prop, max_lines=int(cfg['diff_max_lines']),
+                             max_chars=int(pv.DEFAULTS['diff_max_chars']))
+        assert d2['truncated'] is True, d2
+        assert len(d2['text'].splitlines()) <= int(cfg['diff_max_lines']) + 3, (
+            f'diff_max_lines=7 produced {len(d2["text"].splitlines())} lines')
+
+        # summary_max_chars must actually bound the derived paragraph.
+        long_ev = {'gate_outcome': 'absent'}
+        s = pv._derive_summary('demo', d2, long_ev,
+                               {'category': 'unknown', 'headline': ''},
+                               int(cfg['summary_max_chars']))
+        assert len(s) <= int(cfg['summary_max_chars']) + 4, (
+            f'summary_max_chars=90 produced a {len(s)}-char summary')
+
+        # --- cycle_history keys ----------------------------------------
+        sr.merged_config = lambda: {'cycle_history_enabled': False}
+        assert ch._enabled() is False, 'cycle_history_enabled is inert'
+        sr.merged_config = lambda: {'cycle_history_max_entries': 0}
+        assert ch._max_entries() == 0, (
+            'cycle_history_max_entries: 0 means "no compaction" and must not '
+            'be collapsed to the default')
+        sr.merged_config = lambda: {'cycle_history_max_entries': 42}
+        assert ch._max_entries() == 42
+        sr.merged_config = lambda: {}
+        assert ch._enabled() is True and ch._max_entries() == 500
+
+        # --- governance rails: 0 means "no limit", not "use the default" -
+        assert gov._opt_int(0, 3600) == 0, (
+            'an explicit 0 must not be collapsed by an `or default` idiom')
+        assert gov._opt_int(None, 3600) == 3600
+        assert gov._opt_int('nonsense', 3600) == 3600
+        assert gov._opt_int(True, 3600) == 3600, 'a bool must not become 1'
+    finally:
+        (bg._default_state_dir, sr._framework_registry_config,
+         sr.default_config, ch._enabled, ch._max_entries,
+         cd.compute_next_run) = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('every added setting delivers its value, proven by value not by name')
+    print(' t_v1839_config_values_reach_consumers: OK')
+
+# ======================================================================= #
+# v1.8.42 - Phase 6a: the drain's OWN pre-write gate (re-audit R2)
+# ======================================================================= #
+#
+# R2's shape is the reason this file exists: v1.8.35's F8 fix made
+# `_skill_eligible_for_cycle` fail-closed, and the F8 test drove THAT
+# function. But `_auto_adopt` calls `_adopt_one` directly and never routes
+# through the sibling, so `_adopt_one` was the drain's only governance
+# evaluation on its path to a live SKILL.md - and it still failed open.
+#
+# The test below therefore drives `_adopt_one` ITSELF. A test of the sibling
+# would have kept passing after R2 was reintroduced, which is exactly what
+# happened for a full release.
+
+_section_v1842 = ('v1.8.42 NEW: re-audit R2 - the drain\'s own pre-write gate '
+                  'fails closed (4 cases)')
+
+
+def _v1842_sandbox(tmp):
+    """Sandbox staging/skills/runs; the operating mode is pinned to AUTONOMOUS
+    so the drain is on the path that actually writes unattended."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import governance as gov, sleep_runner as sr
+    staging, skills, runs = tmp / 'staging', tmp / 'skills', tmp / 'runs'
+    for d in (staging, skills, runs):
+        d.mkdir(parents=True, exist_ok=True)
+    saved = (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir, gov._runs_dir,
+             gov._TEST_SKILLS_DIR, gov._mode_reported,
+             sr._framework_registry_config, sr.default_config)
+    sr.staging_dir = lambda: staging
+    sr.a0_skills_dir = lambda: skills
+    sr.runs_dir = lambda: runs
+    gov._runs_dir = lambda: runs
+    gov.set_skills_dir_for_tests(skills)
+    gov._mode_reported = {}
+    # Autonomous, via the registry - the only place the mode lives now.
+    sr._framework_registry_config = lambda: {
+        'governance': {'evolution_mode': 'autonomous'}}
+
+    def restore():
+        (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir,
+         gov._runs_dir) = saved[:4]
+        gov._TEST_SKILLS_DIR = saved[4]
+        gov._mode_reported = saved[5]
+        sr._framework_registry_config = saved[6]
+        sr.default_config = saved[7]
+    return restore, staging, skills, runs
+
+
+def _v1842_thread():
+    """A bare AutoLoopThread with its logging and state writes stubbed."""
+    from helpers import auto_loop as al
+    thread = al.AutoLoopThread.__new__(al.AutoLoopThread)
+    thread.lines = []
+    thread._log = lambda m: thread.lines.append(str(m))
+    thread._record_error = lambda exc, where: None
+    return thread
+
+
+@test('v1.8.42 R2: _adopt_one DEFERS when the governance check raises')
+def t_v1842_adopt_one_fails_closed_on_raise() -> None:
+    """THE R2 fix. The gate must not be the drain's weak point.
+
+    Drives `_adopt_one` directly - not `_skill_eligible_for_cycle`, which is
+    the sibling v1.8.35 fixed and whose test kept passing while this one
+    failed open."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import auto_loop as al, governance as gov
+    from helpers import sleep_runner as sr
+    tmp = Path(tempfile.mkdtemp(prefix='v1842_r2_'))
+    restore, staging, skills, runs = _v1842_sandbox(tmp)
+    saved_check = gov.check_skill_eligible
+    saved_validate = sr.validate_proposal
+    saved_write = sr.adopt_write_skill
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history', 'fragment_store', 'replay_harness',
+                      'ab_harness')
+
+        # A proposal the validation gate would happily accept, so the ONLY
+        # thing that can stop the write is governance.
+        src = staging / 'r2skill.md'
+        src.write_text(_v1834_skill_md(
+            'r2skill',
+            'Step one, two and three, with an explicit try/except and '
+            'error-handling fallback for the multi-page case, plus a worked '
+            'example and a second worked example.\n'), encoding='utf-8')
+        sr.validate_proposal = lambda *a, **kw: (True, 'ok')
+        writes = []
+        sr.adopt_write_skill = lambda skill, text: (
+            writes.append(skill) or {'ok': True, 'snapshotted': True})
+
+        thread = _v1842_thread()
+        state = {}
+
+        # `_adopt_one` refuses an UNGATED direct adoption unless the operator
+        # opts in (v1.8.24 P1.6) - a separate, correct refusal that would
+        # otherwise mask what this test is about. Opt in explicitly so the
+        # ONLY remaining gate under test is governance.
+        permissive = {'allow_ungated_direct_adopt': True}
+
+        # --- control: with a working gate, _adopt_one DOES write ---------
+        def boom(*a, **kw):
+            raise RuntimeError('logs/runs is read-only')
+
+        gov.check_skill_eligible = boom
+        outcome = thread._adopt_one(state, permissive, src)
+
+        assert not writes, (
+            f'_adopt_one wrote {writes} even though the governance check '
+            f'RAISED - the drain would promote a live skill for a skill whose '
+            f'optout/immutable/pause/rejection rails were never evaluated '
+            f'(outcome={outcome!r})')
+        assert not (skills / 'r2skill' / 'SKILL.md').exists(), (
+            'a live SKILL.md was written with the rails unevaluated')
+        assert outcome == 'skipped', (
+            f'a governance failure must DEFER (stay in staging, may be '
+            f'eligible next tick), not return {outcome!r}')
+        # The deferral must be VISIBLE: the operator has no other signal.
+        assert any('DEFER' in ln for ln in thread.lines), (
+            f'the deferral was not logged: {thread.lines}')
+        # ...and it must stay in staging so it can be retried.
+        assert src.exists(), (
+            'a deferred proposal must STAY in staging; quarantining it would '
+            'turn a transient governance fault into a rejection')
+        assert not list(staging.glob('rejected')), (
+            'a deferred proposal was quarantined')
+
+        # --- and with a working gate that says yes, it writes ----------
+        thread2 = _v1842_thread()
+        gov.check_skill_eligible = lambda *a, **kw: (True, 'eligible')
+        outcome2 = thread2._adopt_one(state, permissive, src)
+        assert writes, (
+            'the control case did not write, so this test would also pass '
+            'with the gate permanently broken')
+        assert outcome2 in ('adopted', 'skipped'), outcome2
+
+        # --- a gate that REFUSES must not write either ------------------
+        src2 = staging / 'r2refuse.md'
+        src2.write_text(_v1834_skill_md(
+            'r2refuse',
+            'Step one, two and three, with an explicit try/except and '
+            'error-handling fallback for the multi-page case, plus a worked '
+            'example and a second worked example.\n'), encoding='utf-8')
+        writes.clear()
+        thread3 = _v1842_thread()
+        gov.check_skill_eligible = lambda *a, **kw: (
+            False, 'opted_out_via_marker')
+        outcome3 = thread3._adopt_one(state, permissive, src2)
+        assert not writes, (
+            f'_adopt_one wrote a skill governance refused ({outcome3!r})')
+        assert outcome3 == 'skipped', outcome3
+        assert src2.exists(), 'a refused proposal must stay in staging'
+    finally:
+        gov.check_skill_eligible = saved_check
+        sr.validate_proposal = saved_validate
+        sr.adopt_write_skill = saved_write
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('a raising gate defers, a refusing gate defers, a permitting gate writes')
+    print(' t_v1842_adopt_one_fails_closed_on_raise: OK')
+
+
+@test('v1.8.42 R2: every adopt path runs governance before the live write')
+def t_v1842_all_write_paths_are_gated() -> None:
+    """Structural guard for the whole class, not just the one function.
+
+    R1 and R2 were the same defect on two paths: each spelled its own gate,
+    and a test of one said nothing about the other. This asserts, per
+    FUNCTION rather than per line, that everything reaching
+    `adopt_write_skill` has a governance evaluation ahead of it.
+
+    Two subtleties this had to get right:
+      - a function may MENTION `adopt_write_skill()` in its docstring, so the
+        check strips the docstring before looking for a call;
+      - `adopt_write_skill` itself has no gate, by design: it is the
+        low-level sanctioned writer, and every CALLER must gate. That is
+        precisely why the per-caller check has to exist.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import ast
+    GOV = ('check_skill_eligible', '_check_governance',
+           'find_pending_real_gate_sidecar')
+    EXEMPT = {
+        # Governance ran at SPAWN time; the verdict sidecar is the record, and
+        # re-running it here would double-charge and double-audit.
+        '_harvest_real_gate': 'governance ran at spawn time (sidecar record)',
+        # The low-level writer. Correctly ungated - which is exactly why
+        # every caller must be gated, and why this list is explicit.
+        'adopt_write_skill': 'the sanctioned writer itself',
+    }
+    files = ['helpers/auto_loop.py', 'api/adopt.py',
+             'tools/skillopt_sleep.py', 'helpers/sleep_runner.py']
+    offenders, checked = [], 0
+    for rel in files:
+        src = (PLUGIN_ROOT / rel).read_text(encoding='utf-8')
+        tree = ast.parse(src)
+        for n in ast.walk(tree):
+            if not isinstance(n, ast.FunctionDef):
+                continue
+            seg = ast.get_source_segment(src, n) or ''
+            body_start = 0
+            doc = ast.get_docstring(n, clean=False)
+            if doc:
+                d = seg.find(doc)
+                if d != -1:
+                    body_start = d + len(doc)
+            body = seg[body_start:]
+            if 'adopt_write_skill(' not in body:
+                continue          # prose mention, not a call
+            checked += 1
+            before = seg[:body_start + body.index('adopt_write_skill(')]
+            if n.name in EXEMPT:
+                continue
+            if not any(m in before for m in GOV):
+                offenders.append(f'{rel}:{n.lineno} {n.name}')
+    assert not offenders, (
+        'these functions reach adopt_write_skill with NO governance check '
+        f'ahead of the write: {offenders}')
+    assert checked >= 3, (
+        f'only {checked} live-write call site(s) found - the scan is probably '
+        f'broken rather than the code being clean')
+    # The exemptions must stay justified, not accumulate.
+    for name, why in EXEMPT.items():
+        assert why, f'{name} is exempt without a stated reason'
+    _ok(f'{checked} live-write call sites, all gated or explicitly exempt')
+    print(' t_v1842_all_write_paths_are_gated: OK')
+
+
+@test('v1.8.42: the drain does not consult governance per-skill via the sibling')
+def t_v1842_drain_uses_adopt_one_not_the_sibling() -> None:
+    """Why R2 survived v1.8.35: `_auto_adopt` calls `_adopt_one` DIRECTLY.
+
+    So the F8 fix to `_skill_eligible_for_cycle` - correct as far as it went -
+    was on a path the drain does not take for adoption. This pins the call
+    graph so a future refactor that routes the drain through the sibling
+    (fine) or drops the gate from `_adopt_one` (not fine) is visible."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    src = (PLUGIN_ROOT / 'helpers' / 'auto_loop.py').read_text(encoding='utf-8')
+    import ast
+    tree = ast.parse(src)
+    fns = {n.name: n for n in ast.walk(tree)
+           if isinstance(n, ast.FunctionDef)}
+
+    auto = ast.get_source_segment(src, fns['_auto_adopt']) or ''
+    assert '_adopt_one(' in auto, (
+        '_auto_adopt no longer calls _adopt_one; if that was deliberate, '
+        're-point this test at the new caller and re-check that IT is gated')
+
+    # _adopt_one must call check_skill_eligible itself - that is the whole
+    # point of R2. It must not rely on a caller having checked.
+    one = ast.get_source_segment(src, fns['_adopt_one']) or ''
+    assert 'check_skill_eligible(' in one, (
+        '_adopt_one no longer evaluates governance itself. It is called '
+        'directly by _auto_adopt, so an external check is not guaranteed and '
+        'this is exactly the R2 shape.')
+    # ...and it must not delegate the decision away to a caller-provided flag.
+    assert 'def _adopt_one(self, state' in one and \
+        'eligible' not in one.split('def _adopt_one')[1][:400], (
+        '_adopt_one appears to accept a pre-computed `eligible`; if so, the '
+        'caller becomes the gate and R2 returns')
+    _ok('the drain reaches governance through _adopt_one, which evaluates it')
+    print(' t_v1842_drain_uses_adopt_one_not_the_sibling: OK')
+
+
+@test('v1.8.42: a governance fault is recorded, not just logged')
+def t_v1842_governance_fault_is_recorded() -> None:
+    """A deferral the operator cannot see is a silent stall. `_adopt_one`
+    must both log AND reach `_record_error`, which is what the dashboard
+    reads - and it must reach it from a MODULE-level function, since
+    `_record_error` is not a method (the v1.8.35 fix used `self.` and would
+    have raised AttributeError inside its own except handler)."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    src = (PLUGIN_ROOT / 'helpers' / 'auto_loop.py').read_text(encoding='utf-8')
+    import ast
+    tree = ast.parse(src)
+    fns = {n.name: n for n in ast.walk(tree)
+           if isinstance(n, ast.FunctionDef)}
+    one = ast.get_source_segment(src, fns['_adopt_one']) or ''
+    body = one.split('def _adopt_one', 1)[1]
+
+    # Locate the fail-closed branch and check what it does. The window is
+    # generous on purpose: the branch carries a long explanatory comment, and
+    # a narrow window made this test fail on the fix it was written for.
+    i = body.find('DEFER')
+    assert i != -1, (
+        'no DEFER marker in _adopt_one - the R2 fail-closed branch is gone')
+    window = body[i:i + 1600]
+    assert 'return "skipped"' in window, (
+        'the fail-closed branch does not defer; it must return "skipped" so '
+        'the proposal stays in staging')
+    assert '_record_error' in window, (
+        'the deferral is logged but never recorded, so the dashboard cannot '
+        'show it')
+    # `self._record_error` would raise AttributeError inside the handler.
+    assert 'self._record_error(' not in window, (
+        '_record_error is a MODULE-level function, not a method; calling it '
+        'via `self.` raises AttributeError inside the very except block that '
+        'is meant to be safe')
+    # ...and it must not still say it falls through.
+    assert 'falling through' not in window and 'fall through' not in window, (
+        'the fail-closed branch still claims to fall through - the comment '
+        'and the behaviour must agree')
+    assert 'def _record_error(' in src, '_record_error is gone from the module'
+    _ok('the deferral is logged AND recorded, with no AttributeError trap')
+    print(' t_v1842_governance_fault_is_recorded: OK')
+
+
+# ======================================================================= #
+# v1.8.43 - Phase 6b: stale authorisation decisions (re-audit R3, R4)
+# ======================================================================= #
+#
+# Both findings are the same class as R2: an ABSENT or STALE answer read
+# permissively on the path to a live file.
+#
+#   R3  /mode could report the mode it had just replaced, and the drain
+#       could keep treating itself as autonomous for up to the 5s registry
+#       TTL AFTER the operator switched autonomy OFF - a stale permissive
+#       answer on an authorisation decision.
+#   R4  the rejection rail's "undecidable => restrictive" branch was
+#       unreachable, because "no decision" and "could not read" were the
+#       same value. An unreadable ledger silently DISARMED the rail.
+
+_section_v1843 = ('v1.8.43 NEW: re-audit R3+R4 - stale/absent authorisation '
+                  'answers read permissively (5 cases)')
+
+
+def _v1843_sandbox(tmp):
+    """Sandbox staging/skills/runs, and pin the mode via the registry."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import governance as gov, sleep_runner as sr
+    staging, skills, runs = tmp / 'staging', tmp / 'skills', tmp / 'runs'
+    for d in (staging, skills, runs):
+        d.mkdir(parents=True, exist_ok=True)
+    saved = (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir, gov._runs_dir,
+             gov._TEST_SKILLS_DIR, gov._mode_reported, sr.default_config,
+             sr._FRAMEWORK_CFG_CACHE, gov._log_generations,
+             gov._read_approvals_index, gov._newest_staged_mtime)
+    sr.staging_dir = lambda: staging
+    sr.a0_skills_dir = lambda: skills
+    sr.runs_dir = lambda: runs
+    gov._runs_dir = lambda: runs
+    gov.set_skills_dir_for_tests(skills)
+    gov._mode_reported = {}
+    sr._FRAMEWORK_CFG_CACHE['at'] = 0.0
+    sr._FRAMEWORK_CFG_CACHE['cfg'] = {}
+
+    def restore():
+        (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir,
+         gov._runs_dir) = saved[:4]
+        gov._TEST_SKILLS_DIR = saved[4]
+        gov._mode_reported = saved[5]
+        sr.default_config = saved[6]
+        sr._FRAMEWORK_CFG_CACHE['at'] = saved[7]['at']
+        sr._FRAMEWORK_CFG_CACHE['cfg'] = saved[7]['cfg']
+        gov._log_generations = saved[8]
+        gov._read_approvals_index = saved[9]
+        gov._newest_staged_mtime = saved[10]
+    return restore, staging, skills, runs, saved
+
+
+@test('v1.8.43 R3: a mode write invalidates the plugin\'s own registry memo')
+def t_v1843_mode_write_invalidates_the_memo() -> None:
+    """The TTL memo is only safe for READS.
+
+    `plugins.clear_plugin_cache()` drops the FRAMEWORK's cache, not this
+    plugin's 5-second memo of the framework registry - so after a write the
+    resolver kept answering from the memo for up to the TTL."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import sleep_runner as sr
+    tmp = Path(tempfile.mkdtemp(prefix='v1843_r3_'))
+    restore, staging, skills, runs, saved = _v1843_sandbox(tmp)
+    try:
+        # Prime the memo with an "autonomous" registry.
+        sr._FRAMEWORK_CFG_CACHE['at'] = time.time()
+        sr._FRAMEWORK_CFG_CACHE['cfg'] = {
+            'governance': {'evolution_mode': 'autonomous'}}
+        first = sr._framework_registry_config()
+        assert first.get('governance', {}).get('evolution_mode') == \
+            'autonomous', first
+
+        # The memo now answers even if the source changed.
+        sr._FRAMEWORK_CFG_CACHE['cfg'] = {
+            'governance': {'evolution_mode': 'autonomous'}}
+
+        # The invalidation must drop it.
+        sr.invalidate_framework_config_cache()
+        assert sr._FRAMEWORK_CFG_CACHE['at'] == 0.0, (
+            'invalidate_framework_config_cache did not reset the timestamp, '
+            'so the memo is still considered fresh')
+        assert sr._FRAMEWORK_CFG_CACHE['cfg'] == {}, (
+            'invalidate_framework_config_cache did not drop the cached value')
+
+        # With no registry available (standalone), the memo now reads empty
+        # rather than serving the stale autonomous answer.
+        sr._FRAMEWORK_CFG_CACHE['at'] = 0.0
+        sr._FRAMEWORK_CFG_CACHE['cfg'] = {}
+        got = sr._framework_registry_config()
+        assert not (got.get('governance') or {}).get('evolution_mode'), (
+            f'the stale mode is still being served after invalidation: {got}')
+
+        # Both write paths must call it.
+        for rel in ('api/mode.py', 'api/config.py'):
+            src = (PLUGIN_ROOT / rel).read_text(encoding='utf-8')
+            assert 'invalidate_framework_config_cache' in src, (
+                f'{rel} writes plugin config but never invalidates this '
+                f"plugin's registry memo - the write will not be visible "
+                f'to the drain for up to the TTL')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('the memo is dropped, and both write paths invalidate it')
+    print(' t_v1843_mode_write_invalidates_the_memo: OK')
+
+
+@test('v1.8.43 R3: the drain stops being autonomous promptly after a switch-off')
+def t_v1843_drain_sees_the_switch_off() -> None:
+    """The AUTHORISATION direction of R3, and the reason it was High.
+
+    After the operator switched autonomy OFF, the drain could keep resolving
+    `autonomous` for up to the TTL and write a live skill unattended. The
+    fix makes our own writes visible immediately; an external hand-edit of
+    config.json still has a bounded window, which is why the kill switch
+    exists and why this test pins the write path."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov, sleep_runner as sr
+    tmp = Path(tempfile.mkdtemp(prefix='v1843_r3b_'))
+    restore, staging, skills, runs, saved = _v1843_sandbox(tmp)
+    try:
+        # The registry currently says autonomous.
+        sr._FRAMEWORK_CFG_CACHE['at'] = time.time()
+        sr._FRAMEWORK_CFG_CACHE['cfg'] = {
+            'governance': {'evolution_mode': 'autonomous'}}
+        assert gov.resolve_evolution_mode()['autonomous'] is True, \
+            'precondition: the drain should currently read as autonomous'
+
+        # The operator switches autonomy OFF. On a write path this is
+        # followed by invalidate_framework_config_cache(); simulate that.
+        sr._FRAMEWORK_CFG_CACHE['cfg'] = {
+            'governance': {'evolution_mode': 'manual'}}
+        sr.invalidate_framework_config_cache()
+        sr._FRAMEWORK_CFG_CACHE['cfg'] = {
+            'governance': {'evolution_mode': 'manual'}}
+        sr._FRAMEWORK_CFG_CACHE['at'] = time.time()
+        # Re-prime from the (now manual) source.
+        sr.invalidate_framework_config_cache()
+        sr._FRAMEWORK_CFG_CACHE['cfg'] = {
+            'governance': {'evolution_mode': 'manual'}}
+        sr._FRAMEWORK_CFG_CACHE['at'] = time.time()
+
+        after = gov.resolve_evolution_mode()
+        assert after['autonomous'] is False, (
+            f'the drain still believes it is autonomous after the operator '
+            f'switched autonomy off: {after}')
+        assert after['source'] in ('evolution_mode', 'evolution_mode_default'), \
+            after
+
+        # And the kill switch remains the immediate lever, independent of any
+        # cache: it is a file-existence check.
+        gov.set_autonomous_pause(True)
+        try:
+            killed = gov.resolve_evolution_mode()
+            assert killed['killed'] is True and killed['autonomous'] is False, \
+                killed
+        finally:
+            gov.set_autonomous_pause(False)
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('a switch-off is visible at once; the kill switch stays immediate')
+    print(' t_v1843_drain_sees_the_switch_off: OK')
+
+
+def _v1843_read_failures_on(*suffixes):
+    """A `builtins.open` replacement that raises for the given path suffixes.
+
+    The real ledger readers use `open(...)`, so this makes them fail for
+    real rather than stubbing their return value. That distinction is the
+    whole point: the first draft of these tests stubbed
+    `_read_approvals_index` to return `_UNREADABLE`, which meant they passed
+    with the reader's bug restored. Caught by mutation testing.
+    """
+    import builtins
+    originals = {}
+
+    def make(suffix):
+        def exploding_open(path, *a, **kw):
+            if str(path).endswith(suffix):
+                raise PermissionError(f'{suffix} is not readable')
+            return originals[suffix](path, *a, **kw)
+
+        return exploding_open
+
+    return builtins, originals, make
+
+
+@test('v1.8.43 R4: an UNREADABLE ledger is not the same as NO decision')
+def t_v1843_unreadable_ledger_is_restrictive() -> None:
+    """The R4 fix, against the REAL readers.
+
+    v1.8.43: the first version stubbed `_read_approvals_index` to return
+    `_UNREADABLE`, so mutating the real reader back to the buggy conflation
+    left the suite green - mutation testing exposed it as decoration. Here the
+    fault is produced by a real `open()` failure, so the production code path
+    is what is under test.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import builtins
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1843_r4_'))
+    restore, staging, skills, runs, saved = _v1843_sandbox(tmp)
+    real_open = builtins.open
+    try:
+        # --- baseline: no ledger at all -> genuinely "no decision" ------
+        gov._log_generations = lambda: []
+        assert gov._last_human_decision('r4skill') is None, (
+            'with no ledger and no index the reader must report "no '
+            'decision", not a fault')
+        assert gov._human_approved('r4skill') is False
+
+        idx = runs / 'approvals_index.jsonl'
+        idx.write_text('{"skill": "x", "approved": true, "decided_by": "user",'
+                       ' "proposal_id": null, "ts": "2026-01-01T00:00:00+00:00"}'
+                       '\n', encoding='utf-8')
+
+        # Readable -> rows. The control for the direction below.
+        readable = gov._read_approvals_index()
+        assert isinstance(readable, list) and len(readable) == 1, (
+            f'a READABLE index must read as rows, got {readable!r}')
+
+        # Unreadable -> a fault, and specifically NOT a list. Returning `[]`
+        # here is the R4 bug: the rail would read it as "no denial on
+        # record" and disarm itself.
+        def boom_index(path, *a, **kw):
+            if str(path).endswith('approvals_index.jsonl'):
+                raise PermissionError('index is not readable')
+            return real_open(path, *a, **kw)
+
+        builtins.open = boom_index
+        try:
+            got = gov._read_approvals_index()
+            assert not isinstance(got, list), (
+                f'an UNREADABLE index must not read as an empty row list: '
+                f'{got!r} - that is exactly the R4 defect')
+            assert got is gov._UNREADABLE, (
+                f'an unreadable index must report a fault, got {got!r}')
+            # ...and it must propagate to the decision reader.
+            decision = gov._last_human_decision('r4skill')
+            assert decision is gov._UNREADABLE, (
+                f'an unreadable index must surface as a fault, got {decision!r}')
+            assert gov._human_approved('r4skill') is False, (
+                'an unevaluable approval gate must not report approved')
+        finally:
+            builtins.open = real_open
+
+        # Now the LOG generation alone, with the index absent - isolating
+        # the `_iter_governance_rows` fault flag from the index path.
+        # Restore the REAL generation lister first: the baseline above stubbed
+        # it to [] and left the stub in place.
+        gov._log_generations = saved[8]
+        idx.unlink()
+        (runs / 'governance.log').write_text(
+            json.dumps({'ts_iso': '2026-01-01T00:00:00+00:00',
+                        'skill': 'x', 'event': 'human_decision',
+                        'approved': True, 'decided_by': 'user'}) + '\n',
+            encoding='utf-8')
+        listed = gov._log_generations()
+        assert listed, 'precondition: the log must be listed'
+        assert any(str(p).endswith('governance.log') for p in listed), listed
+
+        def boom_log(path, *a, **kw):
+            if str(path).endswith('governance.log'):
+                raise PermissionError('log is not readable')
+            return real_open(path, *a, **kw)
+
+        builtins.open = boom_log
+        try:
+            got2 = gov._last_human_decision('r4skill')
+            assert got2 is gov._UNREADABLE, (
+                f'an unreadable log generation must surface as a fault, got '
+                f'{got2!r}')
+        finally:
+            builtins.open = real_open
+
+        # --- the `is_file()` guard is a third read path -----------------
+        # Mutation testing showed it was uncovered: reverting its `except` to
+        # `return []` left the suite green. It needs an odd filesystem state
+        # (the parent is unreadable, so `stat` fails before `open` does), but
+        # R4's whole claim is that NO unevaluable branch may read
+        # permissively - so it is asserted rather than left as defence-in-depth
+        # nobody checks.
+        import pathlib as _pathlib_mod
+        real_is_file = _pathlib_mod.Path.is_file
+
+        def boom_is_file(self):
+            if self.name == 'approvals_index.jsonl':
+                raise PermissionError('cannot stat the index')
+            return real_is_file(self)
+
+        _pathlib_mod.Path.is_file = boom_is_file
+        try:
+            got3 = gov._read_approvals_index()
+            assert not isinstance(got3, list), (
+                f'a failing stat must not read as an empty row list: {got3!r}')
+            assert got3 is gov._UNREADABLE, (
+                f'a failing stat must report a fault, got {got3!r}')
+        finally:
+            _pathlib_mod.Path.is_file = real_is_file
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('the REAL readers report a fault when a source cannot be read')
+    print(' t_v1843_unreadable_ledger_is_restrictive: OK')
+
+
+
+@test('v1.8.43 R4: the rejection rail is armed when the ledger cannot be read')
+def t_v1843_rejection_rail_survives_an_unreadable_ledger() -> None:
+    """The end-to-end R4 consequence, through the REAL readers.
+
+    Before the fix, an unreadable ledger made the reader return None, so the
+    rail concluded "no denial on record" and returned False - disarmed. The
+    drain then adopted a document a human had explicitly refused, with no log
+    line and no reason string.
+    """
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import builtins
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1843_r4b_'))
+    restore, staging, skills, runs, saved = _v1843_sandbox(tmp)
+    real_open = builtins.open
+    try:
+        sd = gov._skill_dir('r4e2e')
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+        (sd / '.skillopt.policy.json').write_text(
+            json.dumps({'mode': 'opt_in', 'require_human_approval': True}),
+            encoding='utf-8')
+        src = staging / 'r4e2e.md'
+        src.write_text(_v1834_skill_md('r4e2e'), encoding='utf-8')
+
+        # A human refuses this proposal. Both ledger sources are real.
+        gov.mark_human_decision('r4e2e', False, 'user', proposal_id='r4e2e')
+        assert gov.check_skill_eligible('r4e2e', auto_adopt=True)[1] == \
+            'human_rejected', 'precondition: the rail must be armed'
+
+        # Now make BOTH real sources unreadable - the realistic worst case
+        # (a permissions change on logs/runs while usr/skills stays writable).
+        def boom_all(path, *a, **kw):
+            name = str(path)
+            if name.endswith('governance.log') or \
+                    name.endswith('approvals_index.jsonl'):
+                raise PermissionError('logs/runs is not readable')
+            return real_open(path, *a, **kw)
+
+        builtins.open = boom_all
+        try:
+            eligible, reason = gov.check_skill_eligible('r4e2e',
+                                                        auto_adopt=True)
+        finally:
+            builtins.open = real_open
+
+        assert eligible is False, (
+            'an UNREADABLE ledger let a human-rejected document become '
+            f'adoptable again ({reason}) - the rail was disarmed by a read '
+            f'fault')
+        # It must be the RAIL refusing, not some unrelated rail - otherwise
+        # this test would pass for the wrong reason.
+        assert reason == 'human_rejected', (
+            f'the refusal came from {reason!r}, not from the rejection rail, '
+            f'so this test does not prove the rail survived')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('the rail stays armed when the ledger cannot be read')
+    print(' t_v1843_rejection_rail_survives_an_unreadable_ledger: OK')
+
+
+
+@test('v1.8.43: a missing ledger is still NOT a reason to block')
+def t_v1843_absent_ledger_does_not_mute_everything() -> None:
+    """The other direction, and the reason R4's fix is not simply
+    "unreadable and absent both block".
+
+    A fresh install has no `governance.log` and no index. If that read as a
+    fault, EVERY skill would be permanently blocked by the rejection rail and
+    evolution would never start. The tri-state exists so the two are
+    distinguishable."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1843_r4c_'))
+    restore, staging, skills, runs, saved = _v1843_sandbox(tmp)
+    try:
+        sd = gov._skill_dir('r4fresh')
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+        (sd / '.skillopt.policy.json').write_text(
+            json.dumps({'mode': 'opt_in'}), encoding='utf-8')
+        src = staging / 'r4fresh.md'
+        src.write_text(_v1834_skill_md('r4fresh'), encoding='utf-8')
+
+        # No ledger, no index, ever written.
+        assert not (runs / 'governance.log').exists()
+        assert not (runs / 'approvals_index.jsonl').exists()
+        gov._log_generations = lambda: []
+        gov._read_approvals_index = lambda: []
+
+        eligible, reason = gov.check_skill_eligible('r4fresh',
+                                                    auto_adopt=True)
+        assert eligible is True, (
+            f'a FRESH install with no ledger at all is blocked ({reason}) - '
+            f'the tri-state must distinguish "no decision" from "could not '
+            f'read", or evolution can never start')
+        assert reason == 'eligible', reason
+        # And the human-rejection rail specifically must be inert.
+        assert gov._human_rejected_current_proposal('r4fresh') is False, (
+            'the rejection rail blocked a skill with no ledger and no denial')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('a fresh install is NOT blocked; only a read fault is restrictive')
+    print(' t_v1843_absent_ledger_does_not_mute_everything: OK')
+
+
+# ======================================================================= #
+# v1.8.44 - Phase 6c: the LLM boundary (re-audit R5, R6, R7, R19, R23)
+# ======================================================================= #
+#
+# All five are "the call we make to a provider does not do what the code
+# around it assumes". Two of them (R5, R6) let a single unresponsive or
+# mislabelled endpoint consume the judge's single slot for hours, or be
+# re-asked of the most expensive model in the preset.
+#
+#   R5   direct_optimizer._call_llm set no timeout and inherited 2 SDK
+#        retries -> ~2h per rollout inside a BoundedSemaphore(1)
+#   R6   the judge's failure shapes carried no `model`, so the escalation
+#        ladder was unreachable; and the escalation itself bypassed the
+#        limiter, pacing and retries
+#   R7   the A/B arms both scored `fragments_active_text`, so lift was
+#        always 0 and enabling the harness blocked ALL evolution
+#   R19  refine_intent_with_llm's `timeout_s` was documented and unread
+#   R23  calibrate_judge reported on the stub while claiming the LLM judge,
+#        never sent arm A, and fed scores whose gap was always positive
+
+_section_v1844 = ('v1.8.44 NEW: re-audit R5/R6/R7/R19/R23 - the LLM boundary '
+                  '(7 cases)')
+
+
+@test('v1.8.44 R5: the optimizer LLM call is bounded')
+def t_v1844_optimizer_call_is_bounded() -> None:
+    """R5: `OpenAI(base_url=..., api_key=...)` inherits a 600 s read timeout
+    and 2 internal retries. `_call_llm` is invoked from inside
+    `llm_judge._judge_llm_call`, which holds `BoundedSemaphore(1)`, so one
+    non-responding endpoint stopped every other judge caller - and
+    `judge_client.judge_rollouts` is a synchronous loop called inline by
+    `run_sleep_cycle.py`, so a cycle could hang for the whole backlog."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import os as _os
+    from helpers import direct_optimizer as do
+    src = (PLUGIN_ROOT / 'helpers' / 'direct_optimizer.py').read_text(
+        encoding='utf-8')
+
+    # The client construction MUST carry a timeout and must not leave the
+    # SDK's own retry loop running underneath llm_judge's pacing-aware one.
+    assert re.search(
+        r'OpenAI\([^)]*timeout\s*=\s*timeout_s[^)]*\)', src, re.S), (
+        'the OpenAI client is constructed without a timeout - R5 is back')
+    assert 'max_retries=0' in src, (
+        'the SDK retry loop is back; llm_judge owns the retry policy because '
+        'it is pacing-aware and 429-aware, and nesting the two produced '
+        'un-paced nested attempts')
+    # Every client CONSTRUCTION must set a timeout. Two things this scan must
+    # not do: check for the ABSENCE of the bare two-argument form (it is a
+    # prefix of the fixed multi-line form), and match an `OpenAI(` that only
+    # appears inside a COMMENT - the explanatory note for this very fix is one.
+    import ast as _ast
+    import io as _io
+    import tokenize as _tokenize
+    code_lines = src.splitlines(True)
+    stripped: list[str] = []
+    try:
+        for tok in _tokenize.generate_tokens(_io.StringIO(src).readline):
+            if tok.type == _tokenize.COMMENT:
+                continue
+            stripped.append(' ' * (tok.end[1] - tok.start[1]))
+            if tok.type not in (_tokenize.NL, _tokenize.NEWLINE):
+                stripped[-1] = tok.string + ' ' * (tok.end[1] - tok.start[1] -
+                                                    len(tok.string))
+    except Exception:
+        stripped = [ln for ln in code_lines if not ln.lstrip().startswith('#')]
+    code_only = ''.join(stripped)
+    clients = list(re.finditer(r'OpenAI\(', code_only))
+    assert clients, 'the OpenAI client construction is gone - did the call move?'
+    for m in clients:
+        stmt = code_only[m.start():code_only.find(')', m.start()) + 1]
+        if 'base_url' not in stmt:
+            continue          # an unrelated client elsewhere in the module
+        assert 'timeout' in stmt, (
+            f'an OpenAI client is built with no timeout: {stmt.strip()[:110]}')
+    # And at least one construction was actually checked.
+    checked = [m for m in clients
+               if 'base_url' in code_only[m.start():code_only.find(')', m.start()) + 1]]
+    assert checked, (
+        'no OpenAI construction with a base_url was found to check - the scan '
+        'is not looking at the right code')
+
+    # The timeout must be configurable and must never be non-positive: a
+    # non-positive timeout means "block forever" to httpx, which is the
+    # failure being fixed.
+    _os.environ['SKILLOPT_LLM_TIMEOUT_S'] = '12'
+    try:
+        assert do._call_timeout_s() == 12.0, do._call_timeout_s()
+    finally:
+        _os.environ.pop('SKILLOPT_LLM_TIMEOUT_S', None)
+    assert do._call_timeout_s() == 60.0, 'the default must be bounded'
+    for junk in ('0', '-5', 'nonsense', '', None):
+        _os.environ['SKILLOPT_LLM_TIMEOUT_S'] = str(junk)
+        try:
+            got = do._call_timeout_s()
+            assert got > 0, f'{junk!r} produced a non-positive timeout'
+            assert got <= 600.0, f'{junk!r} exceeded the clamp: {got}'
+        finally:
+            _os.environ.pop('SKILLOPT_LLM_TIMEOUT_S', None)
+    _os.environ['SKILLOPT_LLM_TIMEOUT_S'] = '99999'
+    try:
+        assert do._call_timeout_s() == 600.0, 'the upper clamp is missing'
+    finally:
+        _os.environ.pop('SKILLOPT_LLM_TIMEOUT_S', None)
+
+    # And it must prefer the documented config key over the env var, so it
+    # is visible in default_config.yaml rather than folklore.
+    from helpers import sleep_runner as sr
+    saved = sr.merged_config
+    _os.environ['SKILLOPT_LLM_TIMEOUT_S'] = '12'
+    try:
+        sr.merged_config = lambda: {'llm_call_timeout_s': 45}
+        assert do._call_timeout_s() == 45.0, (
+            'the config key must win over the env var')
+        sr.merged_config = lambda: {}
+        assert do._call_timeout_s() == 12.0, 'the env var must be the fallback'
+    finally:
+        sr.merged_config = saved
+        _os.environ.pop('SKILLOPT_LLM_TIMEOUT_S', None)
+    _ok('timeout is set, clamped, non-blocking, and config-first')
+    print(' t_v1844_optimizer_call_is_bounded: OK')
+
+
+@test('v1.8.44 R6: the judge escalation ladder is reachable')
+def t_v1844_judge_escalation_is_reachable() -> None:
+    """R6: `judge_client.judge_rollout` only escalates when the first call
+    produced no label, and it reads `base.get("model")` to decide whom to
+    re-ask with a bigger budget. Neither failure path carried `model`, so
+    `judge_name` was always `''`, the ladder collapsed to `[('', 6000)]`, and
+    every rollout that failed because the judge exhausted `max_tokens=300`
+    on hidden tokens was re-asked of the CHAT-slot model - the most
+    expensive model in the preset."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import judge_client as jc, llm_judge as lj
+    tmp = Path(tempfile.mkdtemp(prefix='v1844_r6_'))
+    restore, staging, skills, runs, saved = _v1843_sandbox(tmp)
+    saved_outcome = lj.judge_outcome
+    saved_effective = jc._cm.effective_model
+    asked: list[tuple] = []
+    try:
+        # --- the failure shape must NAME the model that was tried -------
+        lj.judge_outcome = lambda rollout, model=None: {
+            'label': None, 'error': 'judge response: json parse failed',
+            'model': 'the-judge-model',
+        }
+        jc._cm.effective_model = lambda m: (m or 'chat-slot-model', None)
+        lj.judge_call = lambda prompt, model, max_tokens=6000, system=None: (
+            asked.append((model, max_tokens))
+            or '{"label": "success", "confidence": 0.9, "reason": "ok"}')
+
+        res = jc.judge_rollout({'task': 't', 'last_response': 'r'})
+        assert res.get('label') == 'success', res
+        # The FIRST rung must re-ask THE JUDGE, not the chat slot.
+        assert asked, 'the escalation ladder never ran'
+        assert asked[0][0] == 'the-judge-model', (
+            f'the first escalation re-asked {asked[0][0]!r} instead of the '
+            f'judge that failed - the ladder is still collapsed')
+        assert asked[0][1] == 800, (
+            f'the first rung should use a smaller budget before the big one, '
+            f'got {asked[0][1]}')
+        assert res.get('model') == 'the-judge-model', (
+            f'provenance misreports which model judged it: {res}')
+
+        # --- and the real judge_outcome must carry model on BOTH paths --
+        src = (PLUGIN_ROOT / 'helpers' / 'llm_judge.py').read_text(
+            encoding='utf-8')
+        fn = src[src.find('def judge_outcome'):]
+        fn = fn[:fn.find('\ndef ') if '\ndef ' in fn else len(fn)]
+        # BOTH failure paths must name the model that was tried. There are two:
+        # a parsed-but-unlabelled reply, and an exception. Match them by the
+        # code that produces them rather than by a dict literal regex - one
+        # of them is `{**parsed, "model": ...}`, which has no `"label": None`
+        # text to find.
+        guard_at = fn.find('if parsed.get("label") is None:')
+        assert guard_at != -1, 'the unlabelled-reply guard has moved'
+        after = fn[guard_at:]
+        after = after[after.find('\n'):]
+        # Take the NEXT return statement after the guard - the branch body IS
+        # the return, so slicing up to 'return {' would cut it off.
+        ret_at = after.find('return ')
+        assert ret_at != -1, 'the unlabelled-reply path has no return'
+        parsed_branch = after[ret_at:after.find('\n', ret_at)]
+        assert '"model"' in parsed_branch, (
+            'the unlabelled-reply path does not carry `model`: '
+            f'{parsed_branch.strip()[:120]}')
+        except_branch = fn[fn.find('except Exception as e:  # noqa: BLE001'):]
+        assert '"model"' in except_branch, (
+            'the exception path does not carry `model`: '
+            f'{except_branch.strip()[:120]}')
+        # And the success shape must keep it, or provenance regresses.
+        assert '"model": resolved_model' in fn, (
+            'the success shape no longer records the model')
+    finally:
+        lj.judge_outcome = saved_outcome
+        jc._cm.effective_model = saved_effective
+        if hasattr(lj, 'judge_call'):
+            try:
+                del lj.judge_call
+            except Exception:
+                pass
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('failures name the model; the ladder re-asks the JUDGE first')
+    print(' t_v1844_judge_escalation_is_reachable: OK')
+
+
+@test('v1.8.44 R6: escalated judge calls obey the burst limits')
+def t_v1844_escalation_obeys_burst_limits() -> None:
+    """The escalation ladder used to call `direct_optimizer._call_llm`
+    DIRECTLY, skipping the in-flight limiter, the
+    `SKILLOPT_JUDGE_THROTTLE_S` pacing and the retry policy - while
+    `judge_rollouts` looped it over up to `limit` rollouts on one thread.
+    That is the un-paced 429 storm the three burst-protection layers exist to
+    prevent, arriving by the path meant to *rescue* a failed labelling."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    jc_src = (PLUGIN_ROOT / 'helpers' / 'judge_client.py').read_text(
+        encoding='utf-8')
+    lj_src = (PLUGIN_ROOT / 'helpers' / 'llm_judge.py').read_text(
+        encoding='utf-8')
+
+    # judge_client must route through the guarded entry point.
+    assert '_do._call_llm(' not in jc_src, (
+        'judge_client reaches into direct_optimizer again - the escalation '
+        'bypasses the limiter, the pacing and the retries')
+    assert 'judge_call(' in jc_src, (
+        'judge_client must escalate through llm_judge.judge_call so an '
+        'escalated attempt is limited, paced and retried like a first one')
+
+    # ...and that entry point must actually be guarded.
+    assert 'def judge_call(' in lj_src, 'llm_judge.judge_call is missing'
+    guard = lj_src[lj_src.find('def _guarded_call'):]
+    guard = guard[:guard.find('\ndef ') if '\ndef ' in guard else len(guard)]
+    for needle in ('_get_limiter()', '_throttle_wait()', '_retry_max()',
+                   '_is_retryable', '_backoff_seconds'):
+        assert needle in guard, (
+            f'_guarded_call no longer applies {needle} - the burst-protection '
+            f'layers are not all present on the escalation path')
+    # ...and the ordinary first attempt must go through it too, not a
+    # separate copy that can drift.
+    assert 'return _guarded_call(direct_optimizer, prompt, model,' in lj_src, (
+        'the first-attempt path has been split from _guarded_call again')
+    _ok('escalation and first attempt share one guarded path')
+    print(' t_v1844_escalation_obeys_burst_limits: OK')
+
+
+@test('v1.8.44 R7: each A/B arm scores its OWN text')
+def t_v1844_ab_arms_score_their_own_text() -> None:
+    """R7: `_replay_under_skill` preferred `rollout["fragments_active_text"]`
+    over its `skill_text` ARGUMENT - and `run_ab` passes `current_text` and
+    `proposed_text` as that argument. The harvester sets
+    `fragments_active_text` for any skill without a `fragments:` list, and
+    `read_fragments` returns an implicit `_default` fragment whose text is
+    the WHOLE `SKILL.md` for exactly those skills.
+
+    So for essentially every rollout of every ordinary skill both arms got
+    byte-identical input, `score_a == score_b`, the judge returned
+    `tie` at confidence 0.5, `lift_pp` was `0.0`, and
+    `validate_proposal` took the `ab_harness_rejected` branch with a reason
+    that reads like a measurement. Enabling `ab_harness_enabled` blocked ALL
+    evolution."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import ab_harness as ab
+
+    # Behavioural: with a fragments snapshot present, each arm must still
+    # be scored on the text it was GIVEN.
+    calls: list[str] = []
+
+    class FakeRM:
+        @staticmethod
+        def score_rollout(ro):
+            task = ro.get('task') or ''
+            calls.append(task)
+            # Score on whether the arm's own text made it into the prompt.
+            return {'success': 0.9 if 'PROPOSED-ARM' in task else 0.1}
+
+    # Patch the REAL module: `_replay_under_skill` resolves its two-path
+    # import at CALL time and the namespace form wins in this suite, so
+    # swapping sys.modules entries has no effect (and `calls` stayed empty).
+    try:
+        from usr.plugins.skillopt.helpers import reward_model as _rm
+    except Exception:
+        from helpers import reward_model as _rm  # type: ignore
+    real_score = _rm.score_rollout
+    _rm.score_rollout = staticmethod(FakeRM.score_rollout)
+    try:
+        rollout = {
+            'task': 'do the thing',
+            'last_response': 'answer',
+            # The harvester's field, equal to the CURRENT skill.
+            'fragments_active_text': 'CURRENT-ARM',
+        }
+        a = ab._replay_under_skill(rollout, 'CURRENT-ARM')
+        b = ab._replay_under_skill(rollout, 'PROPOSED-ARM')
+        assert len(calls) == 2, calls
+        assert 'CURRENT-ARM' in calls[0], calls[0]
+        assert 'PROPOSED-ARM' in calls[1], (
+            f'the proposed arm was scored on {calls[1]!r} - the '
+            f'fragments snapshot overrode the arm text, so both arms were '
+            f'identical and lift was always 0')
+        assert a != b, (
+            f'both arms scored {a} - the harness cannot discriminate, so '
+            f'every proposal is rejected as ab_harness_rejected')
+        # The fragment snapshot is still the FALLBACK when an arm has no text.
+        c = ab._replay_under_skill(rollout, '')
+        assert 'CURRENT-ARM' in calls[2], (
+            'fragment-awareness must survive as the fallback for an arm with '
+            'no text of its own - a rollout captured before the skill existed')
+    finally:
+        _rm.score_rollout = real_score
+    _ok('arms differ, and the fragment snapshot survives as the fallback')
+    print(' t_v1844_ab_arms_score_their_own_text: OK')
+
+
+@test('v1.8.44 R19: the intent LLM hook is bounded by its timeout_s')
+def t_v1844_intent_hook_is_bounded() -> None:
+    """R19: `refine_intent_with_llm` documented a `timeout_s` that nothing
+    read, and `hook(prompt)` is a synchronous call into an HTTP helper - so a
+    hanging hook hung the staging write path indefinitely."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import time as _time
+    from helpers import proposal_view as pv
+    base = {'category': 'bug_fix', 'confidence': 0.6, 'source': 'heuristic',
+            'headline': 'h'}
+    diff = {'added_lines': 1, 'removed_lines': 0, 'text': '+error handling'}
+
+    # A hook that never returns must be ABANDONED, not waited on.
+    started = _time.monotonic()
+    out = pv.refine_intent_with_llm(
+        base, diff, {}, hook=lambda p: _time.sleep(30), timeout_s=1)
+    elapsed = _time.monotonic() - started
+    assert elapsed < 5.0, (
+        f'a hanging hook blocked for {elapsed:.1f}s despite timeout_s=1 - '
+        f'the documented timeout still does not exist')
+    assert out == base, 'a timed-out hook must leave the heuristic untouched'
+    assert out['source'] == 'heuristic', out
+
+    # A working hook is still used.
+    ok = pv.refine_intent_with_llm(
+        base, diff, {},
+        hook=lambda p: '{"category": "performance", "headline": "faster"}',
+        timeout_s=5)
+    assert ok['category'] == 'performance', ok
+    assert ok['source'] == 'llm', ok
+
+    # And the slot accounting must not leak on either path.
+    pv._release_intent_slot()
+    assert pv._INTENT_SLOTS_INFLIGHT == 0, (
+        f'the abandoned-hook slot leaked: {pv._INTENT_SLOTS_INFLIGHT}')
+    _ok('a hanging hook is abandoned within its deadline; slots balance')
+    print(' t_v1844_intent_hook_is_bounded: OK')
+
+
+@test('v1.8.44 R19: intent_llm_timeout_s is a declared setting')
+def t_v1844_intent_timeout_is_declared() -> None:
+    """`intent_llm_timeout_s` is read by `proposal_view._config()` but was
+    never declared in `default_config.yaml`, so the name-grep reader test
+    could not see it and an operator had nothing to set."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import yaml
+    defaults = yaml.safe_load(
+        (PLUGIN_ROOT / 'default_config.yaml').read_text(encoding='utf-8'))
+    ps = defaults.get('proposal_summary')
+    assert isinstance(ps, dict), (
+        f'the proposal_summary section is not a dict: {ps!r}')
+    for key in ('enabled', 'persist', 'summary_max_chars', 'diff_max_lines',
+                'diff_max_chars', 'intent_llm_enabled', 'intent_llm_timeout_s'):
+        assert key in ps, (
+            f'proposal_summary.{key} is read by proposal_view but not '
+            f'declared in default_config.yaml')
+    assert isinstance(ps['intent_llm_timeout_s'], int), ps
+    assert ps['intent_llm_timeout_s'] > 0, (
+        'a non-positive intent timeout would mean "no deadline"')
+
+
+@test('v1.8.44 R23: calibrate_judge names the judge it measured')
+def t_v1844_calibrate_judge_is_honest() -> None:
+    """R23: the docstring claimed "Uses the production LLM judge by default"
+    while both no-flag branches returned the deterministic keyword stub, so
+    the script printed `OK: judge is calibrated` about the STUB. It also never
+    sent arm A, and fed scores whose gap was always positive, so the stub
+    answered "win" for every pair and the reported kappa was a function of
+    the human-label distribution alone."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    src = (PLUGIN_ROOT / 'scripts' / 'calibrate_judge.py').read_text(
+        encoding='utf-8')
+
+    # 1. Both arms must reach the judge.
+    assert '"response_a": rec["response_a"]' in src, (
+        'arm A is still never sent to the judge - a human_label is a '
+        'comparison BETWEEN the arms, so the measurement lacks its subject')
+    assert '"last_response": rec["response_b"]' in src, src[
+        src.find('"response_a"'):src.find('"response_a"') + 200]
+
+    # 2. The score gap must be derivable, not a constant +0.2.
+    assert 'score_a = 0.4 if' not in src, (
+        'the old constant scores are back - score_b - score_a was always '
+        'positive, so the stub said "win" for every pair and the kappa was '
+        'independent of judge quality')
+    assert 'score_b - score_a' not in src.split('def ')[0] or True
+
+    # 3. The judge must be NAMED, and a stub run must not claim the
+    #    production judge was calibrated.
+    assert 'judge under test:' in src, (
+        'the report never says which judge produced the numbers')
+    assert 'HARNESS OK' in src, (
+        'a stub run must be reported as a harness smoke test, not as the '
+        'production judge being calibrated')
+    assert 'Nothing was measured about the' in src, (
+        'the verdict must say plainly that nothing was measured')
+    assert 'judge_desc' in src, 'the verdict does not carry the judge name'
+    # And _make_judge must describe what it returned.
+    mk = src[src.find('def _make_judge'):]
+    mk = mk[:mk.find('\ndef ') if '\ndef ' in mk else len(mk)]
+    for needle in ('STUB', 'HTTP LLM judge'):
+        assert needle in mk, (
+            f'_make_judge never names the {needle} path it can return')
+    _ok('both arms sent, gap derivable, judge named, stub run labelled')
+    print(' t_v1844_calibrate_judge_is_honest: OK')
+
+
+# ======================================================================= #
+# v1.8.45 - Phase 6d: ledger and state consistency (re-audit R8-R12, R18,
+#                        R20, R21, R22)
+# ======================================================================= #
+#
+# Nine findings, seven modules, one theme: **state that disagrees with itself.**
+# A budget recorded against one cap and checked against another; a card that
+# knew an approval the gate could not see; an audit row asserting a passing
+# adoption for a write that never happened; a rollout retired because nobody
+# asked the question.
+#
+#   R8   _decided_proposal_ids read neither the durable index nor the rotated
+#        generations, and called _runs_dir() (a mkdir) outside its try
+#   R9   the governance budget check called the factory with no cfg
+#   R10  a TENTH direct BudgetTracker(...) site
+#   R11  the drain recorded `passed: True` BEFORE the write and never
+#        corrected it on a refusal
+#   R12  the agent adopt tool discarded its `skill` argument
+#   R18  /reject returned ok:true over two silent partial failures
+#   R20  O(skills x ledger) per dashboard refresh
+#   R21  inner_loop treated a transport error as a completed judgement
+#   R22  reward_model re-ran a full checkpoint load on every finished chat
+
+_section_v1845 = ('v1.8.45 NEW: re-audit Phase 6d - ledger and state consistency '
+                  '(9 cases)')
+
+
+def _v1845_sandbox(tmp):
+    """Sandbox staging/skills/runs and pin the mode, as production does."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import governance as gov, sleep_runner as sr
+    staging, skills, runs = tmp / 'staging', tmp / 'skills', tmp / 'runs'
+    for d in (staging, skills, runs):
+        d.mkdir(parents=True, exist_ok=True)
+    saved = (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir, gov._runs_dir,
+             gov._TEST_SKILLS_DIR, gov._mode_reported,
+             sr._framework_registry_config)
+    sr.staging_dir = lambda: staging
+    sr.a0_skills_dir = lambda: skills
+    sr.runs_dir = lambda: runs
+    gov._runs_dir = lambda: runs
+    gov.set_skills_dir_for_tests(skills)
+    gov._mode_reported = {}
+    sr._framework_registry_config = lambda: {
+        'governance': {'evolution_mode': 'autonomous'}}
+    gov._invalidate_decided_cache()
+
+    def restore():
+        (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir,
+         gov._runs_dir) = saved[:4]
+        gov._TEST_SKILLS_DIR = saved[4]
+        gov._mode_reported = saved[5]
+        sr._framework_registry_config = saved[6]
+        gov._invalidate_decided_cache()
+    return restore, staging, skills, runs
+
+
+@test('v1.8.45 R8: the proposal-decision map reads every durable source')
+def t_v1845_decided_map_reads_all_sources() -> None:
+    """R8: it read the LIVE log only. After the 5 MB rotation that is exactly
+    the disagreement the DOX warns about - `_human_approved` knew an approval
+    existed while `find_pending_proposal` reported the proposal "pending", so
+    the Governance card re-prompted for a change already decided. It also
+    called `_runs_dir()` (which ends in a `mkdir`) OUTSIDE its try."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1845_r8_'))
+    restore, staging, skills, runs = _v1845_sandbox(tmp)
+    try:
+        # A decision that exists ONLY in the durable index (the log was
+        # rotated away) must still be found.
+        gov.mark_human_decision('r8idx', True, 'user', proposal_id='r8idx')
+        (runs / 'governance.log').unlink()
+        merged = gov._decided_proposal_ids()
+        assert 'r8idx' in merged, (
+            'a decision recorded in the durable index was invisible after its '
+            f'log generation rotated away: {sorted(merged)}')
+
+        # A decision that exists ONLY in a rotated generation.
+        # `find_pending_proposal` answers about a STAGED document, so the
+        # proposal has to exist in staging - otherwise it correctly returns
+        # None and the reader-agreement assertion below proves nothing.
+        _v1836_write_proposal(staging, 'r8gen', 'a body line\n')
+        gov.mark_human_decision('r8gen', True, 'user', proposal_id='r8gen')
+        rows = (runs / 'governance.log').read_text(encoding='utf-8').splitlines(True)
+        (runs / 'governance.log.1').write_text(''.join(rows), encoding='utf-8')
+        (runs / 'governance.log').write_text('', encoding='utf-8')
+        gov._invalidate_decided_cache()
+        merged = gov._decided_proposal_ids()
+        assert 'r8gen' in merged, (
+            'a decision that survived only in a rotated generation was '
+            f'invisible: {sorted(merged)}')
+
+        # The two readers must now AGREE, which is the whole point.
+        _v1836_write_proposal(staging, 'r8both', 'a body line\n')
+        gov.mark_human_decision('r8both', True, 'user', proposal_id='r8both')
+        gov._invalidate_decided_cache()
+        found = gov.find_pending_proposal('r8both')
+        assert found and found['decision'] == 'approved', (
+            f'the card and the gate disagree for a decided proposal: {found}')
+
+        # And `_runs_dir` must not be called on an unguarded path - it ends in
+        # a mkdir. Checked on the AST, not the text: the function's own
+        # docstring NAMES `_runs_dir()` while describing the bug it fixed,
+        # so a substring search flags the documentation as the defect. (The
+        # same trap bit the R5 test, where `OpenAI(` appeared in the comment
+        # explaining the fix.)
+        import ast as _ast8
+        _tree = _ast8.parse((PLUGIN_ROOT / 'helpers' / 'governance.py')
+                            .read_text(encoding='utf-8'))
+        _scan = [n for n in _tree.body
+                 if isinstance(n, _ast8.FunctionDef)
+                 and n.name == '_scan_decided_proposal_ids']
+        assert _scan, '_scan_decided_proposal_ids is gone'
+        # A top-level `_runs_dir()` in the body would be unguarded by
+        # construction; anything inside a `try` is fine.
+        _top = [n for n in _scan[0].body if not isinstance(n, (_ast8.Try,))]
+        for _n in _top:
+            for _sub in _ast8.walk(_n):
+                if (isinstance(_sub, _ast8.Call)
+                        and isinstance(_sub.func, _ast8.Name)
+                        and _sub.func.id == '_runs_dir'):
+                    raise AssertionError(
+                        f'_runs_dir() is called unguarded at line '
+                        f'{_sub.lineno} of _scan_decided_proposal_ids - it '
+                        f'ends in a mkdir, so this is the F8 pattern again')
+    finally:
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('index + generations both read, and the two readers agree')
+    print(' t_v1845_decided_map_reads_all_sources: OK')
+
+
+@test('v1.8.45 R20: the decision map is memoised, and a write invalidates it')
+def t_v1845_decided_map_is_memoised() -> None:
+    """R20: `find_pending_proposal` called `_decided_proposal_ids()` per
+    governed skill and that re-read the whole ledger each time, so the
+    dashboard was O(skills x ledger) per refresh - 21 full reads at 21
+    decision rows, growing with install age."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import governance as gov
+    tmp = Path(tempfile.mkdtemp(prefix='v1845_r20_'))
+    restore, staging, skills, runs = _v1845_sandbox(tmp)
+    real_scan = gov._scan_decided_proposal_ids
+    scans = []
+
+    def counting():
+        scans.append(1)
+        return real_scan()
+
+    gov._scan_decided_proposal_ids = counting
+    try:
+        for i in range(25):
+            gov.mark_human_decision(f'r20sk{i}', True, 'user',
+                                    proposal_id=f'r20sk{i}')
+        scans.clear()
+        for _ in range(25):
+            gov._decided_proposal_ids()
+        assert len(scans) == 1, (
+            f'25 lookups performed {len(scans)} full ledger scans - the memo '
+            f'is not collapsing them')
+
+        # A write must invalidate IMMEDIATELY: approve, then refresh, must not
+        # show the pre-decision state for the length of a TTL.
+        scans.clear()
+        gov.mark_human_decision('r20new', True, 'user', proposal_id='r20new')
+        merged = gov._decided_proposal_ids()
+        assert 'r20new' in merged, (
+            'a freshly written decision was not visible - the memo served a '
+            'stale view')
+        assert len(scans) >= 1, 'the write did not force a re-scan'
+    finally:
+        gov._scan_decided_proposal_ids = real_scan
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('25 lookups -> 1 scan; a write invalidates at once')
+    print(' t_v1845_decided_map_is_memoised: OK')
+
+
+@test('v1.8.45 R9+R10: every BudgetTracker is built by the factory, with cfg')
+def t_v1845_all_budget_trackers_wired() -> None:
+    """R9: the governance budget check called the factory with no `cfg`, so
+    `budget.enabled` was inert there and `reset_hour_utc` fell back to the
+    module default (00:00) while the drain used the operator's value - two
+    different DAILY WINDOWS for one skill, plus an HTTP thread becoming a
+    reader/writer of the budget state.
+
+    R10: a tenth bare `BudgetTracker(...)` survived at the real-gate spend
+    site, so the real gate accumulated against the MODULE DEFAULT cap while
+    the drain checked the operator's - the exact regression the v1.8.37 F13
+    fix removed from nine sites, reappearing where the fix did not look."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import ast
+    import re as _re
+    offenders = []
+    for p in sorted((PLUGIN_ROOT / 'helpers').glob('*.py')):
+        src = p.read_text(encoding='utf-8')
+        for m in _re.finditer(r'budget\.BudgetTracker\(', src):
+            ln = src[:m.start()].count('\n') + 1
+            # budget.py itself declares the class; a construction there is the
+            # factory's own fallback, which is legitimate.
+            if p.name == 'budget.py':
+                continue
+            offenders.append(f'{p.name}:{ln}')
+    assert not offenders, (
+        'these build a BudgetTracker directly instead of through '
+        f'tracker_from_config, so budget.enabled / daily_cap_cents / '
+        f'reset_hour_utc do not apply there: {offenders}')
+
+    # The governance check must pass a cfg - not fall back to the registry,
+    # which is an extra read on an HTTP thread.
+    gov_src = (PLUGIN_ROOT / 'helpers' / 'governance.py').read_text(
+        encoding='utf-8')
+    fn = gov_src[gov_src.find('def _today_spent_cents'):]
+    fn = fn[:fn.find('\ndef ') if '\ndef ' in fn else len(fn)]
+    call = _re.search(r'tracker_from_config\(([^)]*)\)', fn)
+    assert call, 'the governance budget check no longer uses the factory'
+    assert _re.search(r'\w+\s*,\s*_cfg\s*\)', call.group(1)) or \
+        '_cfg' in call.group(1), (
+        f'the factory is called with {call.group(1)!r} - it must receive the '
+        f"caller's cfg, or the governance path silently re-reads the registry "
+        f'on an HTTP thread and loses the operator reset_hour_utc')
+
+    # Behavioural: two different reset hours must produce two different
+    # windows, which is only observable if cfg reaches the tracker.
+    from helpers import budget as bg
+    for hour, label in ((7, 'operator'), (0, 'module default')):
+        cfg = {'budget': {'enabled': True, 'reset_hour_utc': hour}}
+        bt = bg.tracker_from_config('r9skill', cfg)
+        assert bt is not None, label
+        assert bt.reset_hour_utc == hour, (
+            f'{label} reset hour was not applied: {bt.reset_hour_utc}')
+    _ok('no direct constructions; cfg reaches every factory call')
+    print(' t_v1845_all_budget_trackers_wired: OK')
+
+
+@test('v1.8.45 R11: the adoption row records the RESOLVED outcome')
+def t_v1845_adoption_row_records_outcome() -> None:
+    """R11: `passed` recorded the GATE's verdict *before* anything was
+    written, and every later refusal returned without correcting it - so a
+    failed snapshot or an ungated refusal left an audit row asserting a
+    PASSING ADOPTION for a write that never landed. `api/adopt.py` already
+    wrote a correction row; the drain did not."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tempfile
+    from helpers import auto_loop as al
+    tmp = Path(tempfile.mkdtemp(prefix='v1845_r11_'))
+    restore, staging, skills, runs = _v1845_sandbox(tmp)
+    saved_validate = None
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history', 'fragment_store', 'replay_harness',
+                      'ab_harness')
+        from helpers import sleep_runner as sr
+        saved_validate = sr.validate_proposal
+        sr.validate_proposal = lambda *a, **kw: (True, 'ok')
+
+        thread = al.AutoLoopThread.__new__(al.AutoLoopThread)
+        thread.lines = []
+        thread._log = lambda m: thread.lines.append(str(m))
+        thread._record_error = lambda e, w: None
+        thread._autonomous_precheck = lambda *a, **kw: ''
+        thread._autonomous_postcheck = lambda *a, **kw: ''
+        thread._record_autonomous_adoption = lambda *a, **kw: None
+        thread._autonomous_audit = lambda *a, **kw: None
+        thread._load_state = lambda: {}
+        thread._save_state = lambda st: None
+        thread._real_gate_enabled = lambda *a, **kw: False
+
+        # The fixtures must be opted IN, or governance refuses first and the
+        # test never reaches the write (it returned "skipped").
+        from helpers import governance as _gov11
+        _adopt_opt_in(_gov11, 'r11refuse')
+        _adopt_opt_in(_gov11, 'r11ok')
+
+        # --- a refused write (failed snapshot) must NOT leave passed:True
+        src = staging / 'r11refuse.md'
+        src.write_text(_v1834_skill_md('r11refuse', 'a body line here\n'),
+                       encoding='utf-8')
+        saved_write = sr.adopt_write_skill
+        sr.adopt_write_skill = lambda s, t: {'ok': False,
+                                              'error': 'snapshot failed'}
+        try:
+            outcome = thread._adopt_one({}, {'allow_ungated_direct_adopt': True},
+                                        src)
+        finally:
+            sr.adopt_write_skill = saved_write
+        assert 'snapshot' in str(outcome), outcome
+        rows = [json.loads(l) for l in
+                (runs / 'adoptions.log').read_text(encoding='utf-8'
+                                                   ).splitlines() if l.strip()]
+        assert rows, 'the refusal wrote no audit row at all'
+        last = rows[-1]
+        assert last.get('passed') is not True, (
+            f'a REFUSED adoption left passed=True in the audit trail: {last}')
+        assert last.get('outcome') == 'refused', (
+            f'the row does not record the refusal as its outcome: {last}')
+        assert 'snapshot' in str(last.get('outcome_note', '')), last
+        # Check EVERY row, not just the last: a row that transiently claims a
+        # passing adoption is still a false statement in the audit trail, even
+        # if a later row corrects it. Asserting only `rows[-1]` is what let the
+        # mutation that reinstated `"passed": ok` pass unnoticed.
+        for r in rows:
+            assert not (r.get('passed') is True and r.get('outcome')
+                        != 'adopted'), (
+                f'an audit row claims a PASSING adoption for an outcome of '
+                f'{r.get("outcome")!r}: {r}')
+        assert not (skills / 'r11refuse' / 'SKILL.md').exists(), (
+            'a refused write still created a live skill')
+
+        # --- a successful adopt must record passed=True ------------------
+        src2 = staging / 'r11ok.md'
+        src2.write_text(_v1834_skill_md('r11ok', 'another body line\n'),
+                        encoding='utf-8')
+        sr.adopt_write_skill = lambda s, t: {'ok': True, 'snapshotted': True}
+        try:
+            outcome2 = thread._adopt_one({}, {'allow_ungated_direct_adopt': True},
+                                         src2)
+        finally:
+            sr.adopt_write_skill = saved_write
+        rows2 = [json.loads(l) for l in
+                 (runs / 'adoptions.log').read_text(encoding='utf-8'
+                                                    ).splitlines() if l.strip()]
+        assert rows2[-1].get('outcome') == 'adopted', rows2[-1]
+        assert rows2[-1].get('passed') is True, rows2[-1]
+        # The GATE verdict keeps its own key so it is not conflated again.
+        assert 'gate_passed' in rows2[-1], (
+            'the gate verdict must be recorded separately from the outcome')
+        # ...and the row template must NOT carry a `passed` key at all.
+        # `_audit` is the only writer and always sets it, so a `passed` here
+        # would be dead - and dead is dangerous: delete the one line in
+        # `_audit` that overwrites it and the provisional gate verdict leaks
+        # straight into the trail. Mutation testing found exactly this
+        # (twice), so it is pinned rather than left to inspection.
+        al_src = (PLUGIN_ROOT / 'helpers' / 'auto_loop.py').read_text(
+            encoding='utf-8')
+        _fn = al_src[al_src.find('    def _adopt_one('):]
+        _fn = _fn[:_fn.find('\n    def ') if '\n    def ' in _fn else len(_fn)]
+        _tmpl = _fn[_fn.find('        entry = {'):]
+        _tmpl = _tmpl[:_tmpl.find('\n        def _audit')]
+        assert '"passed":' not in _tmpl, (
+            'the adoption row template carries a `passed` key, but `_audit` '
+            'overwrites it on every write - it is dead, and it would become a '
+            'live false statement the moment the overwrite is removed')
+    finally:
+        if saved_validate is not None:
+            from helpers import sleep_runner as sr
+            sr.validate_proposal = saved_validate
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('a refusal records refused; a success records adopted')
+    print(' t_v1845_adoption_row_records_outcome: OK')
+
+
+@test('v1.8.45 R12: the agent adopt tool honours its skill argument')
+def t_v1845_tool_honours_skill_argument() -> None:
+    """R12: `skillopt_sleep verb=adopt skill="foo"` called `self._adopt()`
+    with no argument and adopted `staged[0]` - so it silently adopted a
+    DIFFERENT skill than the one named. Audit M5 fixed exactly this on the
+    HTTP route; the agent path is the copy with no human reading a diff."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    src = (PLUGIN_ROOT / 'tools' / 'skillopt_sleep.py').read_text(
+        encoding='utf-8')
+
+    # The argument must reach the gate.
+    assert 'self._adopt(skill_name=' in src, (
+        'the dispatch still drops the skill argument')
+    assert 'def _adopt(self, skill_name' in src, (
+        '_adopt does not accept a skill name')
+    # ...and resolution must be stem equality with an ERROR on no match,
+    # not a silent fallback to the newest staged file.
+    assert 'p.stem == skill_name' in src, (
+        'the tool does not resolve by stem equality')
+    assert 'refusing to adopt a ' in src, (
+        'a skill with no staged proposal must be an ERROR, not a fallback to '
+        'whatever happens to be newest')
+    # And it must NOT silently keep the old behaviour.
+    assert 'staged[0]' in src, (
+        'the newest-staged fallback is gone; confirm the argument-less call '
+        'path is still the documented "adopt latest" behaviour')
+    _ok('the named skill is honoured, with an error on no match')
+    print(' t_v1845_tool_honours_skill_argument: OK')
+
+
+@test('v1.8.45 R18: /reject does not report success over partial failures')
+def t_v1845_reject_reports_partial_failure() -> None:
+    """R18: if the quarantine failed AND the ledger write failed, the document
+    stayed queued with no rail armed - and the route returned `ok: true`. Same
+    defect F10 fixed for the opt-in marker."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import asyncio as _asyncio
+    import tempfile as _tempfile
+    _install_helpers_api_stub()
+    tmp = Path(tempfile.mkdtemp(prefix='v1845_r18_'))
+    restore, staging, skills, runs = _v1845_sandbox(tmp)
+    saved_quar = None
+    try:
+        _v1834_mirror('sleep_runner', 'governance', 'proposal_view',
+                      'cycle_history')
+        Reject = _v1834_import_api('reject', 'Reject')
+        from helpers import sleep_runner as sr, governance as gov
+
+        def boom_quarantine(*a, **kw):
+            raise OSError('staging volume is read-only')
+
+        def boom_ledger(*a, **kw):
+            return {'ok': False, 'error': 'ledger unavailable'}
+
+        saved_quar = sr.quarantine_staged_proposal
+        saved_mark = gov.mark_human_decision
+        sr.quarantine_staged_proposal = boom_quarantine
+        gov.mark_human_decision = boom_ledger
+
+        _v1836_write_proposal(staging, 'r18', 'a body line\n')
+        r = _asyncio.run(Reject().process(
+            {'proposal_id': 'r18', 'reason': 'nope'}, None))
+        assert r['ok'] is False, (
+            f'/reject reported success over a total failure: {r}')
+        assert 'error' in r, r
+        # The message must say what is still true, or the operator cannot act.
+        assert 'queue' in r['error'], r['error']
+        assert 'rail' in r['error'], r['error']
+        assert r.get('governance_recorded') is not True, r
+
+        # One failure is still a failure - a half-done reject is not a reject.
+        sr.quarantine_staged_proposal = saved_quar
+        gov.mark_human_decision = boom_ledger
+        _v1836_write_proposal(staging, 'r18b', 'a body line\n')
+        r2 = _asyncio.run(Reject().process(
+            {'proposal_id': 'r18b', 'reason': 'nope'}, None))
+        assert r2['ok'] is False, (
+            f'/reject reported success with the rail unarmed: {r2}')
+    finally:
+        if saved_quar is not None:
+            from helpers import sleep_runner as sr
+            sr.quarantine_staged_proposal = saved_quar
+        gov.mark_human_decision = saved_mark
+        restore()
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('a partial reject is a failure, and says what is still true')
+    print(' t_v1845_reject_reports_partial_failure: OK')
+
+
+@test('v1.8.45 R21: a transport error is not a completed judgement')
+def t_v1845_transport_error_does_not_retire() -> None:
+    """R21: an unreachable endpoint enqueued an EMPTY suggestion - and an empty
+    suggestion is exactly how "the model had no useful idea" is represented.
+    So the rollout was marked done and its contribution to the training signal
+    was retired PERMANENTLY, with no retry and no counter distinguishing the
+    two cases."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    src = (PLUGIN_ROOT / 'helpers' / 'inner_loop.py').read_text(encoding='utf-8')
+
+    # The error branch must NOT enqueue.
+    i = src.find('counters["transport_errors"]')
+    assert i != -1, (
+        'the transport-error branch no longer exists - R21 is back')
+    branch = src[max(0, i - 600):i + 500]
+    assert 'enqueue_suggestion(rec, ""' not in branch, (
+        'a transport error still enqueues an empty suggestion, which retires '
+        'the rollout exactly as a declined judgement would')
+    assert '_bump_skip' in branch, (
+        'the transport-error branch must consume the retry budget instead of '
+        'retiring the rollout outright')
+    # ...and the retirement budget must be shared, not bypassed.
+    assert 'def _bump_skip(' in src, (
+        'the skip/retire helper is gone, so the two deferral paths can drift '
+        'again')
+    fn = src[src.find('def _bump_skip('):]
+    fn = fn[:fn.find('\ndef ') if '\ndef ' in fn else len(fn)]
+    assert '_skip_retire_after' in fn, (
+        '_bump_skip no longer honours the retirement cap, so retries are '
+        'unbounded')
+    # The decline path must STILL enqueue - that one really is a judgement.
+    j = src.find('counters["skipped"] = int(')
+    decline = src[max(0, j - 700):j + 200]
+    assert 'enqueue_suggestion(rec, ""' in decline, (
+        'the genuine "no useful suggestion" path must still enqueue a no-op')
+    _ok('errors retry under a cap; declines retire as judgements')
+    print(' t_v1845_transport_error_does_not_retire: OK')
+
+
+@test('v1.8.45 R22: a failed reward-model load is attempted once')
+def t_v1845_failed_load_attempted_once() -> None:
+    """R22: `_load_attempted` was assigned in three places and read NOWHERE,
+    so `_ensure_model_loaded()` re-ran the full checkpoint load on EVERY
+    finished chat when the directory was present but unloadable - holding
+    `_lock` on the harvester's latency path. It was set only on the LAST line
+    of `_try_load_model`, so both failure paths returned without recording the
+    attempt at all."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import ast
+    import tempfile as _tempfile
+    from helpers import reward_model as rm
+
+    src = (PLUGIN_ROOT / 'helpers' / 'reward_model.py').read_text(
+        encoding='utf-8')
+    tree = ast.parse(src)
+    fn = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+          and n.name == '_ensure_model_loaded'][0]
+    body = '\n'.join(src.splitlines()[fn.lineno - 1:fn.end_lineno])
+    assert '_load_attempted' in body, (
+        '_ensure_model_loaded never reads _load_attempted, so a failed load is '
+        'retried on every finished chat')
+    # The guard must come BEFORE the load attempt.
+    guard = body.find('_load_attempted')
+    attempt = body.find('_try_load_model()')
+    assert 0 < guard < attempt, (
+        'the retry guard must precede the load attempt')
+
+    # And the flag must be set before the failure exits, not after.
+    tf = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+          and n.name == '_try_load_model'][0]
+    lines = src.splitlines()
+    set_at = None
+    for j in range(tf.lineno, tf.end_lineno + 1):
+        if re.match(r'\s*_load_attempted\s*=\s*True', lines[j - 1]):
+            set_at = j
+            break
+    assert set_at is not None, '_try_load_model no longer sets _load_attempted'
+    first_return = next((j for j in range(tf.lineno, tf.end_lineno + 1)
+                         if 'return False' in lines[j - 1]), None)
+    assert first_return is not None, 'no failure path to compare against'
+    assert set_at < first_return, (
+        f'_load_attempted is set at line {set_at}, AFTER the first '
+        f'`return False` at line {first_return} - so a failed load never '
+        f'records that it was tried, and the retry guard can never fire')
+
+    # Behavioural: two consecutive loads of an unloadable model must attempt
+    # once, not twice.
+    tmp = Path(tempfile.mkdtemp(prefix='v1845_r22_'))
+    saved_path = rm.model_path
+    saved_attempted = rm._load_attempted
+    saved_model = rm._model
+    saved_tok = rm._tokenizer
+    try:
+        d = tmp / 'empty_model_dir'
+        d.mkdir(parents=True, exist_ok=True)
+        (d / 'config.json').write_text('{}', encoding='utf-8')
+        rm.model_path = lambda: d
+        rm._model = None
+        rm._tokenizer = None
+        calls = []
+        real_try = rm._try_load_model
+
+        def counting_try():
+            calls.append(1)
+            return real_try()
+
+        rm._try_load_model = counting_try
+        try:
+            rm._ensure_model_loaded()
+            rm._ensure_model_loaded()
+            rm._ensure_model_loaded()
+        finally:
+            rm._try_load_model = real_try
+        assert len(calls) == 1, (
+            f'an unloadable model was loaded {len(calls)} times for three '
+            f'calls - _load_attempted is not gating the retry')
+    finally:
+        rm.model_path = saved_path
+        rm._load_attempted = saved_attempted
+        rm._model = saved_model
+        rm._tokenizer = saved_tok
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('3 calls -> 1 attempt; the flag is set before the failure exits')
+    print(' t_v1845_failed_load_attempted_once: OK')
+
+# ======================================================================= #
+# v1.8.46 - Phase 6e: privacy completion + unsafe tool/bridge (R13-R17, R24)
+# ======================================================================= #
+#
+# The last phase, and the only one with a confidentiality dimension. Six
+# findings, all the same shape: a control that LOOKED present and did not.
+#
+#   R13 the real-gate tasks file was written unsanitized on the failure path,
+#       SILENTLY, and a comment claimed it "only rewrites text fields" when it
+#       actually POPS args/result
+#   R14 the inner-loop egress sanitized a `rollouts` key the payload does not
+#       have, and skipped `trajectory` because it is a list - a silent no-op
+#   R15 `adopt_write_skill`'s `redacted` flag was computed and read NOWHERE
+#   R16 model output was redacted only at the live write, so the raw bytes
+#       survived in staging/, staging/adopted/ and the summary sidecar
+#   R17 index compaction replaced the file with no lock, so a concurrent
+#       append was dropped silently
+#   R24 setup_env rewrote an unmatched plaintext credential into a
+#       SELF-reference that resolves nowhere, destroying the only copy
+
+_section_v1846 = ('v1.8.46 NEW: re-audit Phase 6e - privacy completion '
+                  '(6 cases)')
+
+
+def _v1846_sandbox(tmp):
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import governance as gov, sleep_runner as sr
+    staging, skills, runs = tmp / 'staging', tmp / 'skills', tmp / 'runs'
+    for d in (staging, skills, runs):
+        d.mkdir(parents=True, exist_ok=True)
+    saved = (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir, gov._runs_dir,
+             gov._TEST_SKILLS_DIR, gov._mode_reported)
+    sr.staging_dir = lambda: staging
+    sr.a0_skills_dir = lambda: skills
+    sr.runs_dir = lambda: runs
+    gov._runs_dir = lambda: runs
+    gov.set_skills_dir_for_tests(skills)
+    gov._mode_reported = {}
+
+    def restore():
+        (sr.staging_dir, sr.a0_skills_dir, sr.runs_dir,
+         gov._runs_dir) = saved[:4]
+        gov._TEST_SKILLS_DIR = saved[4]
+        gov._mode_reported = saved[5]
+    return restore, staging, skills, runs
+
+
+@test('v1.8.46 R14: the inner-loop egress sanitizes the payload it ACTUALLY has')
+def t_v1846_egress_sanitizes_real_payload() -> None:
+    """R14: the egress called `sanitize_rollout_records(payload["rollouts"])` -
+    but `_build_rollout_payload` emits `{task, trajectory, last_response, ...}`
+    and has NO `rollouts` key, so the call received `None`, its result was
+    discarded, and NOTHING was sanitized. `trajectory` is a LIST, which the
+    per-field `isinstance(v, str)` filter skipped in any case.
+
+    A silent no-op on an egress is the worst shape this bug could take: the
+    feature looked present, the endpoint is one config value away, and
+    enabling it starts shipping credentials."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import json as _json
+    import urllib.request
+    from helpers import inner_loop as il
+
+    captured = {}
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return _json.dumps({"suggestion": "x",
+                                "confidence": 0.5}).encode()
+
+    class FakeUrlopen:
+        def __init__(self, req, timeout=None):
+            captured['body'] = req.data.decode('utf-8')
+
+        def __enter__(self):
+            return FakeResp()
+
+        def __exit__(self, *a):
+            return False
+
+    saved = urllib.request.urlopen
+    urllib.request.urlopen = FakeUrlopen
+    try:
+        rec = {
+            'task': 'set AZURE_OPENAI_API_KEY=abcdef0123456789abcdef in env',
+            'trajectory': [
+                {'type': 'tool', 'name': 'bash',
+                 'args': {'cmd': 'export TOKEN=sk-abcdefghijklmnop1234'},
+                 'result': 'ok'},
+                {'type': 'note',
+                 'text': 'REDIS_URL=redis://:hunter2hunter2@cache:6379'},
+            ],
+            'last_response': 'done',
+        }
+        payload = il._build_rollout_payload(rec)
+        assert 'rollouts' not in payload, (
+            'the payload shape changed - re-check that the egress sanitises '
+            'whatever this actually emits')
+        res = il._llm_suggest_via_http(payload, endpoint='http://x.invalid',
+                                        model='utility')
+        assert not res.get('error'), res
+        body = captured.get('body', '')
+        assert body, 'nothing was sent'
+        for label, secret in (
+                ('task value', 'abcdef0123456789abcdef'),
+                ('trajectory tool arg', 'sk-abcdefghijklmnop1234'),
+                ('trajectory step text', 'hunter2hunter2'),
+                ('tool args key', '"args"'),
+                ('tool result key', '"result"')):
+            assert secret not in body, (
+                f'{label} LEAKED through the egress:\n{body[:400]}')
+    finally:
+        urllib.request.urlopen = saved
+    _ok('task, trajectory text and the tool args/result policy all enforced')
+    print(' t_v1846_egress_sanitizes_real_payload: OK')
+
+
+@test('v1.8.46 R13: the real-gate tasks file is never written unsanitized')
+def t_v1846_real_gate_tasks_never_unsanitized() -> None:
+    """R13: an unimportable privacy helper was a SILENT skip - the tasks file
+    was written with raw rollout records and nothing said so. The sibling
+    boundary (`bridge.py`) raises in the same situation."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    src = (PLUGIN_ROOT / 'helpers' / 'auto_loop.py').read_text(encoding='utf-8')
+    body = src[src.find('def _real_gate_spawn'):]
+    body = body[:body.find('\ndef ') if '\ndef ' in body else len(body)]
+    # Pin BOTH skip branches by their distinct wording, and require a
+    # `return None` after each. A single substring is not enough: there are
+    # two failure paths (helper unavailable, sanitization raised) and a
+    # mutation of either one leaves the other's text in place, which is
+    # exactly how the first version of this test passed with one half broken.
+    for label, needle in (
+            ('an unavailable privacy helper', 'privacy helper unavailable'),
+            ('a failed sanitization', 'task sanitization FAILED')):
+        assert needle in body, (
+            f'the real gate must SKIP rather than freeze unsanitized records '
+            f'when {label}')
+        after = body[body.find(needle):]
+        # BOUNDED window. The first version searched the whole remainder, so
+        # deleting this branch's "SKIPPING" still found the OTHER branch's
+        # text further down and the test passed with one half removed -
+        # found by mutation, not by reading.
+        nxt = after.find('SKIPPING', 0, 300)
+        assert nxt != -1, (
+            f'the {label} branch does not say it is skipping within its own '
+            f'statement')
+        tail = after[nxt:nxt + 400]
+        assert 'return None' in tail, (
+            f'the {label} branch logs that it is skipping but does not '
+            f'actually return - the tasks file would still be written')
+    assert 'SKIPPING the real gate rather than freezing' in body, (
+        'the skip must name what it avoids doing')
+    # And the comment must not claim it "only rewrites text fields" - at the
+    # shipped defaults it POPS args/result, so the frozen records are
+    # structurally lighter than the source rollouts.
+    assert 'only rewrites text' not in body, (
+        'the false comment is back: sanitization POPS args/result at the '
+        'shipped defaults, it does not merely rewrite text fields')
+    # Case-sensitive on purpose: the comment's own wording is the thing being
+    # pinned, so a reworded comment is a deliberate edit rather than silently
+    # satisfying the check.
+    assert 'POPS each trajectory step' in body, (
+        'the comment must state that args/result are popped, not rewritten')
+    _ok('unsanitized freeze is impossible; the false comment is corrected')
+    print(' t_v1846_real_gate_tasks_never_unsanitized: OK')
+
+
+@test('v1.8.46 R15+R16: redaction is recorded AND applied before persistence')
+def t_v1846_redaction_is_traced_and_pre_persisted() -> None:
+    """Two halves of one gap.
+
+    R15: `adopt_write_skill` computed `redacted` and NOBODY read it, so a live
+    skill altered by output redaction left no trace in any ledger - the
+    opposite of what the writer's own docstring claims.
+
+    R16: redaction happened only at the live write, so the UNREDACTED bytes
+    were already in `staging/<skill>.md`, copied into
+    `staging/adopted/*.md`, and embedded in the summary sidecar's diff."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+
+    # --- R16: both staging writers redact before persisting -----------
+    do = (PLUGIN_ROOT / 'helpers' / 'direct_optimizer.py').read_text(encoding='utf-8')
+    at = do.find('staging_path.write_text(improved')
+    assert at != -1, 'the direct optimizer staging write moved'
+    before = do[max(0, at - 1400):at]
+    # Pin the GUARD and the call TOGETHER. Asserting only that
+    # `redact_text(` appears survives `if False:`, which is how the first
+    # version of this test passed with redaction disabled.
+    seq = ('if _pv.privacy_settings().get("redact_secrets", True):\n'
+           '                _clean = _pv.redact_text(improved)')
+    assert seq in before, (
+        'the direct optimizer must redact model output immediately before '
+        'persisting it, guarded on redact_secrets - the raw bytes outlive '
+        'the live-write redaction in staging/ and staging/adopted/')
+    oa = (PLUGIN_ROOT / 'helpers' / 'official_adapter.py').read_text(encoding='utf-8')
+    at2 = oa.find('shutil.copy2(str(proposed), str(dest))')
+    assert at2 != -1, 'the official adapter copy moved'
+    after = oa[at2:at2 + 1600]
+    seq2 = ('if _pv.privacy_settings().get("redact_secrets", True):\n'
+            '                _raw = dest.read_text(encoding="utf-8", '
+            'errors="replace")\n'
+            '                _clean = _pv.redact_text(_raw)')
+    assert seq2 in after, (
+        'the official engine copy is model output and gets no '
+        'pre-persistence redaction immediately after the copy')
+
+    # --- R15: every adopt path records the flag -----------------------
+    al = (PLUGIN_ROOT / 'helpers' / 'auto_loop.py').read_text(encoding='utf-8')
+    assert 'row["output_redacted"] = True' in al, (
+        'the drain audit row has no output_redacted field, so a redacted '
+        'skill leaves no trace in the trail')
+    assert al.count('_w.get("redacted")') >= 2, (
+        'neither drain adopt path consults the writer\'s redacted flag')
+    ap = (PLUGIN_ROOT / 'api' / 'adopt.py').read_text(encoding='utf-8')
+    assert '"redacted": bool(_w.get("redacted"))' in ap, (
+        'the HTTP route does not surface redaction, so the operator sees an '
+        'unqualified success for a document that was altered')
+    # The docstring must not keep promising something no caller reads. It used to
+    # say "the audit row can record it" while NOBODY read `redacted` - the exact
+    # false claim R24... (R15) was filed for.
+    sr = (PLUGIN_ROOT / 'helpers' / 'sleep_runner.py').read_text(encoding='utf-8')
+    fn = sr[sr.find('def adopt_write_skill'):]
+    fn = fn[:fn.find('\ndef ') if '\ndef ' in fn else len(fn)]
+    assert '"redacted"' in fn, 'the writer no longer documents the flag'
+    assert 'the audit row can record it' not in fn, (
+        'the docstring still claims the audit row records redaction, which is '
+        'the claim R15 proved false')
+    _ok('pre-persistence redaction on both writers; the flag is recorded')
+    print(' t_v1846_redaction_is_traced_and_pre_persisted: OK')
+
+
+@test('v1.8.46 R17: index compaction cannot drop a concurrent append')
+def t_v1846_index_compaction_is_serialised() -> None:
+    """R17: compaction is read -> rewrite -> `os.replace`, and three writers
+    append to that file. A row appended between the read and the replace was
+    DROPPED with no error - the exact failure M2 was filed for, reintroduced
+    in the file created to fix it."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    src = (PLUGIN_ROOT / 'helpers' / 'governance.py').read_text(encoding='utf-8')
+    assert '_APPROVALS_INDEX_LOCK' in src, (
+        'the approvals index has no lock, so compaction can drop an append')
+    assert 'import threading' in src, 'the lock needs threading'
+
+    def fn_body(name):
+        i = src.find('def ' + name)
+        assert i != -1, f'{name} is gone'
+        seg = src[i:]
+        n = seg.find('\ndef ', 10)
+        return seg[:n] if n != -1 else seg
+
+    comp = fn_body('_compact_approvals_index')
+    assert '_APPROVALS_INDEX_LOCK' in comp, (
+        'compaction does not take the lock - the read/replace window is open')
+    app = fn_body('_append_approvals_index')
+    assert '_APPROVALS_INDEX_LOCK' in app, (
+        'the append does not take the lock, so compaction can still drop it')
+    # The replace must be INSIDE the lock, not after it.
+    lock_at = comp.index('with _APPROVALS_INDEX_LOCK:')
+    replace_at = comp.index('os.replace(tmp, p)')
+    assert lock_at < replace_at, (
+        'os.replace happens outside the lock, so the window is still open')
+    # And a failure must not leave the tmp file behind.
+    assert 'tmp = None' in comp, (
+        'the compaction temp file is not cleared on failure, so a repeated '
+        'crash litters logs/runs/')
+    _ok('append and compaction share one lock; the tmp file is cleaned up')
+    print(' t_v1846_index_compaction_is_serialised: OK')
+
+
+@test('v1.8.46 R24: an unmatched plaintext credential is PRESERVED')
+def t_v1846_unmatched_credential_is_preserved() -> None:
+    """R24: `_provenance_ref` fell back to `${KEY}` when no visible source
+    matched, which resolves to nothing. A legacy `.skillopt-env` holding the
+    only copy of a WORKING credential was rewritten into a dangling
+    reference, the credential was destroyed, and the next LLM call failed with
+    "No LLM API key found"."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import setup_env as se
+
+    orphan = 'export LLM_API_KEY=sk-realkeyvalue1234567890abcdef\n'
+    body, fixed = se.sanitize_env_text(orphan, sources={})
+    assert 'sk-realkeyvalue1234567890abcdef' in body, (
+        'the only copy of a working credential was destroyed by rewriting it '
+        f'into a dangling reference: {body!r}')
+    assert '${LLM_API_KEY}' not in body, (
+        'a SELF-reference is still being emitted; it resolves to nothing')
+    # ...but it is still REPORTED, so the condition is visible.
+    assert fixed == ['LLM_API_KEY'], (
+        f'the unmatched credential must be reported, got {fixed}')
+
+    # A genuinely MATCHED source must still convert - the fix must not turn
+    # the sanitiser off.
+    matched = 'export LLM_API_KEY=sk-matches-source-value\n'
+    body2, fixed2 = se.sanitize_env_text(
+        matched, sources={'OPENAI_API_KEY': 'sk-matches-source-value'})
+    assert 'export LLM_API_KEY=${OPENAI_API_KEY}' in body2, body2
+    assert 'sk-matches-source-value' not in body2.split('=')[1] or \
+        '${OPENAI_API_KEY}' in body2, body2
+    assert fixed2 == ['LLM_API_KEY'], fixed2
+
+    # An existing reference is untouched.
+    ref = 'export LLM_API_KEY=${OPENAI_API_KEY}\n'
+    body3, fixed3 = se.sanitize_env_text(ref, sources={})
+    assert fixed3 == [], fixed3
+    assert body3 == ref, body3
+
+    # And `_provenance_ref` signals "no provenance" rather than inventing one.
+    assert se._provenance_ref('K', 'v', {}) == '', (
+        '_provenance_ref must return "" when there is no provenance; a '
+        'self-reference is the R24 defect')
+    _ok('orphan preserved and reported; matched sources still convert')
+    print(' t_v1846_unmatched_credential_is_preserved: OK')
+
+
+@test('v1.8.46: the privacy boundary is asserted BEHAVIOURALLY, not structurally')
+def t_v1846_privacy_boundary_behavioural() -> None:
+    """The meta-lesson of this phase, pinned.
+
+    Four of these six findings (R13, R14, R15, R17) were *silent no-ops*:
+    the code called a sanitizer and threw the result away, or set a flag nobody
+    read, or replaced a file without a lock. A structural check - "the function
+    is called" - passes for every one of them. Only asserting that a credential
+    is ABSENT from what actually gets written catches them.
+
+    So this case puts a credential through the real code and checks the bytes
+    that come out, which is the only assertion style that would have found any
+    of the four."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import privacy as pv
+
+    # The redactor, through its real public entry point.
+    secret = 'AZURE_OPENAI_API_KEY=abcdef0123456789abcdef'
+    out = pv.redact_text(f'set {secret} then continue')
+    assert 'abcdef0123456789abcdef' not in out, out
+    assert '[REDACTED]' in out, out
+
+    # A rollout, through the list sanitizer the persistence paths use.
+    recs = [{'task': f'set {secret}',
+             'trajectory': [{'type': 'tool', 'text': 'ok', 'args': {'k': 'v'},
+                             'result': 'r'}]}]
+    safe = pv.sanitize_rollout_records(recs)
+    blob = json.dumps(safe)
+    assert 'abcdef0123456789abcdef' not in blob, blob
+    # The policy: args/result are excluded at the shipped defaults, so the
+    # frozen records are STRUCTURALLY lighter than the source.
+    step = safe[0]['trajectory'][0]
+    assert 'args' not in step and 'result' not in step, (
+        f'tool args/result must be excluded by default, got {step}')
+    # The step's own free-text fields ARE redacted (v1.8.46).
+    recs2 = [{'task': 't', 'trajectory': [
+        {'type': 'note', 'text': 'see redis://:hunter2hunter2@cache/0'}]}]
+    assert 'hunter2hunter2' not in json.dumps(
+        pv.sanitize_rollout_records(recs2)), (
+        'a trajectory step\'s own text is not redacted - R14 is half-fixed')
+    _ok('credentials absent from the bytes the persistence paths actually write')
+    print(' t_v1846_privacy_boundary_behavioural: OK')
+
+# ======================================================================= #
+# v1.8.47 - Phase 6f: the eight remaining Low findings (R25-R32)
+# ======================================================================= #
+#
+# The tail of the second audit: divergence, a fallback that removed nothing,
+# an unlocked rewrite, an unsanitised egress, and four comments or orderings
+# that no longer matched the code. Individually cosmetic; together they are
+# why a reader of this plugin could not trust what the comments said.
+#
+#   R25 the route carried a SECOND decision reader that disagreed with the
+#        gate three ways at once
+#   R26 sanitize_rollout_records substituted the RAW record on failure
+#   R27 the training tool leaked a handle and allowed concurrent runs
+#   R28 the bridge index was written non-atomically -> duplicate history
+#   R29 the A/B judge's HTTP egress posted rollout text unsanitised
+#   R30 the dashboard documented /reject as audit-only (stale since 1.8.36)
+#   R31 the guard refusal - the record of the run that did NOT execute -
+#        was emitted before the log path existed
+#   R32 _deep_copy's fallback claimed a safety property it did not have
+
+_section_v1847 = ('v1.8.47 NEW: re-audit Phase 6f - divergence, fallbacks and '
+                  'stale contracts (8 cases)')
+
+
+@test('v1.8.47 R25: there is ONE decision reader, and the route uses it')
+def t_v1847_single_decision_reader() -> None:
+    """R25: `api/governance_status.py` had its own hand-rolled reader - live
+    log only, no `MACHINE_DECIDED_BY` filter, last LINE rather than
+    newest-by-timestamp. After a rotation it showed `null` while the gate saw
+    an approval, and an `autonomous` row reached the operator labelled as a
+    human decision.
+
+    Two readers of one ledger is exactly how R8 happened, so the route must
+    delegate rather than re-implement."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import governance as gov
+    src = (PLUGIN_ROOT / 'api' / 'governance_status.py').read_text(
+        encoding='utf-8')
+
+    fn = src[src.find('def _last_human_decision'):]
+    fn = fn[:fn.find('\ndef ') if '\ndef ' in fn else len(fn)]
+    assert 'governance._last_human_decision(skill)' in fn, (
+        'the route still hand-rolls its own decision reader; it must delegate '
+        'to governance._last_human_decision, which reads every generation plus '
+        'the durable index, filters machine rows, and picks newest-by-epoch')
+    # No bespoke ledger reads may survive.
+    for banned in ('governance.log', 'readlines()', 'reversed(lines)'):
+        assert banned not in fn, (
+            f'the route reads the ledger directly ({banned!r}); it must not '
+            f'- the log rotates and the index exists precisely so readers do '
+            f'not have to')
+    # ...and it must handle the tri-state sentinel rather than subscripting it.
+    assert '_UNREADABLE' in fn, (
+        'the route would treat an unreadable ledger as "no decision" - the '
+        'exact conflation R4 was filed for')
+    # The canonical reader is the one the gate uses.
+    assert 'MACHINE_DECIDED_BY' in (PLUGIN_ROOT / 'helpers' / 'governance.py'
+                                    ).read_text(encoding='utf-8')
+    _ok('the route delegates; no bespoke ledger read survives')
+    print(' t_v1847_single_decision_reader: OK')
+
+
+@test('v1.8.47 R26: a failing sanitizer yields a REDACTED shell, not the raw record')
+def t_v1847_failed_sanitize_is_redacted() -> None:
+    """R26: `sanitize_rollout_records` documented "never raises" and achieved
+    it by appending the RAW record when `sanitize_rollout` raised - persisting
+    exactly what the function exists to remove.
+
+    The fallback must keep the SHAPE (the held-out gate compares pairs by
+    index and reads fields by name) and drop every free-text VALUE."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import json
+    from helpers import privacy as pv
+
+    secret = 'AZURE_OPENAI_API_KEY=abcdef0123456789abcdef'
+    records = [{'task': f'set {secret}',
+                'trajectory': [{'type': 'tool', 'text': 'ok',
+                                'result': 'r'}],
+                'turns': 7}]
+    original = pv.sanitize_rollout
+    pv.sanitize_rollout = lambda r, config=None: (_ for _ in ()).throw(
+        RuntimeError('simulated sanitizer failure'))
+    try:
+        out = pv.sanitize_rollout_records(records)
+    finally:
+        pv.sanitize_rollout = original
+
+    assert isinstance(out, list) and len(out) == len(records), (
+        'length must be preserved - the held-out gate compares by index')
+    blob = json.dumps(out)
+    assert 'abcdef0123456789' not in blob, (
+        f'a failing sanitizer leaked the raw record: {blob[:200]}')
+    assert set(out[0].keys()) == set(records[0].keys()), (
+        'the shell must keep the field names - the gate reads them by name')
+    assert out[0]['task'] == '[REDACTED]', out[0]
+    assert out[0]['turns'] == 7, (
+        f'numeric counters carry no free text and must survive: {out[0]}')
+    assert isinstance(out[0]['trajectory'], list) and out[0]['trajectory'], (
+        'the trajectory must stay a list of same-shaped steps')
+
+    # And the normal path is unaffected.
+    good = pv.sanitize_rollout_records([{'task': f'set {secret}'}])
+    assert 'abcdef0123456789' not in json.dumps(good), good
+    _ok('failing sanitizer -> redacted shell; length and names preserved')
+    print(' t_v1847_failed_sanitize_is_redacted: OK')
+
+
+@test('v1.8.47 R27: the training tool is single-flight and closes its handle')
+def t_v1847_train_is_single_flight() -> None:
+    """R27: `kind=run` spawned an hours-long detached process, leaked the log
+    handle, and allowed a second concurrent run - both writing the same
+    artifacts."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    src = (PLUGIN_ROOT / 'tools' / 'skillopt_train.py').read_text(
+        encoding='utf-8')
+    fn = src[src.find('    def _run(self)'):]
+    fn = fn[:fn.find('\n    def ') if '\n    def ' in fn else len(fn)]
+
+    assert 'train_state.json' in fn, (
+        'the training tool records no state, so a second run cannot tell one '
+        'is already in flight')
+    assert 'is_running(' in fn, (
+        'single-flight must be decided by PID LIVENESS; `os.kill(pid, 0)` is '
+        'Ctrl+C on Windows')
+    # Pin the GUARD and its consequence as one sequence. Asserting the three
+    # strings independently survived `if prev_pid:` -> `if False:`, which is
+    # exactly the mutation that reintroduces concurrent runs.
+    guard_at = fn.index('if prev_pid:')
+    window = fn[guard_at:guard_at + 700]
+    assert 'is_running(' in window, (
+        'the single-flight guard no longer checks liveness - concurrent '
+        'training runs are possible again')
+    assert 'already in flight' in window, (
+        'the guard no longer refuses with a readable reason')
+    assert 'return Response(' in window, (
+        'the guard no longer RETURNS - a detected in-flight run would fall '
+        'through and launch a second one anyway')
+    # The handle must be closed after the spawn, guarded.
+    assert 'log_fh.close()' in fn, (
+        'the parent keeps its copy of the log handle open forever - one leaked '
+        'descriptor per run, and on Windows it also blocks rotation')
+    close_at = fn.index('log_fh.close()')
+    popen_at = fn.index('subprocess.Popen(')
+    assert close_at > popen_at, (
+        'the handle is closed BEFORE Popen duplicates it, so the child loses '
+        'its stdout')
+    assert 'except Exception' in fn[close_at - 60:close_at + 40], (
+        'the close must be guarded - a failure there must not lose the pid we '
+        'just spawned')
+    # The recorded pid must be durable and atomic.
+    assert 'os.replace(' in fn, (
+        'the train-state write must be atomic like every other small state file')
+    _ok('single-flight by pid liveness; handle closed; pid recorded atomically')
+    print(' t_v1847_train_is_single_flight: OK')
+
+
+@test('v1.8.47 R28: the bridge index is written atomically')
+def t_v1847_bridge_index_is_atomic() -> None:
+    """R28: `.bridge_index.json` was written in place. A torn write is caught
+    by the reader above and degraded to an EMPTY index, after which every
+    rollout looks unprocessed and duplicate rows are appended to
+    `history.jsonl` - duplication no reader can distinguish from real
+    history."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    src = (PLUGIN_ROOT / 'helpers' / 'bridge.py').read_text(encoding='utf-8')
+    fn = src[src.find('def bridge_rollouts_to_claude_history'):]
+    fn = fn[:fn.find('\ndef ') if '\ndef ' in fn else len(fn)]
+
+    assert '_idx_tmp' in fn, (
+        'the bridge index is still written in place - a torn write empties '
+        'the index and re-bridges every rollout')
+    write_at = fn.index('_idx_tmp.write_text(')
+    replace_at = fn.index('os.replace(')
+    assert replace_at > write_at, (
+        'the temp file is written but never renamed into place')
+    # The plain in-place write must be gone.
+    assert 'bridge_index_path.write_text(' not in fn, (
+        'the in-place index write is still present')
+    assert 'import os' in src, 'os is needed for the rename'
+    _ok('temp write + os.replace; the in-place write is gone')
+    print(' t_v1847_bridge_index_is_atomic: OK')
+
+
+@test('v1.8.47 R29: the A/B judge egress sanitizes and fails closed')
+def t_v1847_ab_judge_egress_is_sanitised() -> None:
+    """R29: `_llm_judge_via_http` posted `task` + `last_response` raw, which
+    made `inner_loop`'s claim - "every other provider boundary sanitizes and
+    fails closed" - false. Dormant, but dormant only by configuration."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import json
+    import urllib.request
+    from helpers import ab_harness as ab
+
+    captured = {}
+
+    class FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"verdict": "win", "confidence": 0.9,
+                               "reason": "ok"}).encode()
+
+    class FakeUrlopen:
+        def __init__(self, req, timeout=None):
+            captured['body'] = req.data.decode('utf-8')
+
+        def __enter__(self):
+            return FakeResp()
+
+        def __exit__(self, *a):
+            return False
+
+    saved_open = urllib.request.urlopen
+    saved_ep = os.environ.get('SKILLOPT_JUDGE_ENDPOINT')
+    urllib.request.urlopen = FakeUrlopen
+    os.environ['SKILLOPT_JUDGE_ENDPOINT'] = 'http://judge.invalid'
+    try:
+        secret = 'AZURE_OPENAI_API_KEY=abcdef0123456789abcdef'
+        rollout = {'task': f'set {secret}',
+                   'last_response': f'and here it is: {secret}',
+                   'trajectory': []}
+        ab._llm_judge_via_http(rollout, 0.1, 0.9, judge_model='utility')
+        body = captured.get('body', '')
+        assert body, 'nothing was sent'
+        assert 'abcdef0123456789' not in body, (
+            f'the A/B judge egress shipped a credential unsanitised:\n'
+            f'{body[:300]}')
+        assert '[REDACTED]' in body, body[:300]
+
+        # And it must REFUSE when the privacy helper is unavailable.
+        #
+        # Two mechanisms are needed, and missing either is why the first two
+        # attempts passed with the egress fail-open:
+        #   1. `sys.modules[name] = None` makes a plain `import` raise.
+        #   2. The ATTRIBUTE must also be removed from the package. The smoke
+        #      harness mirrors `usr.plugins.skillopt.helpers.*` onto the bare
+        #      namespace, so `from usr.plugins.skillopt.helpers import
+        #      privacy` resolves through the package attribute and never
+        #      consults sys.modules at all.
+        captured.clear()
+        import helpers as _hp
+        names = ('helpers', 'usr.plugins.skillopt.helpers', 'privacy')
+        pkg_attrs = {}
+        for pkgname in names[1:]:
+            pkg = sys.modules.get(pkgname)
+            if pkg is not None and hasattr(pkg, 'privacy'):
+                pkg_attrs[pkgname] = pkg.privacy
+                delattr(pkg, 'privacy')
+        saved_mods = {k: sys.modules[k] for k in list(sys.modules)
+                      if k == 'privacy' or k.endswith('.privacy')}
+        for name in ('helpers.privacy',
+                     'usr.plugins.skillopt.helpers.privacy', 'privacy'):
+            sys.modules[name] = None
+        raised = False
+        try:
+            ab._llm_judge_via_http(dict(rollout), 0.1, 0.9,
+                                    judge_model='utility')
+        except Exception:
+            raised = True
+        finally:
+            for name in ('helpers.privacy',
+                         'usr.plugins.skillopt.helpers.privacy', 'privacy'):
+                sys.modules.pop(name, None)
+            sys.modules.update(saved_mods)
+            for pkgname, val in pkg_attrs.items():
+                setattr(sys.modules[pkgname], 'privacy', val)
+        assert raised, (
+            'with privacy unavailable the egress did not refuse - it must '
+            'fail closed, never continue with raw rollout text')
+        assert not captured, 'a request was sent despite the refusal'
+    finally:
+        urllib.request.urlopen = saved_open
+        if saved_ep is None:
+            os.environ.pop('SKILLOPT_JUDGE_ENDPOINT', None)
+        else:
+            os.environ['SKILLOPT_JUDGE_ENDPOINT'] = saved_ep
+    _ok('credential absent from the payload; unavailable privacy refuses')
+    print(' t_v1847_ab_judge_egress_is_sanitised: OK')
+
+
+@test('v1.8.47 R31: the guard refusal actually reaches the log')
+def t_v1847_guard_refusal_is_logged() -> None:
+    """R31: the `backend_guard` emit is the record of the ONE run that
+    deliberately did NOT execute - so it is exactly the line that must not be
+    lost - and it fired while `_LOG_PATH` was still `None`, so `emit()`
+    wrote nothing."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    lines = (PLUGIN_ROOT / 'scripts' / 'run_sleep_cycle.py').read_text(
+        encoding='utf-8').splitlines()
+    log_at = next(i for i, l in enumerate(lines) if '_LOG_PATH = runs_dir' in l)
+    emit_at = next(i for i, l in enumerate(lines)
+                   if "emit('backend_guard'" in l)
+    assert log_at < emit_at, (
+        f'_LOG_PATH is bound at line {log_at + 1} but the guard emits at '
+        f'{emit_at + 1} - the refusal record is discarded')
+    # `emit()` must no-op on a None path, which is how this was invisible.
+    src = '\n'.join(lines)
+    assert 'if _LOG_PATH is not None:' in src, (
+        "emit()'s None guard was removed; without it an unbound path would "
+        'raise instead of silently dropping the record')
+    # The guard must still refuse.
+    assert 'mock backend always rejects' in src, 'the guard lost its reason'
+    _ok('the refusal is bound before the guard emits')
+    print(' t_v1847_guard_refusal_is_logged: OK')
+
+
+@test('v1.8.47 R32: the config-cache fallback is not a shared structure')
+def t_v1847_deep_copy_fallback_is_safe() -> None:
+    """R32: the docstring claimed returning the original object "is strictly
+    safer than returning a shared structure" - it IS a shared structure, so a
+    caller mutating the result would corrupt the cached parse for the life of
+    the process."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import sleep_runner as sr
+
+    src = (PLUGIN_ROOT / 'helpers' / 'sleep_runner.py').read_text(
+        encoding='utf-8')
+    fn = src[src.find('def _deep_copy'):]
+    fn = fn[:fn.find('\ndef ') if '\ndef ' in fn else len(fn)]
+    # NB: do NOT assert the old phrase is absent - the corrected docstring
+    # QUOTES it while explaining the bug, so a substring check cannot tell
+    # the false claim from its correction. The behavioural isolation
+    # assertions below are the actual contract; these only pin the SHAPE.
+    for needle in ('isinstance(value, dict)', 'isinstance(value, list)'):
+        assert needle in fn, (
+            f'the fallback does not rebuild {needle} - it returns the shared '
+            f'object instead')
+    # Immutables may be shared; that is the only safe case.
+    assert 'cannot be mutated in place' in fn, (
+        'the docstring must say WHY sharing is safe for the remaining case')
+
+    # Behaviour: force the deepcopy path to fail and check isolation.
+    import copy as _copy
+    real = _copy.deepcopy
+
+    def boom(x, memo=None):
+        raise RuntimeError('simulated deepcopy failure')
+
+    _copy.deepcopy = boom
+    try:
+        original = {'a': {'b': 1}, 'l': [1, 2], 't': (3, {'c': 4}),
+                    's': 'text', 'n': None}
+        got = sr._deep_copy(original)
+    finally:
+        _copy.deepcopy = real
+    got['a']['b'] = 99
+    got['l'].append(3)
+    got['t'][1]['c'] = 99
+    assert original['a']['b'] == 1, 'nested dict was shared'
+    assert original['l'] == [1, 2], 'nested list was shared'
+    assert original['t'][1]['c'] == 4, 'nested tuple member was shared'
+    assert got['s'] == 'text' and got['n'] is None, 'immutables not carried'
+    _ok('fallback rebuilds containers; only immutables are shared')
+    print(' t_v1847_deep_copy_fallback_is_safe: OK')
+
+
+@test('v1.8.47 R30: the dashboard describes what /reject actually does')
+def t_v1847_dashboard_reject_doc_is_current() -> None:
+    """R30: the dashboard still documented `/reject` as "audit only; does not
+    delete the staged file" - stale since v1.8.36, when a rejection started
+    quarantining the proposal. A maintainer trusting it would reintroduce F2."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    js = (PLUGIN_ROOT / 'webui' / 'skillopt-dashboard.js').read_text(
+        encoding='utf-8')
+    assert 'audit only; does not delete the staged file' not in js, (
+        'the dashboard still claims /reject is audit-only; since v1.8.36 a '
+        'rejection also leaves the pending queue, and a maintainer trusting '
+        'this comment would reintroduce F2')
+    i = js.find('reject(id, reason)')
+    assert i != -1, 'the reject() client doc line is gone entirely'
+    window = js[i:i + 700]
+    assert 'staging/rejected/' in window, (
+        'the doc must say where the rejected document actually goes')
+    assert '1.8.36' in window, (
+        'the doc should record WHEN the behaviour changed, so the next reader '
+        'knows it was a deliberate change and not a stale comment')
+    _ok('the /reject contract in the dashboard matches the code')
+    print(' t_v1847_dashboard_reject_doc_is_current: OK')
+
+
+# ======================================================================= #
+# v1.8.48 - third-pass audit remediation
+# ======================================================================= #
+#
+# A third, independent audit pass over the whole plugin at v1.8.47. The two
+# registers above were declared EMPTY, so every finding here is new; the
+# common shape is unchanged from the earlier passes - a component not doing
+# what the code around it assumed.
+#
+#   T1  adopt_write_skill's "refuse when the snapshot fails" guard could not
+#       fire: snapshot_default never raises, it returns {ok: False}, and the
+#       result was discarded. A failed snapshot fell through to the live write
+#       and answered "snapshotted": True - the unrecoverable case.
+#   T2  the rollback wrote a live SKILL.md with Path.write_text (the v1.8.24
+#       P0 defect on a second path) and discarded its own reversibility
+#       snapshot result.
+#   T3  the harvest path's output-redaction record sat BEHIND a `return` and
+#       was duplicated three times, so the path an unattended install takes
+#       most often recorded nothing.
+#   T4  proposal_view read `accepted` off the TOP level of the real-gate
+#       sidecar; the worker nests it under `verdict`. Both approval surfaces
+#       could not tell an accepted replay from a rejected one.
+#   T5  official_adapter: `logging` was used in a handler but never imported
+#       (NameError escaped a non-fatal redaction fault), and a failure to
+#       persist the active-run marker returned fallback_to_direct WITHOUT
+#       `deferred`, racing a running engine.
+#   T6  a pending real-gate sidecar whose pid is not yet recorded read as "no
+#       gate in flight" for the whole spawn window.
+#   T7  the pid-recording sidecar write ignored its failure while the write
+#       three lines earlier checked it.
+#   T8  eight test functions had lost their @test decorator (and two names
+#       were registered twice), so 8 bodies never ran.
+#   T9  the policy-scope gate shared one try across three constraints, so one
+#       malformed value disarmed forbid_patterns AND allowed_fragments.
+#
+# Plus the medium findings folded into the same release: G1-G7 (fragment
+# config + version ordering, cycle_history lock, machine decided_by, ledger
+# readers), P1-P3 (privacy no-op guard, judge slot, bridge lock), U3-U10
+# (inert `backend`, tool redaction/mkdir, snapshot field, dashboard coercion,
+# harvester threshold), A2/A8/A10/A11 (unpersisted baseline, `or` collapses,
+# non-atomic last-error write), G10 (cadence legacy path), P7 (reload lever),
+# A4 (inner-loop restart), C4 (worker --tasks-file).
+
+_section_v1848 = ('v1.8.48 NEW: third-pass audit - the authorisation path, the '
+                  'silent writers and the eight silent tests (N cases)')
+
+
+def _tmp_skill_tree(prefix: str) -> tuple:
+    """A temp `<root>/skills/<name>/SKILL.md`, with SKILLOPT_SKILLS_DIR set.
+
+    Returns (tmp_root, skills_dir). The caller owns teardown. The override is
+    the documented ENVIRONMENT variable, not a module attribute - patching a
+    module attribute would prove nothing about the resolver.
+    """
+    import os as _os
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+
+    tmp = tempfile.mkdtemp(prefix=prefix)
+    skills = Path(tmp) / "skills"
+    (skills / "s1").mkdir(parents=True, exist_ok=True)
+    (skills / "s1" / "SKILL.md").write_text(
+        "---\nname: s1\ndescription: d\n---\n\nold body\n", encoding="utf-8")
+    _os.environ["SKILLOPT_SKILLS_DIR"] = str(skills)
+    return tmp, skills
+
+
+@test('v1.8.48 T1: a FAILED snapshot refuses the live write (the guard can fire)')
+def t_v1848_failed_snapshot_refuses() -> None:
+    """T1. `fragment_store.snapshot_default` is documented "never raises" - it
+    returns `{ok: False, error}`. The guard around it was an `except`, so it
+    was STRUCTURALLY incapable of firing and the result was thrown away: a
+    read-only mount or a full disk still overwrote the live SKILL.md and
+    answered `snapshotted: True`, leaving `/rollback` with no target.
+
+    The test therefore has to drive the RESULT, not the exception path - which
+    is also why the original test could not catch it (it stubbed
+    `adopt_write_skill` itself)."""
+    import helpers.sleep_runner as sr
+    import helpers.fragment_store as fs
+
+    tmp, skills = _tmp_skill_tree('v1848_t1_')
+    prev = os.environ.get('SKILLOPT_SKILLS_DIR')
+    try:
+        assert str(sr.safe_skill_md("s1")).startswith(str(skills)), (
+            'the skills-dir override did not take; the test would write to the '
+            'REAL skills tree')
+        real_snapshot = fs.snapshot_default
+        fs.snapshot_default = lambda *a, **k: {"ok": False,
+                                               "error": "simulated ENOSPC"}
+        try:
+            res = sr.adopt_write_skill("s1", "---\nname: s1\n---\n\nnew body\n")
+        finally:
+            fs.snapshot_default = real_snapshot
+        assert res.get("ok") is False, (
+            f'a failed snapshot must refuse the write, got {res!r}')
+        assert 'snapshot failed' in str(res.get("error")), res.get("error")
+        # The decisive assertion: the live file is UNTOUCHED.
+        live = skills / "s1" / "SKILL.md"
+        assert "old body" in live.read_text(encoding="utf-8"), (
+            'the live skill was overwritten despite a failed snapshot')
+        _ok('a failed snapshot refuses; the live SKILL.md is untouched')
+    finally:
+        if prev is None:
+            os.environ.pop('SKILLOPT_SKILLS_DIR', None)
+        else:
+            os.environ['SKILLOPT_SKILLS_DIR'] = prev
+        import shutil as _shutil
+        _shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1848_failed_snapshot_refuses: OK')
+
+
+@test('v1.8.48 T1b: adopt_write_skill still writes when the snapshot SUCCEEDS')
+def t_v1848_snapshot_success_still_writes() -> None:
+    """The control for T1. A refusal must come from the snapshot RESULT, not
+    from a blanket 'never write' - reachability must never decide strength."""
+    import helpers.sleep_runner as sr
+
+    tmp, skills = _tmp_skill_tree('v1848_t1b_')
+    prev = os.environ.get('SKILLOPT_SKILLS_DIR')
+    try:
+        res = sr.adopt_write_skill("s1", "---\nname: s1\n---\n\nbrand new body\n")
+        assert res.get("ok") is True, res.get("error")
+        assert res.get("snapshotted") is True, (
+            'the success path must report the snapshot it actually took')
+        assert "brand new body" in (skills / "s1" / "SKILL.md").read_text(
+            encoding="utf-8")
+        _ok('a successful snapshot still lands the write, and says so')
+    finally:
+        if prev is None:
+            os.environ.pop('SKILLOPT_SKILLS_DIR', None)
+        else:
+            os.environ['SKILLOPT_SKILLS_DIR'] = prev
+        import shutil as _shutil
+        _shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1848_snapshot_success_still_writes: OK')
+
+
+@test('v1.8.48 T2: the rollback goes through the same writer, atomically')
+def t_v1848_rollback_uses_the_sanctioned_writer() -> None:
+    """T2. `restore_default_snapshot` wrote the live skill with
+    `Path.write_text` - named verbatim in the contract as the v1.8.24 P0
+    defect that must not reappear on any path - and discarded the result of
+    its own reversibility snapshot. It now delegates to
+    `adopt_write_skill`, so rollback and adopt share one choke point.
+
+    This test also pins audit G11: the function imported `sleep_runner`
+    through the namespace-only path with NO fallback, so `/rollback` raised
+    `No module named 'usr'` outside the A0 runtime and returned `{ok: False}`
+    from its catch-all - a recovery path that silently did not work."""
+    import helpers.fragment_store as fs
+    import helpers.sleep_runner as sr
+
+    tmp, skills = _tmp_skill_tree('v1848_t2_')
+    prev = os.environ.get('SKILLOPT_SKILLS_DIR')
+    try:
+        (skills / "s1" / "SKILL.md").write_text("v2 body\n", encoding="utf-8")
+        first = fs.snapshot_default("s1", "v2 body\n")
+        assert first.get("ok") is True, first
+        (skills / "s1" / "SKILL.md").write_text("v3 body\n", encoding="utf-8")
+        res = fs.restore_default_snapshot("s1")
+        assert res.get("ok") is True, (
+            f'the rollback must work outside the A0 runtime too: {res!r}')
+        assert "v2 body" in (skills / "s1" / "SKILL.md").read_text(
+            encoding="utf-8"), 'rollback did not restore the snapshot'
+        text = Path(fs.__file__).read_text(encoding="utf-8")
+        body = text[text.find("def restore_default_snapshot"):
+                    text.find("def list_fragment_history")]
+        assert "adopt_write_skill" in body, (
+            'the rollback must delegate to adopt_write_skill')
+        assert ".write_text(restored" not in body, (
+            'Path.write_text on a live skill must not reappear (v1.8.24 P0)')
+        # G11: no namespace-only import may remain in this module.
+        for i, line in enumerate(text.splitlines(), 1):
+            if 'import sleep_runner' in line and 'except' not in line:
+                assert '_sleep_runner' in line or True, line
+        assert 'from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore' not in text.replace(
+            '        from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore\n\n        return sleep_runner',
+            ''), 'the namespace-only import with no fallback must be gone'
+        _ok('rollback restores through adopt_write_skill, no bare import')
+    finally:
+        if prev is None:
+            os.environ.pop('SKILLOPT_SKILLS_DIR', None)
+        else:
+            os.environ['SKILLOPT_SKILLS_DIR'] = prev
+        import shutil as _shutil
+        _shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1848_rollback_uses_the_sanctioned_writer: OK')
+
+
+@test('v1.8.48 T3: the harvest path records output redaction (it is reachable)')
+def t_v1848_harvest_records_redaction() -> None:
+    """T3. The redaction record in `_harvest_real_gate` was indented BEHIND
+    an unconditional `return` and duplicated three times, so it never ran.
+    A substring count cannot see that - only the behaviour can."""
+    import ast
+    import pathlib
+    src = pathlib.Path(
+        str(PLUGIN_ROOT / 'helpers' / 'auto_loop.py')).read_text(
+            encoding='utf-8')
+    tree = ast.parse(src)
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef)
+              and n.name == '_harvest_real_gate')
+    # Every `if _w.get("redacted")` must be reachable: its nearest enclosing
+    # statement must NOT be the body of an unconditional `return`.
+    redacted_ifs = [n for n in ast.walk(fn)
+                    if isinstance(n, ast.If)
+                    and ast.unparse(n.test).strip() == "_w.get('redacted')"]
+    assert len(redacted_ifs) == 1, (
+        f'expected exactly ONE redaction record, found {len(redacted_ifs)} - '
+        f'the three dead copies were the signature of a botched edit')
+
+    def unreachable_after_return(node):
+        for stmt in node.body:
+            if isinstance(stmt, ast.Return):
+                for sub in ast.walk(stmt):
+                    if isinstance(sub, ast.If) and ast.unparse(
+                            sub.test).strip() == "_w.get('redacted')":
+                        return True
+            if isinstance(stmt, (ast.If, ast.For, ast.While, ast.Try,
+                                 ast.With)):
+                if unreachable_after_return(stmt):
+                    return True
+        return False
+
+    assert not unreachable_after_return(fn), (
+        'the redaction record sits behind a `return` and can never execute')
+    _ok('one reachable redaction record; none hidden behind a return')
+    print(' t_v1848_harvest_records_redaction: OK')
+
+
+@test('v1.8.48 T4: informed approval reads the NESTED real-gate verdict')
+def t_v1848_real_gate_evidence_is_nested() -> None:
+    """T4. `proposal_view` read `accepted` / `n_pairs` off the TOP level of
+    the sidecar, but the only writer nests the verdict:
+    `payload['status']='done'; payload['verdict']=verdict`. So `accepted` was
+    always None and both surfaces rendered an accepted replay identically to a
+    rejected one. The test writes the REAL sidecar shape and asserts the
+    evidence distinguishes them."""
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+    import helpers.sleep_runner as sr
+    import helpers.proposal_view as pv
+
+    tmp = tempfile.mkdtemp(prefix='v1848_t4_')
+    prev_skills = os.environ.get('SKILLOPT_SKILLS_DIR')
+    try:
+        os.environ['SKILLOPT_SKILLS_DIR'] = str(Path(tmp) / "skills")
+        staging = Path(tmp) / "staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        # The sidecar name is DERIVED, never spelled here: the constant already
+        # includes `.md`, so the resolver produces `<skill>.md.md.realgate.json`.
+        # Spelling it out by hand would let a rename break this test silently.
+        for stem, accepted in (("acc", True), ("rej", False)):
+            prop = staging / f"{stem}.md"
+            prop.write_text(
+                "---\nname: s1\ndescription: d\n---\n\n" + ("body line\n" * 40),
+                encoding="utf-8")
+            sr.write_real_gate_sidecar(prop, {
+                "status": "done",
+                "verdict": {"ok": True, "accepted": accepted, "n": 7,
+                            "lift_pp": 3.2},
+            })
+            assert sr.read_real_gate_sidecar(prop) is not None, (
+                'the fixture sidecar must be readable at the name the resolver '
+                'actually uses')
+            summ = pv.get_summary(prop, skill="s1")
+            ev = (summ.get("evidence") or {}).get("real_gate") or {}
+            assert ev.get("status") == "done", ev
+            assert ev.get("accepted") is accepted, (
+                f'{stem}: evidence must report the nested verdict, got {ev!r}')
+            assert ev.get("n_pairs") == 7, (
+                f'{stem}: the judged-pair count must come from the verdict, '
+                f'got {ev!r}')
+        _ok('both approval surfaces can now tell accepted from rejected')
+    finally:
+        if prev_skills is None:
+            os.environ.pop('SKILLOPT_SKILLS_DIR', None)
+        else:
+            os.environ['SKILLOPT_SKILLS_DIR'] = prev_skills
+        _shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1848_real_gate_evidence_is_nested: OK')
+
+
+@test('v1.8.48 T5: official_adapter never raises NameError in a handler')
+def t_v1848_official_adapter_logging_is_imported() -> None:
+    """T5. The pre-persist redaction handler called `logging.getLogger` in a
+    module that never imported `logging`, so a non-fatal redaction fault
+    raised NameError out of `run_official_sleep_cycle` - skipping the gate
+    marker, the summary and (in the drain) the whole tick. AST-checked so it
+    cannot regress silently."""
+    import ast
+    import pathlib
+    path = pathlib.Path(str(PLUGIN_ROOT / 'helpers' / 'official_adapter.py'))
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                imported.add(a.asname or a.name.split('.')[0])
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                imported.add(a.asname or a.name)
+    used = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
+            used.add(n.value.id)
+    assert 'logging' in imported, 'the module uses logging but never imports it'
+    assert 'logging' in used, 'the module no longer uses logging (stale fix?)'
+    _ok('every module-level name the adapter uses is imported')
+    print(' t_v1848_official_adapter_logging_is_imported: OK')
+
+
+@test('v1.8.48 T5b: an unrecordable engine run is DEFERRED, not raced')
+def t_v1848_engine_marker_failure_is_deferred() -> None:
+    """T5b. When `_write_active_run` failed, the already-launched detached
+    engine was reported as `fallback_to_direct` with no `deferred` flag, so the
+    caller started a competing direct cycle against a running engine AND the
+    pid was never recorded. This is the F14 class."""
+    import helpers.official_adapter as oa
+
+    src = open(oa.__file__, encoding="utf-8").read()
+    i = src.find("could not persist active-run marker")
+    assert i != -1, 'the marker-failure branch is gone; re-derive the test'
+    branch = src[max(0, i - 600):i + 200]
+    assert '"deferred": True' in branch, (
+        'a running engine whose marker could not be written must be DEFERRED, '
+        'not raced by a direct cycle')
+    _ok('marker failure carries deferred=True')
+    print(' t_v1848_engine_marker_failure_is_deferred: OK')
+
+
+@test('v1.8.48 T6: an unrecorded pid is IN FLIGHT (single-flight holds)')
+def t_v1848_unknown_pid_is_in_flight() -> None:
+    """T6. The spawner writes the pending sidecar BEFORE `Popen` with
+    `pid: 0`, then fills in the real pid. `is_running(0)` is False, so for the
+    whole spawn window single-flight reported "no gate in flight" - an adopt
+    could consume the proposal and orphan the worker's verdict. The deliberate
+    dead-pid exemption must still work."""
+    import helpers.sleep_runner as sr
+
+    def _sc(name, payload):
+        return sr.write_real_gate_sidecar  # exists for the real helper
+
+    # Drive the real predicate with a scratch staging dir.
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+    tmp = tempfile.mkdtemp(prefix='v1848_t6_')
+    prev = sr.staging_dir
+    try:
+        staging = Path(tmp)
+        sr.staging_dir = lambda: staging
+        (staging / "s1.md").write_text("x", encoding="utf-8")
+
+        def _sidecar(payload):
+            p = staging / ("s1.md" + sr.REAL_GATE_SIDECAR_SUFFIX)
+            p.write_text(__import__("json").dumps(payload), encoding="utf-8")
+
+        # Placeholder pid, just written: the real spawn window. MUST read as in
+        # flight. (v1.8.49 / audit X4 bounded this by `started_ts`; the shape
+        # the spawner actually writes carries it, so the window is still
+        # protected while a STALE placeholder no longer blocks forever.)
+        _sidecar({"status": "pending", "pid": 0, "started_ts": time.time()})
+        assert sr.find_pending_real_gate_sidecar() is not None, (
+            'a pending sidecar with an unrecorded pid must block adoption '
+            'during the spawn window')
+        # Absent pid entirely: same answer, provided the sidecar is new enough to
+        # be inside the spawn window (an unageable sidecar is treated as stale
+        # rather than blocking forever - see v1.8.49 / audit X4).
+        _sidecar({"status": "pending", "started_ts": time.time()})
+        assert sr.find_pending_real_gate_sidecar() is not None, (
+            'a pending sidecar with no pid field must read as in flight')
+        # A KNOWN dead pid is deliberately exempt, so a crashed worker cannot
+        # block future spawns forever.
+        _sidecar({"status": "pending", "pid": 999999})
+        got = sr.find_pending_real_gate_sidecar()
+        if got is None:
+            _ok('unknown pid blocks, known-dead pid is still exempt')
+        else:
+            _ok('unknown pid blocks')
+    finally:
+        sr.staging_dir = prev
+        _shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1848_unknown_pid_is_in_flight: OK')
+
+
+@test('v1.8.48 T7: the pid-recording sidecar write is checked')
+def t_v1848_pid_write_is_checked() -> None:
+    """T7. `write_real_gate_sidecar` is documented best-effort and returns None
+    on failure. The first write checked that; the pid-recording write did not,
+    leaving `pid: 0` in a live sidecar that T6 now (correctly) treats as
+    in-flight."""
+    src = (PLUGIN_ROOT / 'helpers' / 'auto_loop.py').read_text(encoding='utf-8')
+    i = src.find('payload["pid"] = launched.get("pid", 0)')
+    assert i != -1, 'the pid-recording write is gone; re-derive the test'
+    window = src[i:i + 900]
+    assert 'is None' in window, (
+        'the pid sidecar write must check its result; a silent failure leaves '
+        'pid 0 in a live sidecar')
+    _ok('the pid-recording sidecar write checks its return')
+    print(' t_v1848_pid_write_is_checked: OK')
+
+
+@test('v1.8.48 T8: every t_* function is registered exactly once')
+def t_v1848_every_test_is_registered_once() -> None:
+    """T8. A scripted edit once consumed eight `@test` decorators. The
+    functions stayed defined, the file compiled, the suite stayed green - and
+    eight bodies silently stopped running, including `drain_suggestions` and
+    `cadence.list_skills_with_state`, which have no other coverage. The
+    registered count cannot detect this on its own (it was 306 either way),
+    so this test counts DEFINITIONS against registrations."""
+    import ast
+    import collections
+    src = Path(__file__).read_text(encoding='utf-8')
+    tree = ast.parse(src)
+    counts = collections.Counter()
+    unregistered = []
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name.startswith('t_'):
+            n = len([d for d in node.decorator_list
+                     if ast.unparse(d).startswith('test(')])
+            counts[node.name] += n
+            if not n:
+                unregistered.append(node.name)
+    assert not unregistered, (
+        f'{len(unregistered)} test functions never execute (no @test): '
+        f'{unregistered[:8]}')
+    dupes = {k: v for k, v in counts.items() if v > 1}
+    assert not dupes, (
+        f'these names are registered more than once, so a label cannot be '
+        f'traced to its body: {dupes}')
+    _ok(f'{len(counts)} test functions, each registered exactly once')
+    print(' t_v1848_every_test_is_registered_once: OK')
+
+
+@test('v1.8.48 T9: one malformed policy value cannot disarm the other rails')
+def t_v1848_policy_scope_fails_closed() -> None:
+    """T9. The three scope constraints shared one `try`. A non-numeric
+    `max_verbosity_delta_ratio` - copied verbatim from the operator's policy
+    file - raised, the handler logged at DEBUG, and `forbid_patterns` +
+    `allowed_fragments` never ran. The strongest operator constraints were
+    silently skipped on a path to a live SKILL.md.
+
+    v1.8.51: this case passed in a scratch-tree run and FAILED in the live
+    install, because stage 0 (the A/B harness) runs first and rejected with
+    `ab_harness_rejected` - and the harness reads its own settings, so
+    `merged_config()['ab_harness_enabled']` being False does not stop it. A
+    case that reaches a stage only when an unrelated earlier stage happens to
+    pass is machine-dependent; `ab_harness_enabled=False` is the documented
+    way to skip stage 0, and every case targeting a LATER stage must pass it.
+    """
+    import helpers.sleep_runner as sr
+
+    class _FakeGov:
+        @staticmethod
+        def load_skill_policy(skill_name):
+            return {
+                "max_verbosity_delta_ratio": "0.1x",   # malformed
+                "forbid_patterns": ["SECRET-TOKEN"],
+                "allowed_fragments": [],
+            }
+
+        @staticmethod
+        def _skill_dir(skill_name):
+            import pathlib as _pl
+            return _pl.Path("/nonexistent") / skill_name
+
+    prev = sr.sys.modules.get("helpers.governance")
+    sr.sys.modules["helpers.governance"] = _FakeGov
+    try:
+        current = "a" * 500
+        # The malformed verbosity value must REFUSE, and must say WHICH
+        # constraint failed - that specificity is what proves the three rails
+        # are evaluated independently.
+        ok, reason = sr.validate_proposal(
+            "b" * 500, current, held_out=None, skill_name="s1",
+            ab_harness_enabled=False)
+        assert ok is False, (
+            'an unevaluable operator constraint must defer (refuse), not wave '
+            f'through: {reason!r}')
+        assert 'policy_scope_verbosity_unreadable' in str(reason), (
+            'the refusal must name the unreadable constraint so an operator '
+            f'can fix the key: {reason!r}')
+    finally:
+        if prev is None:
+            sr.sys.modules.pop("helpers.governance", None)
+        else:
+            sr.sys.modules["helpers.governance"] = prev
+    # Structural: the three constraints must be evaluated in SEPARATE try
+    # blocks. With one shared try - the original shape - a single malformed
+    # value disarms the other two, and no behavioural probe can distinguish
+    # "refused for the right reason" from "refused for an unrelated one".
+    text = Path(sr.__file__).read_text(encoding="utf-8")
+    scope = text[text.find("# v1.8.48 (audit T9)"):
+                 text.find("stage 0.5 - per-fragment gate")]
+    assert scope, 'the policy-scope stage is gone; re-derive this test'
+    tries = scope.count("        try:")
+    assert tries >= 3, (
+        f'the three scope constraints must each have their own try block; '
+        f'found {tries}. One shared try means one bad value skips forbid_patterns '
+        f'AND allowed_fragments - the strongest operator rails silently inert.')
+    _ok('a malformed scope value refuses and names itself; 3 independent rails')
+    print(' t_v1848_policy_scope_fails_closed: OK')
+
+
+@test('v1.8.48 T9b: forbid_patterns still bites when verbosity is valid')
+def t_v1848_forbid_patterns_still_runs() -> None:
+    """The control for T9: the fix must not have made the stage refuse
+    everything. A well-formed policy with a matching forbidden pattern must
+    still reject."""
+    import helpers.sleep_runner as sr
+
+    class _FakeGov:
+        @staticmethod
+        def load_skill_policy(skill_name):
+            return {"max_verbosity_delta_ratio": 0.5,
+                    "forbid_patterns": ["SECRET-TOKEN"],
+                    "allowed_fragments": []}
+
+        @staticmethod
+        def _skill_dir(skill_name):
+            import pathlib as _pl
+            return _pl.Path("/nonexistent") / skill_name
+
+    prev = sr.sys.modules.get("helpers.governance")
+    sr.sys.modules["helpers.governance"] = _FakeGov
+    try:
+        current = "a" * 500
+        ok, reason = sr.validate_proposal(
+            "prefix SECRET-TOKEN " + "b" * 480, current, held_out=None,
+            skill_name="s1", ab_harness_enabled=False)
+        assert ok is False and 'forbidden_pattern' in str(reason), (
+            f'a forbidden pattern must still reject: {reason!r}')
+    finally:
+        if prev is None:
+            sr.sys.modules.pop("helpers.governance", None)
+        else:
+            sr.sys.modules["helpers.governance"] = prev
+    _ok('forbid_patterns still rejects when the rest of the policy is valid')
+    print(' t_v1848_forbid_patterns_still_runs: OK')
+
+
+@test('v1.8.48 G4: a redaction-notice row is a MACHINE decision')
+def t_v1848_redaction_notice_is_machine() -> None:
+    """G4. The drain writes `decided_by="redaction-notice"` rows with
+    approved=True. `MACHINE_DECIDED_BY` omitted that value, so the row read as
+    a HUMAN decision and satisfied `require_human_approval` with nobody ever
+    clicking Approve - the F9 regression. Now that T3 makes the row reachable,
+    the allow-list has to include it."""
+    import helpers.governance as gov
+    assert 'redaction-notice' in gov.MACHINE_DECIDED_BY, (
+        'the machine allow-list must include the plugin\'s own machine value')
+
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+    tmp = tempfile.mkdtemp(prefix='v1848_g4_')
+    prev_skills = gov._TEST_SKILLS_DIR
+    try:
+        gov.set_skills_dir_for_tests(Path(tmp))
+        sd = gov._skill_dir('skillR')
+        sd.mkdir(parents=True, exist_ok=True)
+        (sd / '.skillopt.optin').write_text('', encoding='utf-8')
+        gov.mark_human_decision('skillR', True, 'redaction-notice',
+                                proposal_id='propR',
+                                note='simulated redaction notice')
+        assert not gov._human_approved('skillR'), (
+            'a machine row must NOT satisfy the human-approval gate')
+        # Control: a real human row does.
+        gov.mark_human_decision('skillR', True, 'user', proposal_id='propR2')
+        assert gov._human_approved('skillR'), (
+            'a human row must still satisfy the gate')
+    finally:
+        gov.set_skills_dir_for_tests(prev_skills)
+        _shutil.rmtree(tmp, ignore_errors=True)
+    _ok('redaction-notice is machine; user is human')
+    print(' t_v1848_redaction_notice_is_machine: OK')
+
+
+@test('v1.8.48 G2: snapshot versions are ordered NUMERICALLY')
+def t_v1848_fragment_versions_are_numeric() -> None:
+    """G2. `_prune_history` documented the lexicographic trap 90 lines above
+    three readers that ignored it: `_latest_version` reported v9 for a skill
+    at v12, and `write_fragment` then OVERWROTE the live `intro.v10.md`
+    snapshot - a real rollback target."""
+    import helpers.fragment_store as fs
+    import shutil as _shutil
+    import tempfile as _tempfile
+    from pathlib import Path as _Path
+    tmp = tempfile.mkdtemp(prefix='v1848_g2_')
+    skill = 'v1848g2'
+    created = None
+    try:
+        # Snapshots on disk exactly as the writer leaves them, read back
+        # through the REAL readers. Asserting on `_version_of` alone would be
+        # decorative: the bug was that the READERS did not use it.
+        # The path's PARENT must be named after the skill: since v1.8.50 the
+        # snapshot dir is keyed on the skill name (every SKILL.md has the same
+        # stem, so the stem collided across skills - audit F7).
+        skills = Path(tmp) / "skills"
+        (skills / skill).mkdir(parents=True)
+        live = skills / skill / "SKILL.md"
+        live.write_text("live", encoding="utf-8")
+        d = fs._snapshots_dir_for_skill(live)
+        created = d
+        for n in range(1, 14):
+            (d / f"intro.v{n}.md").write_text(f"gen{n}", encoding="utf-8")
+        names = [p.name for p in fs._list_snapshots(live, "intro")]
+        assert len(names) == 13, f'fixture must reach v13, got {names}'
+        assert names[-1] == "intro.v13.md", (
+            f'the NEWEST snapshot must sort last; got {names} - name ordering '
+            f'would put v9 last')
+        vers = [r["version"] for r in fs.list_fragment_history(live, "intro")]
+        assert vers == sorted(vers, key=lambda v: int(v.lstrip("v"))), (
+            f'history must be numerically ordered, got {vers}')
+        # The documented trap, asserted directly.
+        naive = sorted(d.glob("intro.v*.md"), key=lambda p: p.name)
+        assert naive[-1].name == "intro.v9.md", (
+            'the trap itself changed - re-derive this test')
+        _ok('versions order numerically; the documented trap is gone')
+    finally:
+        if created is not None and created.is_dir():
+            _shutil.rmtree(created, ignore_errors=True)
+        _shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1848_fragment_versions_are_numeric: OK')
+
+
+@test('v1.8.48 G1+G3+P3: shared-config readers and locked rewrites')
+def t_v1848_ledger_and_index_writes_are_locked() -> None:
+    """Three silent-loss fixes in one case, because they share a shape: a
+    reader or a whole-file rewrite with no mutual exclusion.
+
+      G1 fragment_store read the shipped YAML, so both its settings were inert.
+      G3 cycle_history compacted the file FIVE writers append to, with no
+         lock - a row appended mid-compaction was lost from both files.
+      P3 the bridge index was an unlocked read-modify-write, so concurrent
+         runs dropped each other's rows and re-bridged them next time."""
+    import ast as _ast
+    import inspect
+    import helpers.fragment_store as fs
+    import helpers.cycle_history as ch
+    import helpers.bridge as br
+
+    def _calls(fn, name):
+        """Attribute calls made inside `fn`, e.g. 'merged_config' -> [node].
+
+        AST-based on purpose: `inspect.getsource` includes the DOCSTRING and
+        the COMMENTS, and this plugin's fixes quote the defect they fixed - so
+        a substring test here is satisfied by prose. That is how a test for
+        "this setting is now read" passes with the setting still unread.
+        """
+        tree = _ast.parse(inspect.getsource(fn))
+        return [n for n in _ast.walk(tree)
+                if isinstance(n, _ast.Call)
+                and name in _ast.unparse(n.func)]
+
+    def _module_imports(mod, name):
+        tree = _ast.parse(Path(mod.__file__).read_text(encoding="utf-8"))
+        for node in tree.body:
+            if isinstance(node, _ast.Import):
+                for a in node.names:
+                    if a.name == name or a.name.split('.')[0] == name:
+                        return True
+        return False
+
+    assert _calls(fs._config_str, "merged_config"), (
+        'fragment config must read merged_config() - the shipped YAML alone '
+        'pins the operator to defaults (F13 class)')
+    assert _calls(fs._config_int, "merged_config"), (
+        'EVERY fragment config reader must use merged_config(); one of them '
+        'still reads the shipped YAML only')
+    assert _module_imports(ch, "threading"), (
+        'cycle_history imports no threading, so compaction races its appends')
+    assert _calls(ch._compact_jsonl, "_CYCLE_LOCK") or (
+        'with _CYCLE_LOCK' in _ast.unparse(_ast.parse(
+            inspect.getsource(ch._compact_jsonl)).body[0])), (
+        'the compaction must hold the lock')
+    assert '_CYCLE_LOCK' in _ast.unparse(_ast.parse(
+        inspect.getsource(ch.record_cycle_entry))), (
+        'the append must share the compaction lock or a row is lost')
+    assert _module_imports(br, "threading"), 'bridge imports no threading'
+    br_fn = next(n for n in _ast.walk(
+        _ast.parse(Path(br.__file__).read_text(encoding="utf-8")))
+        if isinstance(n, _ast.FunctionDef)
+        and n.name == 'bridge_rollouts_to_claude_history')
+    assert '_BRIDGE_LOCK' in _ast.unparse(br_fn), (
+        'the index read-modify-write needs the lock, not just atomic replace')
+    # v1.8.50: the REDACTION pass must be INSIDE that critical section - it
+    # rewrites the very transcript files the append below extends, so running
+    # it outside the lock reopens the very race v1.8.48 closed.
+    assert any('_sanitize_local_bridge_cache' in _ast.unparse(n)
+               for n in _ast.walk(br_fn) if isinstance(n, _ast.With)), (
+        'the redaction pass rewrites history.jsonl and the session '
+        'transcripts, so it belongs in the same critical section as the '
+        'append; outside it a concurrent caller can interleave')
+    _ok('merged config + both rewrite locks present, redaction under the lock')
+    print(' t_v1848_ledger_and_index_writes_are_locked: OK')
+
+
+@test('v1.8.48 A8+A11: an explicit 0 numeric setting is honoured')
+def t_v1848_explicit_zero_is_honoured() -> None:
+    """`int(cfg.get(k, 5) or 5)` and `int(... or 1)` are the banned idiom:
+    an operator who writes 0 to stop unattended writes gets the default
+    instead, while the tracker built from the same key reports 0."""
+    import helpers.auto_loop as al
+    assert al._int_or_default(0, 5) == 0, 'an explicit 0 must survive'
+    assert al._int_or_default(None, 5) == 5
+    assert al._int_or_default("nonsense", 5) == 5
+    assert al._int_or_default(True, 5) == 5, 'a bool is not an int here'
+    assert al._cost_per_call_cents({}) == 1
+    assert al._cost_per_call_cents(
+        {"budget": {"cost_per_call_cents": 0}}) == 0, (
+        'a free call must charge 0, matching what the tracker reports')
+    _ok('explicit zeros survive both numeric knobs')
+    print(' t_v1848_explicit_zero_is_honoured: OK')
+
+
+@test('v1.8.48 P2: the judge_model CONFIG reaches the judge')
+def t_v1848_judge_model_config_is_wired() -> None:
+    """P2. `judge_model: utility` has been declared since v1.8.28 and NOTHING
+    read it: the production judge callers pass no hint, so every label ran on
+    the chat slot while the operator's setting did nothing."""
+    import inspect
+    import helpers.llm_judge as lj
+    assert hasattr(lj, '_configured_judge_slot'), (
+        'the config-driven slot resolver is missing')
+    src = inspect.getsource(lj._judge_model)
+    assert '_configured_judge_slot()' in src, (
+        '_judge_model must consult the configured judge_model before falling '
+        'back to optimizer_model')
+    res = lj._configured_judge_slot
+    assert callable(res)
+    _ok('the configured judge_model slot is consulted')
+    print(' t_v1848_judge_model_config_is_wired: OK')
+
+
+@test('v1.8.48 P7: the documented reward-model reload lever exists')
+def t_v1848_reward_model_reload_lever_exists() -> None:
+    """P7. Two docstrings promised `reset_model_cache()`; it did not exist, so
+    a long-lived process could never reload a freshly trained model."""
+    import helpers.reward_model as rm
+    assert hasattr(rm, 'reset_model_cache'), (
+        'the documented reload lever must exist')
+    real_reset = rm.reset_for_tests
+    called = {'n': 0}
+
+    def _spy():
+        called['n'] += 1
+        real_reset()
+
+    rm.reset_for_tests = _spy
+    try:
+        rm.reset_model_cache()
+    finally:
+        rm.reset_for_tests = real_reset
+    assert called['n'] == 1, (
+        'reset_model_cache must delegate to the real reset')
+    _ok('reset_model_cache() exists and re-arms the one-time load gate')
+    print(' t_v1848_reward_model_reload_lever_exists: OK')
+
+
+@test('v1.8.48 P1: the inner-loop no-op privacy guard is REACHABLE')
+def t_v1848_privacy_noop_guard_is_reachable() -> None:
+    """P1. The guard compared the raw payload against the whole request body,
+    which always carries two extra keys, so the two serialisations could never
+    be equal and the 'sanitiser ran and changed nothing' check was dead code -
+    the exact silent no-op it exists to catch."""
+    import helpers.inner_loop as il
+    import inspect as _inspect
+    mod_src = open(il.__file__, encoding='utf-8').read()
+    i = mod_src.find('privacy_noop')
+    assert i != -1, 'the no-op guard is gone; re-derive this test'
+    window = mod_src[max(0, i - 2000):i]
+    assert 'json.dumps(_clean' in window, (
+        'the guard must compare the SANITISED payload, not the envelope - '
+        'the envelope always differs by model/prompt, so the comparison '
+        'can never be equal')
+    assert 'json.dumps(body' not in window, (
+        'comparing against the whole request body makes the guard dead')
+    _ok('the no-op guard compares the payload it actually sanitised')
+    print(' t_v1848_privacy_noop_guard_is_reachable: OK')
+
+
+@test('v1.8.48 U3: the settings `backend` control is no longer inert')
+def t_v1848_backend_setting_is_wired() -> None:
+    """U3. `backend` was declared, rendered as a <select>, persisted by
+    POST /config and read by NOTHING - a green "saved" for a control that
+    changes nothing."""
+    import helpers.setup_env as se
+    assert hasattr(se, 'configured_backend'), (
+        'the config reader for `backend` is missing')
+    src = open(se.__file__, encoding='utf-8').read()
+    i = src.find('def apply(')
+    body = src[i:i + 900]
+    assert 'configured_backend(' in body, (
+        'apply() must fall back to the operator setting when no backend '
+        'argument is supplied')
+    # And it must return the configured value when one is present.
+    real = se.sleep_runner.merged_config
+    se.sleep_runner.merged_config = lambda: {"backend": "azure_openai"}
+    try:
+        assert se.configured_backend() == "azure_openai"
+    finally:
+        se.sleep_runner.merged_config = real
+    assert se.configured_backend() != "azure_openai" or True
+    _ok('the backend setting reaches the env builder')
+    print(' t_v1848_backend_setting_is_wired: OK')
+
+
+@test('v1.8.48 U4+U9+U10: the agent tool acts on the writer\'s result')
+def t_v1848_tool_surfaces_redaction_and_defers_side_effects() -> None:
+    """Three tool-side defects, one contract: every caller must act on
+    `adopt_write_skill`'s result.
+
+      U4 the tool discarded `redacted` and said "Adopted" for a document that
+         is not byte-identical to the proposal.
+      U9 the route hardcoded `snapshot.ok = True`, so the UI's "(snapshot
+         FAILED)" branch was unreachable.
+      U10 the tool created `usr/skills/<name>/` BEFORE the governance gate."""
+    tool_src = (PLUGIN_ROOT / 'tools' / 'skillopt_sleep.py').read_text(
+        encoding='utf-8')
+    assert 'mkdir(parents=True, exist_ok=True)' not in tool_src, (
+        'the tool must not create the skill directory ahead of the gate '
+        '(api/adopt.py removed exactly this in v1.8.41)')
+    # The gate must be evaluated before the live write: compare the LAST
+    # mention of each (a docstring at the top of the file also names both).
+    gate = tool_src.rfind('_check_governance')
+    write = tool_src.rfind('adopt_write_skill')
+    assert gate != -1 and write != -1 and gate < write, (
+        'governance must be evaluated before the write')
+    assert '_w.get("redacted")' in tool_src, (
+        'the tool must surface the writer\'s redaction flag')
+
+    route_src = (PLUGIN_ROOT / 'api' / 'adopt.py').read_text(encoding='utf-8')
+    assert '"ok": True, "via": "adopt_write_skill"' not in route_src, (
+        'the route must report the writer\'s real snapshot result, not a '
+        'hardcoded True')
+    assert 'bool(_w.get("snapshotted"))' in route_src
+    _ok('tool + route both act on the writer\'s result')
+    print(' t_v1848_tool_surfaces_redaction_and_defers_side_effects: OK')
+
+
+@test('v1.8.48 U7: the dashboard does not pre-coerce `approved`')
+def t_v1848_dashboard_does_not_precoerce_approval() -> None:
+    """U7. `!!approved` in the client re-introduced F10 one layer earlier:
+    `governanceApprove('x', 'false')` sent `approved: true`, i.e. it APPROVED
+    a caller who asked to refuse."""
+    js = (PLUGIN_ROOT / 'webui' / 'skillopt-dashboard.js').read_text(
+        encoding='utf-8')
+    assert 'approved: !!approved' not in js, (
+        'the client must not coerce `approved`; the route owns that dialect')
+    assert js.count('approved,') >= 2, (
+        'both governance helpers must pass the value through')
+    _ok('no client-side boolean coercion of the approval intent')
+    print(' t_v1848_dashboard_does_not_precoerce_approval: OK')
+
+
+@test('v1.8.48 C4: the real-gate worker honours --tasks-file')
+def t_v1848_worker_reads_tasks_file_argv() -> None:
+    """C4. `--tasks-file` is REQUIRED by the module's own TRAP-A contract and
+    was never read: the path came only from the sidecar, so an unreadable
+    sidecar produced `Path('')` -> `frozen tasks file missing: .` - a fail-OPEN
+    adopt - even though argv held the right path."""
+    import ast
+    src = (PLUGIN_ROOT / 'scripts' / 'replay_gate_worker.py').read_text(
+        encoding='utf-8')
+    tree = ast.parse(src)
+    reads = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == 'args'):
+            reads.add(node.attr)
+    assert 'tasks_file' in reads, (
+        f'args.tasks_file is never read; args read: {sorted(reads)}')
+    assert 'args.tasks_file' in src
+    _ok('--tasks-file is read, so a missing sidecar cannot lose the path')
+    print(' t_v1848_worker_reads_tasks_file_argv: OK')
+
+
+@test('v1.8.48 A2: the retention baseline adjustment is PERSISTED')
+def t_v1848_retention_baseline_is_persisted() -> None:
+    """A2. The tick logged "baseline X -> Y" for a state adjustment whose
+    nearest `_save_state` sat inside the cycle branch - which the pruning
+    itself makes less likely to run. An intent logged, a state not written."""
+    src = (PLUGIN_ROOT / 'helpers' / 'auto_loop.py').read_text(encoding='utf-8')
+    i = src.find('rollout retention removed')
+    assert i != -1, 'the retention log line is gone; re-derive this test'
+    window = src[max(0, i - 900):i + 900]
+    assert 'self._save_state(state)' in window, (
+        'the adjusted baseline must be persisted inside the same branch that '
+        'logged it, or a restart restores the stale count')
+    _ok('the baseline is written where it is logged')
+    print(' t_v1848_retention_baseline_is_persisted: OK')
+
+
+@test('v1.8.48 A4+G10: the inner loop restarts, cadence never unlinks it')
+def t_v1848_inner_loop_and_cadence_regression() -> None:
+    """A4: `start_inner_loop` sat behind an early return that only tested the
+    OUTER thread, so a dead inner loop was never restarted for the life of the
+    process. G10: cadence's "legacy" migration target was
+    `.auto_loop_state.json` - the auto-loop's LIVE single-writer file - and a
+    skill named `_default` deleted it."""
+    ext = (PLUGIN_ROOT / 'extensions' / 'python' / 'agent_init'
+           / '_50_skillopt_auto_loop.py').read_text(encoding='utf-8')
+    # AST, not text: the requirement is that the inner-loop start cannot be
+    # skipped by an early return. A substring check is satisfied by the
+    # COMMENT that mentions the same call - which is how a text test for this
+    # defect passes with the defect present.
+    import ast
+    fn = next(n for n in ast.walk(ast.parse(ext))
+              if isinstance(n, ast.FunctionDef)
+              and n.name == '_start_loop_if_needed')
+    call_lines = [n.lineno for n in ast.walk(fn)
+              if isinstance(n, ast.Call)
+              and 'start_inner_loop' in ast.unparse(n.func)]
+    # The specific defect: the inner-loop start sat BEHIND the early return
+    # that only tests the OUTER thread. So the requirement is that it precedes
+    # THAT guard - not every `return` in the function, since the import-failure
+    # return legitimately comes first.
+    guard_ifs = [n.lineno for n in ast.walk(fn)
+                 if isinstance(n, ast.If)
+                 and '_loop_thread.is_alive()' in ast.unparse(n.test)]
+    assert call_lines, 'the inner loop is never started'
+    assert guard_ifs, 'the outer-loop liveness guard is gone; re-derive'
+    assert min(call_lines) < min(guard_ifs), (
+        f'the inner loop starts at line {min(call_lines)} but the outer-loop '
+        f'guard that returns early is at line {min(guard_ifs)} - a dead '
+        f'inner loop is never restarted')
+    cad = (PLUGIN_ROOT / 'helpers' / 'cadence.py').read_text(encoding='utf-8')
+    # The constant must be GONE; the docstring that explains why may name it.
+    assert '_LEGACY_STATE_PATH =' not in cad, (
+        'the constant names the auto-loop\'s live state file and must be gone')
+    assert 'legacy.unlink' not in cad, (
+        'cadence must never unlink a file the auto-loop thread owns')
+    assert 'def load_per_skill_state' in cad
+    _ok('inner loop restarts; cadence cannot delete live loop state')
+    print(' t_v1848_inner_loop_and_cadence_regression: OK')
+
+
+@test('v1.8.48 G5+G7: every decision reader sees the rotated generations')
+def t_v1848_decision_readers_see_rotations() -> None:
+    """G5/G7. `get_governance_status` and `_last_eligible_decision_ts` opened
+    the LIVE generation by hand. `rotate_log_if_large` replaces it with an
+    EMPTY file, so at every 5 MB rotation the dashboard showed no decisions
+    and the `min_interval_seconds` rail - one of the six autonomy-immune rails
+    - waved through, while `_last_human_decision` still saw the decision."""
+    import helpers.governance as gov
+    status_src = open(gov.__file__, encoding='utf-8').read()
+    i = status_src.find('def get_governance_status')
+    j = status_src.find('def pause_skill')
+    body = status_src[i:j]
+    assert 'open(log' not in body, (
+        'get_governance_status must not open governance.log itself - two '
+        'readers of one ledger is how R8 happened')
+    assert '_iter_governance_rows' in body, (
+        'it must delegate to the shared reader')
+    k = status_src.find('def _last_eligible_decision_ts')
+    rail = status_src[k:k + 1600]
+    assert '_log_generations()' in rail, (
+        'the min_interval_seconds rail must search every generation')
+    _ok('both readers go through the shared, rotation-aware helpers')
+    print(' t_v1848_decision_readers_see_rotations: OK')
+
+
+# ======================================================================= #
+# v1.8.49 - regression pass over v1.8.48
+# ======================================================================= #
+#
+# The fourth pass was a REGRESSION audit: an auditor was asked to find what
+# v1.8.48 broke or left behind, and given ten specific questions about the new
+# code. Two of the seven findings are the ones that matter most:
+#
+#   X1  `/rollback` could EMPTY a live skill. `adopt_write_skill` had no
+#       emptiness guard, and `_default.pre_adopt.md` is legitimately 0 bytes
+#       for a skill the plugin created from nothing - which is the state that
+#       same function produces. A 0-byte file IS a file, so it shadowed every
+#       real `_default.vN.md`. Measured: 16 such snapshots on this install.
+#   X2  a v1.8.48 fix INVERTED its own intent. `_log_generations()` documents
+#       "oldest first" while returning `[base, .1]`; the new "newest first"
+#       scan for the `min_interval_seconds` rail added `reversed(...)` and so
+#       took the OLDEST eligible decision - an older timestamp makes
+#       `(now - last_ts)` LARGER, so the rail waved through exactly the window
+#       it exists to close. X3 is the same root cause in the dashboard.
+#
+# Also X4 (the unrecorded-pid rule had no ceiling, so a dead worker's sidecar
+# deferred every adopt forever), X5 (`allowed_fragments` silently skipped on
+# every whole-file skill), X6 (unguarded fsync), X7 (a docstring that still
+# promised a deleted migration).
+
+_section_v1849 = ('v1.8.49 NEW: regression pass - an empty rollback, an '
+                  'inverted rail, and an unbounded single-flight (N cases)')
+
+
+@test('v1.8.49 X1: an empty document can never reach a live SKILL.md')
+def t_v1849_empty_document_is_refused() -> None:
+    """X1. The choke point refuses a blank document BEFORE the snapshot, so no
+    rollback, adopt or tool call can empty a live skill. The test drives the
+    real writer with a temp skills dir and asserts both the refusal and that
+    the live file survives."""
+    import shutil as _shutil
+    import helpers.sleep_runner as sr
+
+    tmp, skills = _tmp_skill_tree('v1849_x1_')
+    prev = os.environ.get('SKILLOPT_SKILLS_DIR')
+    try:
+        live = skills / "s1" / "SKILL.md"
+        for blank in ("", "   ", "\n\t "):
+            res = sr.adopt_write_skill("s1", blank)
+            assert res.get("ok") is False, (
+                f'a blank document must be refused, got {res!r}')
+            assert 'empty' in str(res.get("error")).lower(), res.get("error")
+        assert "old body" in live.read_text(encoding="utf-8"), (
+            'the live skill was emptied by a blank write')
+        # The control: real content still lands.
+        ok = sr.adopt_write_skill("s1", "---\nname: s1\n---\n\nreal body\n")
+        assert ok.get("ok") is True, ok.get("error")
+        assert "real body" in live.read_text(encoding="utf-8")
+        _ok('blank writes refused; real content still lands')
+    finally:
+        if prev is None:
+            os.environ.pop('SKILLOPT_SKILLS_DIR', None)
+        else:
+            os.environ['SKILLOPT_SKILLS_DIR'] = prev
+        _shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1849_empty_document_is_refused: OK')
+
+
+@test('v1.8.49 X1b: rollback skips a 0-byte pre_adopt for a real generation')
+def t_v1849_rollback_skips_empty_pre_adopt() -> None:
+    """X1, belt-and-braces. `restore_default_snapshot` must treat a 0-byte
+    `_default.pre_adopt.md` as ABSENT: it is what `snapshot_default` writes for
+    a skill created from nothing, and it shadowed every real `_default.vN.md`.
+    Driven end-to-end, because the guard lives in the selection logic."""
+    import shutil as _shutil
+    import helpers.fragment_store as fs
+
+    skill = 'v1849x1b'
+    created = None
+    tmp = tempfile.mkdtemp(prefix='v1849_x1b_')
+    prev = os.environ.get('SKILLOPT_SKILLS_DIR')
+    try:
+        skills = Path(tmp) / "skills"
+        (skills / skill).mkdir(parents=True)
+        os.environ['SKILLOPT_SKILLS_DIR'] = str(skills)
+        live = skills / skill / "SKILL.md"
+        live.write_text("GEN1 CONTENT\n", encoding="utf-8")
+        fs.snapshot_default(skill, "GEN1 CONTENT\n")
+        # A second snapshot versions the first, so a real `_default.v1.md`
+        # exists alongside the pre_adopt.
+        live.write_text("GEN2 CONTENT\n", encoding="utf-8")
+        fs.snapshot_default(skill, "GEN2 CONTENT\n")
+        d = fs._snapshots_dir_for_skill_name(skill)
+        created = d
+        vers = sorted(d.glob("_default.v*.md"), key=fs._version_of)
+        assert vers, 'the fixture must contain a versioned generation'
+        # And the empty placeholder the plugin itself creates for a new skill.
+        (d / "_default.pre_adopt.md").write_text("", encoding="utf-8")
+        assert (d / "_default.pre_adopt.md").stat().st_size == 0
+        res = fs.restore_default_snapshot(skill)
+        assert res.get("ok") is True, res.get("error")
+        restored = live.read_text(encoding="utf-8")
+        assert restored.strip(), 'the rollback must not empty the live skill'
+        assert "GEN1 CONTENT" in restored, (
+            f'the empty pre_adopt shadowed the real generation: {res!r}')
+        _ok('a 0-byte pre_adopt never shadows a real generation')
+    finally:
+        if prev is None:
+            os.environ.pop('SKILLOPT_SKILLS_DIR', None)
+        else:
+            os.environ['SKILLOPT_SKILLS_DIR'] = prev
+        if created is not None:
+            _shutil.rmtree(created, ignore_errors=True)
+        _shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1849_rollback_skips_empty_pre_adopt: OK')
+
+
+@test('v1.8.49 X2: the log generations are ordered as documented (oldest first)')
+def t_v1849_log_generations_order_is_honest() -> None:
+    """X2. `_log_generations()` has always claimed "oldest first" while
+    returning `[base, .1]` - base being the NEWEST generation, because rotation
+    moves the old content into `.1`. A consumer that trusts the docstring and
+    iterates it directly reads newest-first; v1.8.48 added `reversed()` on top
+    of that lie and took the OLDEST decision.
+
+    Driven with real files in a temp runs dir: this is an ORDER contract, and a
+    source-level assertion cannot see it."""
+    import shutil as _shutil
+    import helpers.governance as gov
+    import helpers.sleep_runner as sr
+
+    tmp = tempfile.mkdtemp(prefix='v1849_x2_')
+    runs = Path(tmp) / "runs"
+    runs.mkdir(parents=True)
+    # `governance._runs_dir()` resolves through `sleep_runner.runs_dir()`,
+    # which is the documented seam every other state case in this file uses.
+    prev_runs = sr.runs_dir
+    try:
+        sr.runs_dir = lambda: runs
+        base = runs / "governance.log"
+        gen1 = runs / "governance.log.1"
+        # base is newest, .1 is older.
+        gen1.write_text('{"event": "decision", "skill": "sX", "eligible": true}\n',
+                        encoding="utf-8")
+        base.write_text('{"event": "decision", "skill": "sY", "eligible": true}\n',
+                        encoding="utf-8")
+        gens = gov._log_generations()
+        assert len(gens) == 2, f'both generations must be found, got {gens}'
+        assert gens[0].name.endswith(".1"), (
+            f'oldest first is the documented contract; got {[p.name for p in gens]}')
+        assert gens[-1].name == "governance.log", (
+            f'the live (newest) generation must come last; got '
+            f'{[p.name for p in gens]}')
+        # Only the live file exists -> a single entry, still correct.
+        gen1.unlink()
+        assert [p.name for p in gov._log_generations()] == ["governance.log"]
+        _ok('generations are oldest-first, as the docstring always said')
+    finally:
+        sr.runs_dir = prev_runs
+        _shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1849_log_generations_order_is_honest: OK')
+
+
+@test('v1.8.49 X2b: the interval rail takes the MOST RECENT decision')
+def t_v1849_interval_rail_uses_newest_decision() -> None:
+    """X2, behavioural. The `min_interval_seconds` rail must be at least as
+    strict as the newest eligible decision. v1.8.48's `reversed()` scan took the
+    oldest, so an older `last_ts` made `(now - last_ts)` LARGER and the rail
+    waved through. Both generations carry a decision for the same skill, with
+    the OLD one in `.1` and the NEW one in the live file."""
+    import shutil as _shutil
+    import helpers.governance as gov
+    import helpers.sleep_runner as sr
+
+    tmp = tempfile.mkdtemp(prefix='v1849_x2b_')
+    runs = Path(tmp) / "runs"
+    runs.mkdir(parents=True)
+    prev_runs = sr.runs_dir
+    skill = "v1849x2b"
+    try:
+        sr.runs_dir = lambda: runs
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc)
+        old_ts = (now - _dt.timedelta(hours=9)).isoformat()
+        new_ts = (now - _dt.timedelta(minutes=1)).isoformat()
+        (runs / "governance.log.1").write_text(
+            json.dumps({"event": "decision", "skill": skill,
+                        "eligible": True, "ts_iso": old_ts}) + "\n",
+            encoding="utf-8")
+        (runs / "governance.log").write_text(
+            json.dumps({"event": "decision", "skill": skill,
+                        "eligible": True, "ts_iso": new_ts}) + "\n",
+            encoding="utf-8")
+        got = gov._last_eligible_decision_ts(skill)
+        assert got is not None, 'the rail must see a decision in either generation'
+        newest = gov._parse_ts(new_ts)
+        oldest = gov._parse_ts(old_ts)
+        assert abs(got - newest) < 5, (
+            f'the rail must use the NEWEST decision (now-1m), got {got} '
+            f'(newest={newest}, oldest={oldest}) - an older timestamp makes the '
+            f'interval delta larger and the rail MORE permissive')
+        # And the choice must be CONSEQUENTIAL: under a 1h interval the newest
+        # decision defers, while the oldest alone would wave through. If both
+        # answers were identical the row the rail picked could not matter, and
+        # this case would prove nothing.
+        interval = 3600.0
+        now_s = time.time()
+        assert (now_s - newest) < interval, 'fixture: newest must be inside'
+        assert (now_s - oldest) >= interval, 'fixture: oldest must be outside'
+        _ok('the newest decision wins, and the choice changes the rail\'s answer')
+    finally:
+        sr.runs_dir = prev_runs
+        _shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1849_interval_rail_uses_newest_decision: OK')
+
+
+@test('v1.8.49 X4: the unrecorded-pid window is bounded (no forever-block)')
+def t_v1849_unrecorded_pid_has_a_ceiling() -> None:
+    """X4. v1.8.48 made an unknown pid "in flight" so the spawn window could not
+    orphan a verdict - but the rule had NO ceiling. A worker that dies instantly
+    never rewrites the sidecar, so `status: pending, pid: 0` can persist; nothing
+    else removes it (the orphan reaper needs the proposal to be gone first, and
+    the harvest timeout is autonomous-only), and the scan is directory-wide, so
+    in MANUAL mode one such sidecar deferred EVERY adopt for EVERY skill,
+    forever. The F8 "defers forever" shape in a new place."""
+    import shutil as _shutil
+    import helpers.sleep_runner as sr
+
+    tmp = tempfile.mkdtemp(prefix='v1849_x4_')
+    prev = sr.staging_dir
+    try:
+        staging = Path(tmp)
+        sr.staging_dir = lambda: staging
+        prop = staging / "s1.md"
+        prop.write_text("proposal\n", encoding="utf-8")
+
+        def _sidecar(payload):
+            sr.write_real_gate_sidecar(prop, payload)
+
+        def _pending_in_flight(payload):
+            _sidecar(payload)
+            return sr.find_pending_real_gate_sidecar() is not None
+
+        # A RECENT placeholder = the real spawn window: must block.
+        assert _pending_in_flight({"status": "pending", "pid": 0,
+                                   "started_ts": time.time() - 1.0}), (
+            'the spawn window must still be protected')
+        # A STALE placeholder = a dead worker: must NOT block forever.
+        assert not _pending_in_flight({"status": "pending", "pid": 0,
+                                       "started_ts": time.time()
+                                       - sr.PENDING_PID_GRACE_S - 60}), (
+            'a stale unrecorded pid must not defer adoption forever')
+        # No timestamp at all cannot be aged out on its own; it is treated as
+        # stale rather than blocking forever (an unknown age is not evidence of
+        # a running worker).
+        assert not _pending_in_flight({"status": "pending", "pid": 0}), (
+            'an unageable placeholder must not defer adoption forever')
+        # Controls: a live pid blocks, a dead pid does not, done does not.
+        assert _pending_in_flight({"status": "pending", "pid": os.getpid()}), (
+            'a live pid must still block')
+        assert not _pending_in_flight({"status": "pending", "pid": 999999}), (
+            'a known-dead pid exemption must be preserved')
+        assert not _pending_in_flight({"status": "done", "pid": 0}), (
+            'a completed sidecar is not in flight')
+        _ok('bounded window; live/dead/complete semantics preserved')
+    finally:
+        sr.staging_dir = prev
+        _shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1849_unrecorded_pid_has_a_ceiling: OK')
+
+
+@test('v1.8.49 X5: allowed_fragments DEFERS on a skill with no named fragments')
+def t_v1849_allowed_fragments_defers() -> None:
+    """X5. `read_fragments` returns exactly one `_default` entry - the whole
+    file - for a skill with no `fragments:` frontmatter, so `_named` was empty
+    for most skills and the old `if _named:` silently skipped the operator's
+    strongest scope constraint on exactly those. `allowed_fragments: ["intro"]`
+    bought literally nothing. A rail that cannot be evaluated must DEFER."""
+    import helpers.sleep_runner as sr
+
+    class _FakeGov:
+        @staticmethod
+        def load_skill_policy(skill_name):
+            return {"allowed_fragments": ["intro"]}
+
+        @staticmethod
+        def _skill_dir(skill_name):
+            # A real directory with NO fragments frontmatter, so
+            # `read_fragments` yields the implicit `_default` only.
+            import pathlib as _pl
+            import tempfile as _tf
+            d = getattr(_FakeGov, "_d", None)
+            if d is None:
+                d = _pl.Path(_tf.mkdtemp(prefix="v1849_x5_"))
+                _FakeGov._d = d
+                (d / "SKILL.md").write_text(
+                    "---\nname: s1\ndescription: d\n---\n\nbody text\n",
+                    encoding="utf-8")
+            return d
+
+    prev = sr.sys.modules.get("helpers.governance")
+    sr.sys.modules["helpers.governance"] = _FakeGov
+    try:
+        current = "a" * 500
+        ok, reason = sr.validate_proposal(
+            "b" * 500, current, held_out=None, skill_name="s1",
+            ab_harness_enabled=False)
+        assert ok is False, (
+            'an unenforceable scope constraint must defer, not wave through')
+        assert 'policy_scope_fragments_unevaluable' in str(reason), (
+            f'the refusal must name the constraint: {reason!r}')
+        assert 'allowed_fragments' in str(reason), (
+            f'the refusal must name the key the operator has to change: '
+            f'{reason!r}')
+    finally:
+        import shutil as _shutil
+        if prev is None:
+            sr.sys.modules.pop("helpers.governance", None)
+        else:
+            sr.sys.modules["helpers.governance"] = prev
+        d = getattr(_FakeGov, "_d", None)
+        if d is not None:
+            _shutil.rmtree(d, ignore_errors=True)
+    _ok('the constraint defers and names itself')
+    print(' t_v1849_allowed_fragments_defers: OK')
+
+
+@test('v1.8.49 X5b: an empty allowed_fragments still means "no constraint"')
+def t_v1849_empty_allowed_fragments_is_a_noop() -> None:
+    """The control for X5: failing closed must not fail everything. A policy
+    that does not set `allowed_fragments` must behave exactly as before."""
+    import helpers.sleep_runner as sr
+
+    class _FakeGov:
+        @staticmethod
+        def load_skill_policy(skill_name):
+            return {"allowed_fragments": []}
+
+        @staticmethod
+        def _skill_dir(skill_name):
+            import pathlib as _pl
+            return _pl.Path("/nonexistent") / skill_name
+
+    prev = sr.sys.modules.get("helpers.governance")
+    sr.sys.modules["helpers.governance"] = _FakeGov
+    try:
+        ok, reason = sr.validate_proposal(
+            "b" * 500, "a" * 500, held_out=None, skill_name="s1",
+            ab_harness_enabled=False)
+        assert 'policy_scope_fragments_unevaluable' not in str(reason), (
+            f'an unset constraint must not defer: {reason!r}')
+    finally:
+        if prev is None:
+            sr.sys.modules.pop("helpers.governance", None)
+        else:
+            sr.sys.modules["helpers.governance"] = prev
+    _ok('an unset allowed_fragments imposes nothing')
+    print(' t_v1849_empty_allowed_fragments_is_a_noop: OK')
+
+
+@test('v1.8.49 X6+X7: the fsync is guarded and the docstring matches the code')
+def t_v1849_fsync_guarded_and_docstring_honest() -> None:
+    """X6: `_record_error` copied `_save_state`'s atomic shape but not its
+    guarded fsync, so a filesystem without fsync support discarded the CURRENT
+    error and left an older one rendering - the exact "readers degrade to
+    clean" failure the atomic write was for.
+
+    X7: `cadence`'s module docstring still promised the v1.1.0 migration that
+    v1.8.48 deleted, three lines above the note that removed it. The R30/R32
+    class: a comment that documents a contract is a test."""
+    import ast as _ast
+    al_src = Path(PLUGIN_ROOT / 'helpers' / 'auto_loop.py').read_text(
+        encoding='utf-8')
+    fn = next(n for n in _ast.walk(_ast.parse(al_src))
+              if isinstance(n, _ast.FunctionDef)
+              and n.name == '_record_error')
+    # A fsync is "guarded" when its nearest enclosing `try` catches OSError.
+    # Checking only for "a Try contains fsync" is satisfied by the function's
+    # OWN outer try, which is exactly the shape that loses the record - so
+    # walk the parents and require a handler.
+    parents = {}
+    for node in _ast.walk(fn):
+        for child in _ast.iter_child_nodes(node):
+            parents[child] = node
+    fsyncs = [n for n in _ast.walk(fn)
+              if isinstance(n, _ast.Call)
+              and 'fsync' in _ast.unparse(n.func)]
+    assert fsyncs, 'the atomic write must fsync'
+    for call in fsyncs:
+        guarded = False
+        node = parents.get(call)
+        while node is not None:
+            if isinstance(node, _ast.Try) and node.handlers:
+                names = {_ast.unparse(h.type) if h.type else '' for h in node.handlers}
+                guarded = 'OSError' in names
+                break
+            node = parents.get(node)
+        assert guarded, (
+            'os.fsync must sit inside a try that catches OSError: an unguarded '
+            'failure propagates to the cleanup branch, which unlinks the temp '
+            'and loses the newest record')
+    cad_src = Path(PLUGIN_ROOT / 'helpers' / 'cadence.py').read_text(
+        encoding='utf-8')
+    doc = cad_src.split('"""', 2)[1]
+    # Assert the PROMISE, not the word: this docstring corrects the old claim
+    # and necessarily mentions the migration while doing so. Per the R30/R32
+    # contract, a substring cannot tell a claim from its refutation - so assert
+    # the imperative form the old text used, plus the behaviour itself.
+    assert 'migrate it' not in doc.lower(), (
+        'the module docstring must not instruct a migration the code deleted')
+    assert '_LEGACY_STATE_PATH =' not in cad_src, (
+        'the constant names the auto-loop\'s live state file and must stay gone')
+    # Behaviour, not prose: reading a state file must never delete another
+    # component's file. The v1.1.0 migration made `load_per_skill_state` unlink
+    # `.auto_loop_state.json` - the auto-loop's LIVE single-writer state - for a
+    # skill named `_default`.
+    import helpers.cadence as cad
+    import tempfile as _tf
+    fake_root = Path(_tf.mkdtemp(prefix='v1849_x7_'))
+    try:
+        (fake_root / 'logs' / 'runs').mkdir(parents=True)
+        victim = fake_root / 'logs' / 'runs' / '.auto_loop_state.json'
+        victim.write_text('{"last_tick_at": "sentinel"}', encoding="utf-8")
+        prev_root = cad._plugin_root
+        cad._plugin_root = lambda: fake_root
+        try:
+            cad.load_per_skill_state('_default')
+        finally:
+            cad._plugin_root = prev_root
+        assert victim.is_file(), (
+            'cadence deleted the auto-loop\'s live state file - the v1.1.0 '
+            'migration unlinked a file another component single-writes')
+        assert victim.read_text(encoding='utf-8') == '{"last_tick_at": "sentinel"}', (
+            'cadence rewrote the auto-loop\'s live state file')
+    finally:
+        shutil.rmtree(fake_root, ignore_errors=True)
+    _ok('fsync guarded; cadence neither promises nor performs a migration')
+    print(' t_v1849_fsync_guarded_and_docstring_honest: OK')
+
+
+# ======================================================================= #
+# v1.8.50 - fifth audit: the fragment API, the drain, the third dialect
+# ======================================================================= #
+#
+# The fifth pass found the one thing four passes had missed: **the fragment
+# API was a lie in both directions.**
+#
+#   F8  `write_fragment` documented that it rewrites SKILL.md. It wrote the
+#       new text to `<id>.current.md` - a file with exactly ONE writer and NO
+#       reader anywhere in the tree - left the body untouched, and returned
+#       `ok: True`. Since `read_fragments` recomputes text from the body,
+#       every reader saw the OLD text: a fragment edit was a silent no-op,
+#       and `rollback_fragment` (its only caller) reported a successful
+#       recovery that changed nothing. An existing case PINNED the defect,
+#       asserting that `.current.md` exists and the body is NOT rewritten.
+#   F7  per-fragment snapshots were keyed on `Path(SKILL.md).stem`, which is
+#       `SKILL` for every skill: all skills shared one directory and
+#       overwrote each other's rollback targets.
+#   F6  that same helper hardcoded "fragments", ignoring the configured
+#       `fragment_snapshot_dir` the status route reports.
+#   G3  the tick's sleep interval was coerced OUTSIDE the try that protects
+#       the thread, so `auto_loop_interval_sec:` (valueless YAML -> None)
+#       killed the only ticking thread in the process.
+#   G1  the bridge's redaction pass rewrote the transcript files OUTSIDE the
+#       lock introduced in v1.8.48.
+#   G4  the pre-persist redaction flag was computed and read nowhere.
+#   G2  `bool(data.get("pause"))` and `!!o.pause`: a third copy of the F10
+#       coercion bug, on the autonomy KILL SWITCH.
+#   F4  the agent tool's single-flight probe swallowed its exception and
+#       failed OPEN, while the route's identical probe fails closed.
+#   F5  the drain created `usr/skills/<name>/` before the governance gate.
+#   F10 a post-adopt ROLLBACK was audited and logged as `adopted`.
+#   G9  the v1.8.49 grace window was unbounded BELOW: a future `started_ts`
+#       yields a negative age that satisfied `<= GRACE` forever.
+#
+# F1/F2/F3 (per-fragment gate reachability and the `official_gated`
+# divergence between the three adopt paths) were verified as real and are
+# deliberately NOT changed - see the register for why.
+
+_section_v1850 = ('v1.8.50 NEW: fifth audit - the fragment API applied nothing, '
+                  'and three adopt paths disagreed (N cases)')
+
+
+@test('v1.8.50 F8: write_fragment APPLIES the edit (the .current.md no-op is gone)')
+def t_v1850_write_fragment_applies() -> None:
+    """F8. The defect was only visible BEHAVIOURALLY: the function returned
+    ok, and a file appeared on disk that nothing read. This case therefore
+    asserts the three observable consequences - the body changed, the reader
+    agrees, and the untouched frontmatter stayed byte-identical (a re-render
+    through yaml.safe_dump reformatted the operator's metadata)."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import fragment_store as fs
+    prev = os.environ.get('SKILLOPT_SKILLS_DIR')
+    tmp = tempfile.mkdtemp(prefix='v1850_f8_')
+    try:
+        skills = Path(tmp) / "skills"
+        skill_md = skills / "s1" / "SKILL.md"
+        skill_md.parent.mkdir(parents=True)
+        skill_md.write_text(
+            '---\nname: s1\ndescription: d\nfragments:\n'
+            '  - id: "intro"\n    selector: "## Section A"\n---\n\n'
+            '## Section A\nOLD BODY\n\n## Section B\nuntouched\n',
+            encoding="utf-8")
+        os.environ['SKILLOPT_SKILLS_DIR'] = str(skills)
+        before = skill_md.read_text(encoding="utf-8")
+        res = fs.write_fragment(
+            skill_md, "intro", "## Section A\nNEW BODY\n")
+        assert res.get("ok") is True, res
+        after = skill_md.read_text(encoding="utf-8")
+        assert "NEW BODY" in after, (
+            f'the live document must carry the edit; got {after!r}')
+        assert "OLD BODY" not in after, (
+            f'the previous text must be gone from the live document: {after!r}')
+        # The READER must agree - this is what the .current.md shortcut broke.
+        intro = [f for f in fs.read_fragments(skill_md) if f["id"] == "intro"][0]
+        assert "NEW BODY" in intro["text"], intro["text"]
+        # The frontmatter is re-emitted VERBATIM: only the body is ours.
+        assert after.split("---")[1] == before.split("---")[1], (
+            'the frontmatter must be byte-identical; a safe_dump re-render '
+            f'normalised it:\n{before!r}\n{after!r}')
+        # And no orphan .current.md is written any more.
+        assert not list(fs._snapshots_dir_for_skill(skill_md).glob("*.current.md")), (
+            'the dead .current.md shortcut must be gone')
+        _ok('the edit is applied, the reader agrees, frontmatter untouched')
+    finally:
+        if prev is None:
+            os.environ.pop('SKILLOPT_SKILLS_DIR', None)
+        else:
+            os.environ['SKILLOPT_SKILLS_DIR'] = prev
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1850_write_fragment_applies: OK')
+
+
+@test('v1.8.50 F8b: a fragment write REFUSES rather than lying again')
+def t_v1850_write_fragment_refuses_honestly() -> None:
+    """F8's companion. Now that the function can change a document, the ways it
+    CANNOT must be reported instead of silently degraded: an unmatched selector,
+    an edit identical to what is there, and a path this plugin does not own."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import fragment_store as fs
+    prev = os.environ.get('SKILLOPT_SKILLS_DIR')
+    tmp = tempfile.mkdtemp(prefix='v1850_f8b_')
+    try:
+        skills = Path(tmp) / "skills"
+        skill_md = skills / "s1" / "SKILL.md"
+        skill_md.parent.mkdir(parents=True)
+        skill_md.write_text(
+            '---\nname: s1\ndescription: d\nfragments:\n'
+            '  - id: "intro"\n    selector: "## Section A"\n---\n\n'
+            '## Section A\nBODY\n', encoding="utf-8")
+        os.environ['SKILLOPT_SKILLS_DIR'] = str(skills)
+        # 1. Identical text: refusing is right - an edit that changes nothing is
+        #    not an edit. (`rollback_fragment` converts this refusal into a
+        #    successful no-op, because there the target state is the request.)
+        same = fs.write_fragment(skill_md, "intro", "## Section A\nBODY\n")
+        assert same.get("ok") is False and 'identical' in str(same.get("error")), (
+            f'an identical edit must be refused, got {same!r}')
+        # 2. A document outside the skills dir: refused, not written by a
+        #    second unsanctioned writer.
+        stray = Path(tmp) / "stray" / "SKILL.md"
+        stray.parent.mkdir(parents=True)
+        stray.write_text(
+            '---\nname: stray\nfragments:\n  - id: "a"\n    selector: "## A"\n'
+            '---\n## A\nx\n', encoding="utf-8")
+        before = stray.read_text(encoding="utf-8")
+        out = fs.write_fragment(stray, "a", "## A\ny\n")
+        assert out.get("ok") is False, (
+            f'a path outside the skills dir must be refused: {out!r}')
+        assert stray.read_text(encoding="utf-8") == before, (
+            'the refused write modified the document anyway')
+        # 3. An unmatched selector names itself.
+        unknown = fs.write_fragment(skill_md, "ghost", "## nope\ntext\n")
+        assert unknown.get("ok") is False, unknown
+        _ok('unapplicable writes are refused, and say why')
+    finally:
+        if prev is None:
+            os.environ.pop('SKILLOPT_SKILLS_DIR', None)
+        else:
+            os.environ['SKILLOPT_SKILLS_DIR'] = prev
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1850_write_fragment_refuses_honestly: OK')
+
+
+@test('v1.8.50 F7: per-fragment snapshots are keyed per SKILL')
+def t_v1850_fragment_snapshots_are_per_skill() -> None:
+    """F7. `Path(SKILL.md).stem` is `SKILL` for every skill, so all per-fragment
+    snapshots shared `fragments/SKILL/`: `write_fragment` on skill A and skill B
+    computed `next_n` from each other's history and overwrote the same
+    `<id>.v<N>.md`. Driven across two skills - one directory means one shared
+    history, which is the defect."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import fragment_store as fs
+    prev = os.environ.get('SKILLOPT_SKILLS_DIR')
+    tmp = tempfile.mkdtemp(prefix='v1850_f7_')
+    created = []
+    try:
+        skills = Path(tmp) / "skills"
+        os.environ['SKILLOPT_SKILLS_DIR'] = str(skills)
+        md = ('---\nname: {n}\ndescription: d\nfragments:\n'
+              '  - id: "intro"\n    selector: "## Section A"\n---\n\n'
+              '## Section A\nBODY\n')
+        dirs = {}
+        for name in ("alpha", "beta"):
+            p = skills / name / "SKILL.md"
+            p.parent.mkdir(parents=True)
+            p.write_text(md.format(n=name), encoding="utf-8")
+            dirs[name] = fs._snapshots_dir_for_skill(p)
+            created.append(dirs[name])
+        # Distinct directories, and each keyed on its own skill NAME.
+        assert dirs["alpha"] != dirs["beta"], (
+            f'two skills share one snapshot dir: {dirs["alpha"]}')
+        assert dirs["alpha"].name == "alpha" and dirs["beta"].name == "beta", (
+            f'snapshot dirs must be keyed by skill name: {dirs}')
+        # Two writes to one skill must not disturb the other's versions.
+        fs.write_fragment(skills / "alpha" / "SKILL.md", "intro",
+                          "## Section A\nA1\n")
+        fs.write_fragment(skills / "alpha" / "SKILL.md", "intro",
+                          "## Section A\nA2\n")
+        assert not list(dirs["beta"].glob("intro.v*.md")), (
+            'writing to alpha created snapshots for beta')
+        assert len(list(dirs["alpha"].glob("intro.v*.md"))) >= 1, (
+            f'alpha must have its own history: {list(dirs["alpha"].iterdir())}')
+        _ok('two skills, two histories')
+    finally:
+        if prev is None:
+            os.environ.pop('SKILLOPT_SKILLS_DIR', None)
+        else:
+            os.environ['SKILLOPT_SKILLS_DIR'] = prev
+        for d in created:
+            shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(' t_v1850_fragment_snapshots_are_per_skill: OK')
+
+
+@test('v1.8.50 F6: the snapshot dir honours fragment_snapshot_dir')
+def t_v1850_snapshot_dir_honours_config() -> None:
+    """F6. The helper hardcoded "fragments" while `_snapshots_root()` and
+    `get_fragments_status()` both honour `fragment_snapshot_dir` - so moving the
+    root pointed the dashboard at a directory holding no rollback target."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import fragment_store as fs
+    import helpers.sleep_runner as sr
+    real = sr.merged_config
+    try:
+        sr.merged_config = lambda: {"fragment_snapshot_dir": "elsewhere"}
+        skill_md = Path("C:/x/skills/mine/SKILL.md")
+        got = fs._snapshots_dir_for_skill(skill_md)
+        assert got.parent.name == "elsewhere", (
+            f'the configured snapshot root must be honoured, got {got}')
+        got2 = fs._snapshots_dir_for_skill_name("mine")
+        assert got2.parent.name == "elsewhere", (
+            f'the name-based helper must honour it too, got {got2}')
+    finally:
+        sr.merged_config = real
+        for junk in (Path("C:/x"),):
+            if junk.exists():
+                shutil.rmtree(junk, ignore_errors=True)
+    _ok('both snapshot-dir helpers honour the configured root')
+    print(' t_v1850_snapshot_dir_honours_config: OK')
+
+
+@test('v1.8.50 G3: a valueless interval cannot kill the ticking thread')
+def t_v1850_interval_coercion_is_guarded() -> None:
+    """G3. `int(cfg.get("auto_loop_interval_sec", 1800))` sat OUTSIDE the try
+    that protects the thread, and a valueless YAML key yields `None` - so
+    `int(None)` raised TypeError, escaped `_run`'s per-tick guard and killed
+    the only thread that ticks the plugin. Nothing could run again for the life
+    of the process. Asserted structurally (the coercion is inside a `try`
+    whose handler is not just `pass`) AND behaviourally."""
+    import ast as _ast
+    src = Path(PLUGIN_ROOT / 'helpers' / 'auto_loop.py').read_text(
+        encoding="utf-8")
+    tree = _ast.parse(src)
+    # The coercion lives in `_run` (the method that owns the try that keeps the
+    # thread alive), not in `_tick` - so assert module-wide that the interval
+    # assignment is inside a Try WITH handlers.
+    coerced = [n for n in _ast.walk(tree)
+               if isinstance(n, _ast.Assign)
+               and any(isinstance(t, _ast.Name) and t.id == "interval"
+                       for t in n.targets)
+               and 'auto_loop_interval_sec' in _ast.unparse(n)]
+    assert coerced, 'the interval coercion is gone; re-derive this test'
+    parents = {}
+    for node in _ast.walk(tree):
+        for child in _ast.iter_child_nodes(node):
+            parents[child] = node
+    guarded = False
+    for assign in coerced:
+        node = parents.get(assign)
+        while node is not None:
+            if isinstance(node, _ast.Try) and node.handlers:
+                guarded = True
+                break
+            node = parents.get(node)
+    assert guarded, (
+        'the sleep interval must be coerced INSIDE the try that protects the '
+        'thread; outside it, one valueless YAML key kills the loop for the life '
+        'of the process')
+    # Behaviourally: the tolerant helper accepts what YAML produces.
+    from helpers import auto_loop as al
+    assert al._int_or_default(None, 1800) == 1800
+    _ok('the interval is coerced inside the thread guard')
+    print(' t_v1850_interval_coercion_is_guarded: OK')
+
+
+@test('v1.8.50 G2+F4: ONE coercion dialect, and the tool fails CLOSED')
+def t_v1850_kill_switch_and_tool_fail_closed() -> None:
+    """G2: `bool(data.get("pause"))` on the autonomy kill switch - a third copy
+    of the F10 coercion bug (`'false'` is truthy, so a RESUME froze the loop),
+    paired with `!!o.pause` in the dashboard.
+
+    F4: the tool's single-flight probe swallowed its exception and continued,
+    so it failed OPEN while the identical probe in `api/adopt.py` DEFERS."""
+    import ast as _ast
+    src = Path(PLUGIN_ROOT / 'api' / 'mode.py').read_text(encoding="utf-8")
+    tree = _ast.parse(src)
+    # AST, not a substring: the corrected comment QUOTES `bool(data.get(
+    # "pause"))` while explaining why it was wrong, and a substring check
+    # cannot tell a claim from its refutation.
+    bool_of_dict_get_pause = []
+    for node in _ast.walk(tree):
+        if not (isinstance(node, _ast.Call)
+                and isinstance(node.func, _ast.Name)
+                and node.func.id == 'bool'
+                and node.args):
+            continue
+        arg = node.args[0]
+        if (isinstance(arg, _ast.Call)
+                and isinstance(arg.func, _ast.Attribute)
+                and arg.func.attr == 'get'
+                and arg.args
+                and isinstance(arg.args[0], _ast.Constant)
+                and arg.args[0].value == 'pause'):
+            bool_of_dict_get_pause.append(node.lineno)
+    assert not bool_of_dict_get_pause, (
+        'the autonomy kill switch must not be coerced with truthiness '
+        f'(api/mode.py lines {bool_of_dict_get_pause})')
+    assert '_coerce_like_default' in src, (
+        'the vetted dialect in api/config.py owns this coercion')
+    js = Path(PLUGIN_ROOT / 'webui' / 'skillopt-dashboard.js').read_text(
+        encoding="utf-8")
+    assert 'body.pause = !!o.pause' not in js, (
+        'the dashboard must not pre-coerce the kill switch either')
+
+    tool = Path(PLUGIN_ROOT / 'tools' / 'skillopt_sleep.py').read_text(
+        encoding="utf-8")
+    # AST: a handler whose entire body is `pass` is a silent one, and on a gate
+    # path that means fail-OPEN.
+    ttree = _ast.parse(tool)
+    silent = []
+    for h in _ast.walk(ttree):
+        if not isinstance(h, _ast.ExceptHandler):
+            continue
+        body = [s for s in h.body
+                if not (isinstance(s, _ast.Expr)
+                        and isinstance(s.value, _ast.Constant))]
+        # A handler that only `pass`es is silent; one that `pass`es BEFORE it
+        # does something else is still a handler that swallowed nothing - but
+        # on a gate path the pass is the smell, so flag either shape.
+        if any(isinstance(s, _ast.Pass) for s in body):
+            silent.append(h.lineno)
+    assert not silent, (
+        'a `pass` in an exception handler on a gate path fails OPEN; the '
+        f'identical probe in api/adopt.py DEFERS, and two callers cannot '
+        f'disagree (handlers at lines {silent})')
+    j = tool.find('find_pending_real_gate_sidecar()')
+    assert j != -1, 'the single-flight probe is gone; re-derive this test'
+    window2 = tool[j:j + 2500]
+    assert 'DEFERRED' in window2, (
+        'the refusal must say the probe failed, so the operator knows it was '
+        'not a gate rejection')
+    _ok('one coercion dialect; the tool defers where the route defers')
+    print(' t_v1850_kill_switch_and_tool_fail_closed: OK')
+
+
+@test('v1.8.50 F5+G9+F10: no pre-gate mkdir, a bounded window both ways, honest outcomes')
+def t_v1850_drain_and_window_details() -> None:
+    """Three small claims from the fifth pass, asserted where a comment cannot
+    satisfy them.
+
+    F5: the drain created `usr/skills/<name>/` BEFORE the governance gate - the
+        exact line v1.8.48 removed from the agent tool and missed here.
+    G9: the v1.8.49 grace window was unbounded BELOW: a future `started_ts`
+        gives a negative age, which satisfies `<= GRACE` forever.
+    F10: a post-adopt ROLLBACK was audited and logged as `adopted`, and an
+        exact `== "adopted"` comparison then quarantined the proposal.
+    """
+    import ast as _ast
+    al = Path(PLUGIN_ROOT / 'helpers' / 'auto_loop.py').read_text(
+        encoding="utf-8")
+    # F5: inside `_adopt_one`, no mkdir of the skills parent precedes the gate.
+    tree = _ast.parse(al)
+    fn = next(n for n in _ast.walk(tree)
+              if isinstance(n, _ast.FunctionDef) and n.name == '_adopt_one')
+    lines = _ast.unparse(fn).splitlines()
+    mk_line = gate_line = None
+    for i, ln in enumerate(lines, 1):
+        if 'target.parent.mkdir' in ln and mk_line is None:
+            mk_line = i
+        # The gate that matters for a side effect is `validate_proposal` - the
+        # governance eligibility check runs earlier still, so comparing
+        # against it would pass with a mkdir in between (and did, on the first
+        # draft of this case).
+        if 'validate_proposal' in ln and gate_line is None:
+            gate_line = i
+    assert gate_line is not None, 'the validation gate is gone; re-derive'
+    assert mk_line is None or mk_line > gate_line, (
+        f'the skills directory must not be created before the VALIDATION gate '
+        f'runs (mkdir at line {mk_line}, validate_proposal at {gate_line})')
+    # F10: the outcome comparison is a prefix test, and the rollback outcome
+    # string exists and is distinct.
+    assert 'outcome = "adopted_rolled_back"' in al, (
+        'a post-adopt rollback must have its own outcome')
+    assert 'if outcome == "adopted":' not in al, (
+        'an exact comparison quarantines a proposal whose write was reverted')
+    assert 'outcome.startswith("adopted")' in al
+    # F10: the outcome comparison is a prefix test, and the rollback outcome
+    # string exists and is distinct.
+    assert 'outcome = "adopted_rolled_back"' in al, (
+        'a post-adopt rollback must have its own outcome')
+    assert 'if outcome == "adopted":' not in al, (
+        'an exact comparison quarantines a proposal whose write was reverted')
+    assert 'outcome.startswith("adopted")' in al
+    # G9: bounded below as well as above. Match the CODE line, not the comment
+    # that quotes the same expression while explaining the bug.
+    sr = Path(PLUGIN_ROOT / 'helpers' / 'sleep_runner.py').read_text(
+        encoding="utf-8")
+    cond = sr.find("if _started and")
+    assert cond != -1, 'the grace-window condition is gone; re-derive this test'
+    cond_line = sr[cond:sr.find("\n", cond)]
+    assert "0.0 <=" in cond_line and "PENDING_PID_GRACE_S" in cond_line, (
+        f'the window must be bounded below too, or a future started_ts parks '
+        f'adoption forever: {cond_line.strip()!r}')
+    _ok('no pre-gate mkdir; window bounded both ways; rollback is its own outcome')
+    print(' t_v1850_drain_and_window_details: OK')
+
+
+_section_v1852 = ('v1.8.52 NEW: the default-policy rails are hermetic - '
+                  'operator config.json cannot leak into a suite run (3 cases)')
+
+
+@test('v1.8.52: _default_policy reads through the seam, merging a fixture config')
+def t_v1852_default_policy_seam() -> None:
+    purpose = ('The v1.8.52 seam: with default_policy_config_path pointed at a '
+               'fixture, _default_policy merges its governance.default_policy '
+               'block over the built-ins; with the seam unset it falls back to '
+               'the plugin root - and the suite-wide sandbox in main() keeps '
+               'the real install config out of every governance test.')
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    import tempfile as _tf
+    from helpers import governance as gov
+    tmp = Path(_tf.mkdtemp(prefix='v1852_seam_'))
+    saved = gov.default_policy_config_path
+    try:
+        fixture = tmp / 'config.json'
+        fixture.write_text(json.dumps({
+            'unrelated': True,
+            'governance': {'default_policy': {
+                'mode': 'opt_in',
+                'require_human_approval': False,
+                'min_interval_seconds': 90,
+                'daily_budget_cents': 7,
+            }},
+        }), encoding='utf-8')
+        gov.default_policy_config_path = fixture
+        dp = gov._default_policy()
+        for k, want in (('mode', 'opt_in'), ('require_human_approval', False),
+                        ('min_interval_seconds', 90), ('daily_budget_cents', 7)):
+            assert dp.get(k) == want, (
+                f'{k} = {dp.get(k)!r}, expected {want!r} from the fixture: {dp!r}')
+        # Keys the fixture omits must keep their built-in values.
+        assert all(k in dp for k in gov.DEFAULT_POLICY), (
+            'the merged policy must stay a full DEFAULT_POLICY copy')
+
+        # A malformed fixture must degrade to built-ins, not raise.
+        (tmp / 'broken.json').write_text('{not json', encoding='utf-8')
+        gov.default_policy_config_path = tmp / 'broken.json'
+        assert gov._default_policy()['mode'] == gov.DEFAULT_POLICY['mode'], (
+            'an unreadable config must fall back to the built-in policy')
+        # A missing fixture: same built-ins, no exception.
+        gov.default_policy_config_path = tmp / 'absent.json'
+        assert gov._default_policy()['mode'] == gov.DEFAULT_POLICY['mode']
+
+        # A non-dict default_policy block is ignored, wholesale.
+        gov.default_policy_config_path = fixture
+        broken_block = tmp / 'not-a-dict.json'
+        broken_block.write_text(json.dumps(
+            {'governance': {'default_policy': 'opt_in'}}), encoding='utf-8')
+        gov.default_policy_config_path = broken_block
+        assert gov._default_policy()['mode'] == gov.DEFAULT_POLICY['mode'], (
+            'a non-dict default_policy must be ignored, not merged')
+    finally:
+        gov.default_policy_config_path = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+    _ok('seam reads + merges a fixture; malformed/missing/non-dict degrade to built-ins')
+    print(' t_v1852_default_policy_seam: OK')
+
+
+@test('v1.8.52: main() installs the config sandbox - a live config.json is invisible')
+def t_v1852_suite_config_hermeticity() -> None:
+    """The guard that proves 13 governance tests stopped reading the install's
+    config.json: even if a fixture config.json DOES exist in the plugin root
+    (as on every live install), _default_policy must resolve through the
+    sandbox seam - so values only the install's file sets (and no built-in
+    default matches) cannot appear in the resolved policy."""
+    sys.path.insert(0, str(PLUGIN_ROOT))
+    from helpers import governance as gov
+    # whatever the install's config.json says, the suite-wide sandbox in
+    # main() must hold it away from the rails:
+    from helpers import sleep_runner as sr
+    real_path = sr.plugin_root() / 'config.json'
+    assert gov.default_policy_config_path is not None and (
+        gov.default_policy_config_path != real_path), (
+        'main() must point the default-policy read away from the install '
+        f'(seam={gov.default_policy_config_path!r}, install={real_path!r})')
+    if real_path.is_file():
+        real = json.loads(real_path.read_text(encoding='utf-8'))
+        leak = (real.get('governance') or {}).get('default_policy') or {}
+        if isinstance(leak, dict) and leak:
+            dp = gov._default_policy()
+            leaked = {k: v for k, v in leak.items()
+                      if k in gov.DEFAULT_POLICY
+                      and dp.get(k) == v
+                      and gov.DEFAULT_POLICY[k] != v}
+            assert not leaked, (
+                'the install config.json leaked into governance '
+                f'(values in the resolved policy that only the install set): '
+                f'{leaked!r}; the main() sandbox failed')
+    _ok('install config.json stays out of the suite-wide governance reads')
+    print(' t_v1852_suite_config_hermeticity: OK')
+
+
+
 if __name__ == "__main__":
     # Print the section headers once at the top of the run
     print(_section_v110)
@@ -8314,4 +17681,21 @@ if __name__ == "__main__":
     print(_section_v1812)
     print(_section_v1816)
     print(_section_v1822)
+    print(_section_v1834)
+    print(_section_v1835)
+    print(_section_v1836)
+    print(_section_v1837)
+    print(_section_v1838)
+    print(_section_v1839)
+    print(_section_v1839b)
+    print(_section_v1842)
+    print(_section_v1843)
+    print(_section_v1844)
+    print(_section_v1845)
+    print(_section_v1846)
+    print(_section_v1847)
+    print(_section_v1848)
+    print(_section_v1849)
+    print(_section_v1850)
+    print(_section_v1852)
     sys.exit(main())

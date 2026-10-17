@@ -147,13 +147,29 @@ def _strip_quotes(value: str) -> str:
 
 
 def _provenance_ref(key: str, value: str, sources: dict) -> str:
-    # Prefer the mapped source whose CURRENT value matches the plaintext;
-    # fall back to a self-reference (resolvable when the key itself lives
-    # in usr/.env, the v1.8.4 layout).
+    """A `${VAR}` reference for `key`'s plaintext `value`, or "" if none exists.
+
+    Prefer the mapped source whose CURRENT value matches the plaintext.
+
+    v1.8.46 (audit R24): there is deliberately NO self-reference fallback any
+    more. This used to return `${KEY}` when no visible source matched, which
+    resolved through `os.environ` / `usr/.env` to nothing - so a legacy
+    `.skillopt-env` holding the only copy of a WORKING credential was
+    rewritten into a dangling reference, the credential was destroyed, and the
+    next LLM call failed with "No LLM API key found". Loud, yes, but the
+    opposite of the documented intent ("converge to reference-only form
+    instead of regressing"): converging onto a reference that resolves to
+    nothing IS the regression.
+
+    Returning "" tells the caller there is no provenance, and
+    `sanitize_env_text` leaves the literal alone and reports the key as
+    `unresolved`. Rewriting a credential into a broken state is an operator
+    decision, never a silent one.
+    """
     for src, sv in (sources or {}).items():
         if sv == value:
             return '${' + src + '}'
-    return '${' + key + '}'
+    return ""
 
 
 def sanitize_env_text(text: str, sources: dict | None = None) -> tuple:
@@ -177,6 +193,16 @@ def sanitize_env_text(text: str, sources: dict | None = None) -> tuple:
             out_lines.append('export ' + key + '=' + value)
             continue
         ref = _provenance_ref(key, value, sources)
+        # v1.8.46 (audit R24): no provenance for this plaintext value, so
+        # leave it ALONE. Rewriting it to a `${KEY}` reference that resolves
+        # nowhere would destroy the only working copy and fail the next LLM
+        # call. Report it as `fixed` (i.e. it needs attention) but do not
+        # modify it - see `_provenance_ref`.
+        if not ref:
+            out_lines.append(raw)
+            if key not in fixed:
+                fixed.append(key)
+            continue
         out_lines.append('export ' + key + '=' + ref)
         if key not in fixed:
             fixed.append(key)
@@ -227,9 +253,36 @@ def _key_names(text: str) -> list:
     return names
 
 
+def configured_backend(default: str = 'auto') -> str:
+    """The operator's `backend` setting, or `default` when unusable.
+
+    v1.8.48 (audit U3). `backend` has been declared in `default_config.yaml`
+    and rendered as a `<select>` in the settings page since v1.1, and
+    NOTHING read it: the only reader of the name was the setup TOOL's own
+    argument. So the control reported "saved" and changed nothing - the
+    plugin's own "a setting that is declared but unread is a switch an
+    operator can flip that does nothing". This makes the config key the
+    fallback for `apply()`, whose explicit argument still wins.
+    """
+    try:
+        raw = sleep_runner.merged_config().get('backend')
+    except Exception:
+        return default
+    val = str(raw or '').strip()
+    if not val:
+        return default
+    return val
+
+
 def apply(backend: str, env_file=None) -> dict:
     # Write the reference-only env file. Atomic, chmod 600, never raises.
     try:
+        # v1.8.48 (audit U3): no argument -> the operator's `backend` setting,
+        # which the settings page has been persisting since v1.1 and which
+        # nothing read. An explicit argument still wins, so the tool is
+        # unchanged.
+        if not str(backend or '').strip():
+            backend = configured_backend('auto')
         if backend not in BACKENDS or backend == 'auto':
             return {
                 'ok': False,

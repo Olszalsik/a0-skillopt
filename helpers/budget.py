@@ -67,6 +67,79 @@ def estimate_call_cost(cost_per_call_cents: int | None = None) -> int:
     return DEFAULT_COST_PER_CALL_CENTS
 
 
+def budget_section(cfg: dict | None) -> dict:
+    """The `budget:` block from a merged config, as a dict. Never raises.
+
+    v1.8.37 (audit F13). The `budget:` YAML section can arrive as a STRING when
+    the nested section is mangled by `merged_config()`'s flat light-parse (the
+    bare `budget:` key stored as ""), so `.get(...)` raised
+    "'str' object has no attribute 'get'" on every cycle. The v1.8.19 fix
+    guarded that at ONE call site; there are nine, so the guard belongs here,
+    once.
+    """
+    try:
+        sec = (cfg or {}).get("budget")
+        return sec if isinstance(sec, dict) else {}
+    except Exception:
+        return {}
+
+
+def budget_enabled(cfg: dict | None) -> bool:
+    """Is the daily budget gate switched on? Default ON.
+
+    `budget.enabled: false` was declared in default_config.yaml since v1.6.0
+    and read by NOTHING (audit F13), so an operator who switched the budget
+    off still had it enforced.
+    """
+    sec = budget_section(cfg)
+    try:
+        return bool(sec.get("enabled", True))
+    except Exception:
+        return True
+
+
+def tracker_from_config(skill_name: str | None,
+                        cfg: dict[str, Any] | None = None,
+                        *,
+                        default_when_disabled: bool = False
+                        ) -> "BudgetTracker | None":
+    """Build a BudgetTracker wired from the `budget:` block.
+
+    v1.8.37 (audit F13). Nine call sites constructed `BudgetTracker(...)` with
+    different ad-hoc subsets of the config, which is exactly why
+    `daily_cap_cents` and `reset_hour_utc` were declared but never supplied:
+    the effective cap was always the module default. One factory means the
+    settings cannot drift per call site again.
+
+    `daily_cap_cents: 0` keeps its documented meaning - "no cap" - so an
+    operator can keep the tracker for its soft warnings with the hard cap off.
+
+    v1.8.45 (re-audit R10): `default_when_disabled=True` returns a
+    default-configured tracker instead of `None` when `budget.enabled` is
+    false. Three callers need a tracker purely to READ status (or to record
+    spend while the gate is off) and were constructing one directly, which
+    left "only the factory constructs a tracker" true in spirit and false in
+    fact. With this flag, those call sites go through the factory too and the
+    disabled case is explicit at the one place that decides it.
+    """
+    if not budget_enabled(cfg) and not default_when_disabled:
+        return None
+    sec = budget_section(cfg)
+    kwargs: dict[str, Any] = {}
+    for key in ("daily_cap_cents", "reset_hour_utc", "cost_per_call_cents",
+                "soft_warn_pct"):
+        if key not in sec or sec.get(key) is None:
+            continue
+        try:
+            kwargs[key] = int(sec[key])
+        except (TypeError, ValueError):
+            continue  # a malformed value falls back to the module default
+    try:
+        return BudgetTracker(skill_name=skill_name, **kwargs)
+    except Exception:
+        return BudgetTracker(skill_name=skill_name)
+
+
 class BudgetTracker:
     """Per-skill (or global) LLM spend tracker.
 
@@ -197,7 +270,20 @@ class BudgetTracker:
     # ------------------------------------------------------------------ #
 
     def can_spend(self, cents: int) -> tuple[bool, str]:
-        """Return (True, "") if `daily_total + cents <= cap`, else (False, reason)."""
+        """Return (True, "") if `daily_total + cents <= cap`, else (False, reason).
+
+        v1.8.35 (audit F7): this now rolls the day over first. It previously
+        did not, and `_maybe_rollover` was reachable only from
+        `record_spend` - which itself only runs AFTER a successful cycle,
+        which requires `can_spend` to pass. So once the persisted total hit
+        the cap the chain deadlocked permanently: the skill reported
+        "daily cap exceeded" on every tick, forever, with a misleading reason
+        and no way for the counter to reset.
+
+        `_maybe_rollover` already writes the reset through `_save`, so calling
+        it here is the same operation `record_spend` performs - just at the
+        read side too.
+        """
         try:
             c = max(0, int(cents))
         except (TypeError, ValueError):
@@ -205,6 +291,13 @@ class BudgetTracker:
         if self.daily_cap_cents <= 0:
             # No cap configured - allow anything
             return (True, "")
+        try:
+            self._maybe_rollover(time.time())
+        except Exception:
+            # A rollover we cannot perform must not silently unblock spend
+            # beyond the cap: fall through to the (possibly stale) total,
+            # which is the restrictive direction.
+            pass
         state = self._load()
         total = int(state.get("daily_total_cents") or 0)
         if (total + c) <= self.daily_cap_cents:
@@ -242,6 +335,13 @@ class BudgetTracker:
         }
 
     def get_status(self) -> dict[str, Any]:
+        # v1.8.35 (audit F7): same rollover as can_spend. A status read is
+        # what the dashboard shows as "daily cap", so reporting a stale total
+        # here is what made the permanent latch look like a live reading.
+        try:
+            self._maybe_rollover(time.time())
+        except Exception:
+            pass
         state = self._load()
         total = int(state.get("daily_total_cents") or 0)
         cap = self.daily_cap_cents

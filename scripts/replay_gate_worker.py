@@ -30,6 +30,7 @@ worker crash; sidecar status=failed).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import subprocess
@@ -72,7 +73,25 @@ def _write_sidecar(sidecar: Path, payload: dict) -> None:
     tmp.replace(sidecar)
 
 
-def _evalkit_report(per_task: list[dict]) -> dict:
+def _evalkit_command() -> tuple[list[str] | None, str | None]:
+    command = [sys.executable, "-m", "skillopt_sleep.evalkit"]
+    try:
+        help_result = subprocess.run(
+            command + ["--help"], capture_output=True, text=True, timeout=15,
+            check=False,
+        )
+    except Exception as exc:
+        return None, "capability_probe_failed:" + type(exc).__name__
+    help_text = (help_result.stdout or "") + (help_result.stderr or "")
+    required = (
+        "--manifest", "--a", "--b", "--allow-graded", "--boot", "--seed", "--json"
+    )
+    if help_result.returncode != 0 or any(flag not in help_text for flag in required):
+        return None, "installed_evalkit_missing_required_options"
+    return command, None
+
+
+def _evalkit_report(per_task: list[dict], command: list[str] | None = None) -> dict:
     """Run upstream's optional paired evalkit over already-scored pairs.
 
     This is a post-hoc report only. Any discovery, input, timeout, or CLI
@@ -92,24 +111,16 @@ def _evalkit_report(per_task: list[dict]) -> dict:
                 or not 0 <= a <= 1 or not 0 <= b <= 1):
             return {"available": False, "reason": "invalid_paired_scores"}
         seen.add(task_id)
-        pairs.append((task_id, float(a), float(b)))
+        # The evalkit needs stable pairing only within this invocation. Do
+        # not copy rollout IDs, which may contain user data, into its report.
+        pairs.append((f"task-{len(pairs) + 1:04d}", float(a), float(b)))
     if not pairs:
         return {"available": False, "reason": "no_paired_scores"}
 
-    command = [sys.executable, "-m", "skillopt_sleep.evalkit"]
-    try:
-        help_result = subprocess.run(
-            command + ["--help"], capture_output=True, text=True, timeout=15,
-            check=False,
-        )
-    except Exception as exc:
-        return {"available": False, "reason": "capability_probe_failed:" + type(exc).__name__}
-    help_text = (help_result.stdout or "") + (help_result.stderr or "")
-    required = (
-        "--manifest", "--a", "--b", "--allow-graded", "--boot", "--seed", "--json"
-    )
-    if help_result.returncode != 0 or any(flag not in help_text for flag in required):
-        return {"available": False, "reason": "installed_evalkit_missing_required_options"}
+    if command is None:
+        command, reason = _evalkit_command()
+        if command is None:
+            return {"available": False, "reason": reason or "evalkit_unavailable"}
 
     try:
         with tempfile.TemporaryDirectory(prefix="skillopt-evalkit-") as tmp_dir:
@@ -147,6 +158,68 @@ def _evalkit_report(per_task: list[dict]) -> dict:
         return {"available": True, "ok": False, "reason": type(exc).__name__ + ":" + str(exc)[:300]}
 
 
+def _independent_evalkit_report(
+    tasks_file: str, skill: str, current_md: str, proposed_md: str,
+    gate_task_ids: set[str], cfg: dict,
+) -> dict:
+    """Score a curated fixed task manifest separate from the adoption gate."""
+    path = Path(tasks_file).expanduser()
+    try:
+        raw = path.read_bytes()
+        if len(raw) > 1_000_000:
+            return {"available": False, "reason": "manifest_too_large"}
+        tasks = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        return {"available": False, "reason": "manifest_read_failed:" + type(exc).__name__}
+    if not isinstance(tasks, list):
+        return {"available": False, "reason": "manifest_not_a_list"}
+    max_tasks = max(1, min(20, int(cfg.get("replay_evalkit_max_tasks", 4) or 4)))
+    if len(tasks) > max_tasks:
+        return {"available": False, "reason": "manifest_exceeds_max_tasks"}
+    seen: set[str] = set()
+    for task in tasks:
+        task_id = task.get("id") if isinstance(task, dict) else None
+        task_text = task.get("task") if isinstance(task, dict) else None
+        if (not isinstance(task_id, str) or not task_id.strip()
+                or task_id != task_id.strip() or len(task_id) > 256
+                or task_id in seen):
+            return {"available": False, "reason": "invalid_or_duplicate_manifest_ids"}
+        if not isinstance(task_text, str) or not task_text.strip():
+            return {"available": False, "reason": "manifest_task_text_missing"}
+        if task_id in gate_task_ids:
+            return {"available": False, "reason": "manifest_overlaps_gate_tasks"}
+        seen.add(task_id)
+    if len(tasks) < int(cfg.get("replay_min_n", 3) or 3):
+        return {"available": False, "reason": "manifest_below_replay_min_n"}
+    if cfg.get("replay_real_executor_enabled") is not True:
+        return {"available": False, "reason": "independent_evalkit_requires_real_executor"}
+
+    command, reason = _evalkit_command()
+    if command is None:
+        return {"available": False, "reason": reason or "evalkit_unavailable"}
+
+    scored = replay_harness.run_counterfactual(
+        skill_name=skill,
+        current_skill_md=current_md,
+        proposed_skill_md=proposed_md,
+        held_out_tasks=tasks,
+        executor="real",
+        config={**cfg, "replay_real_max_tasks": max_tasks},
+    )
+    if not scored.get("ok"):
+        return {"available": False, "reason": "independent_replay_failed:" + str(scored.get("reason", "unknown"))[:250]}
+    report = _evalkit_report(scored.get("per_task") or [], command=command)
+    return {
+        "mode": "independent_fixed_manifest",
+        "available": bool(report.get("available")),
+        "ok": bool(report.get("ok")),
+        "executor": "real",
+        "manifest_sha256": hashlib.sha256(raw).hexdigest(),
+        "n": scored.get("n"),
+        "paired_report": report,
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description='SkillOpt async real-gate worker')
     ap.add_argument('--skill-name', required=True)
@@ -166,6 +239,9 @@ def main() -> int:
     ap.add_argument('--replay-min-n', type=int, default=3)
     ap.add_argument('--evalkit', action='store_true',
                     help='attach an optional official paired evalkit report')
+    ap.add_argument('--evalkit-tasks-file', default=None,
+                    help='optional independent reviewed JSON task list')
+    ap.add_argument('--evalkit-max-tasks', type=int, default=4)
     ap.add_argument('--log-dir', default=None,
                     help='JSONL log dir (default: sleep_runner.runs_dir())')
     args = ap.parse_args()
@@ -205,8 +281,16 @@ def main() -> int:
     try:
         if not staged.is_file():
             raise RuntimeError(f'staged proposal missing: {staged}')
-        tasks_path = Path(payload.get('tasks_file') or '')
+        tasks_path = Path(args.tasks_file or payload.get('tasks_file') or '')
         if not tasks_path.is_file():
+            # v1.8.48 (audit C4): `--tasks-file` is declared REQUIRED by this
+            # module's own TRAP-A contract ("every tunable knob is CLI-passed
+            # by the spawner") yet nothing read `args.tasks_file`. The path
+            # was taken only from the SIDECAR, so when the sidecar could not
+            # be read the code fell back to `Path('')` -> `Path('.')` and the
+            # worker died with `frozen tasks file missing: .` even though the
+            # correct absolute path was sitting in argv - exiting 1 with
+            # `status: failed`, i.e. the documented fail-OPEN adopt.
             raise RuntimeError(f'frozen tasks file missing: {tasks_path}')
         held_out = json.loads(tasks_path.read_text(encoding='utf-8'))
         if not isinstance(held_out, list):
@@ -239,7 +323,28 @@ def main() -> int:
         payload['verdict'] = verdict
         if args.evalkit and verdict.get('ok'):
             try:
-                payload['evalkit'] = _evalkit_report(verdict.get('per_task') or [])
+                if args.evalkit_tasks_file:
+                    gate_ids = {
+                        str(row.get('id')) for row in (verdict.get('per_task') or [])
+                        if isinstance(row, dict) and row.get('id') is not None
+                    }
+                    eval_cfg = {
+                        'replay_real_executor_enabled': args.executor == 'real',
+                        'replay_real_per_task_timeout_s': args.per_task_timeout_s,
+                        'replay_real_max_tasks': args.evalkit_max_tasks,
+                        'replay_min_n': args.replay_min_n,
+                        'gate_min_improvement_pp': args.gate_min_improvement_pp,
+                        'replay_evalkit_max_tasks': args.evalkit_max_tasks,
+                    }
+                    payload['evalkit'] = _independent_evalkit_report(
+                        args.evalkit_tasks_file, skill, current_md, proposed_md,
+                        gate_ids, eval_cfg,
+                    )
+                else:
+                    payload['evalkit'] = {
+                        'mode': 'gate_pairs_descriptive',
+                        **_evalkit_report(verdict.get('per_task') or []),
+                    }
             except Exception as eval_exc:
                 # Reporting is strictly post-gate and must never turn a
                 # measured pass/reject into an infrastructure failure.

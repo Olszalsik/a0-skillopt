@@ -169,6 +169,15 @@ def _try_load_model() -> bool:
     global _tokenizer, _model, _model_dir, _model_version
     global _load_attempted, _load_error
 
+    # v1.8.45 (re-audit R22): mark the attempt BEFORE any exit, not on the
+    # last line. It used to be set only after a SUCCESSFUL load, so both
+    # failure paths returned without recording that a load had been tried -
+    # which is why `_load_attempted` was read nowhere and
+    # `_ensure_model_loaded()` re-ran the full checkpoint load on every
+    # finished chat whenever the directory was present but unloadable.
+    # `reset_model_cache()` clears it, so a deliberate reload still works.
+    _load_attempted = True
+
     p = model_path()
     if not p.is_dir() or not (p / "config.json").is_file():
         _load_error = f"model directory not found: {p}"
@@ -203,13 +212,30 @@ def _try_load_model() -> bool:
 
 
 def _ensure_model_loaded() -> bool:
-    """Lazy load. Thread-safe. Returns True if model is ready."""
+    """Lazy load. Thread-safe. Returns True if model is ready.
+
+    v1.8.45 (re-audit R22): a failed load is attempted ONCE.
+
+    `_load_attempted` was assigned in three places and read NOWHERE, so
+    `_ensure_model_loaded()` re-ran the full checkpoint load on **every
+    finished chat** whenever a model directory was present but unloadable -
+    holding `_lock` on the harvester's latency path. The module's own
+    docstring implied one attempt, and the dashboard's `_load_error` is the
+    only thing that made the repeated work visible at all.
+
+    The flag now gates the retry. `reset_model_cache()` (which the tests and
+    an operator use after dropping in new artifacts) clears it, so a
+    deliberate reload is still possible.
+    """
     global _model, _tokenizer
     if _model is not None and _tokenizer is not None:
         return True
     with _lock:
         if _model is not None and _tokenizer is not None:
             return True
+        if _load_attempted:
+            # Already tried and failed; do not pay for it on every chat.
+            return False
         return _try_load_model()
 
 
@@ -485,6 +511,22 @@ def get_model_status() -> dict[str, Any]:
         "classes": list(_CLASSES),
         "enabled": True,  # v1.2.0: always on; future versions may add a toggle
     }
+
+
+def reset_model_cache() -> None:
+    """Re-arm the one-time load gate so the next scoring call retries.
+
+    v1.8.48 (audit P7): two docstrings promised this function existed, so an
+    operator could believe a deliberate reload was available after dropping in
+    new artefacts. It did not - `_load_attempted` was cleared only by
+    `reset_for_tests`, which the test suite calls. In a long-lived A0 process,
+    a first scoring call on a fresh install (no `models/reward_model/config.json`)
+    latched the flag and the trained model was never loaded for the life of the
+    process, so `get_model_status()` reported
+    `model_present_on_disk: true, model_loaded: false` forever. The one-time
+    behaviour itself is deliberate (audit R22); the missing lever was not.
+    """
+    reset_for_tests()
 
 
 def reset_for_tests() -> None:

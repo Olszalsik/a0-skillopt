@@ -72,8 +72,16 @@ DEFAULT_MAX_PER_SKILL = 100
 def _config() -> dict[str, Any]:
     """Read failure_memory_* keys from the merged config + env overrides."""
     try:
-        from helpers.sleep_runner import merged_config  # type: ignore
-        cfg = merged_config()
+        # v1.8.37 (audit F11): namespace FIRST. In the A0 runtime the
+        # plugin is `usr.plugins.skillopt.helpers.*`, so a bare
+        # `helpers.` import targets the FRAMEWORK package, raises on every
+        # call, and was swallowed by the except below - which is why every
+        # `failure_memory_*` key silently resolved to its default.
+        from usr.plugins.skillopt.helpers import sleep_runner as _sr  # type: ignore
+    except ImportError:
+        from helpers import sleep_runner as _sr  # type: ignore
+    try:
+        cfg = _sr.merged_config()
     except Exception:
         cfg = {}
     out = {
@@ -116,6 +124,21 @@ def _runs_dir() -> Path:
 def _cycle_log_path() -> Path:
     p = _runs_dir() / "failure_memory.log"
     p.parent.mkdir(parents=True, exist_ok=True)
+    # v1.8.39 (audit M12): this log grew without bound AND is fully
+    # re-read by get_status_block() on every dashboard poll, so the
+    # cost grew with install age. Rotate on access; best-effort.
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner as _sr  # type: ignore
+    except Exception:
+        try:
+            from helpers import sleep_runner as _sr  # type: ignore
+        except Exception:
+            _sr = None  # type: ignore[assignment]
+    if _sr is not None:
+        try:
+            _sr.rotate_log_if_large(p)
+        except Exception:
+            pass
     return p
 
 
@@ -145,8 +168,11 @@ def _backup_keep() -> int:
     "Resolve failure_memory_backup_keep (config key; env wins). 0 = off."
     keep = DEFAULT_BACKUP_KEEP
     try:
-        from helpers.sleep_runner import merged_config  # type: ignore
-        _val = merged_config().get("failure_memory_backup_keep")
+        from usr.plugins.skillopt.helpers import sleep_runner as _sr  # type: ignore
+    except ImportError:
+        from helpers import sleep_runner as _sr  # type: ignore
+    try:
+        _val = _sr.merged_config().get("failure_memory_backup_keep")
         if _val is not None:
             keep = int(_val)
     except Exception:
@@ -715,8 +741,12 @@ def get_status_block() -> dict[str, Any]:
     cfg = _config()
     per_skill: dict[str, dict[str, Any]] = {}
     try:
-        from helpers.sleep_runner import a0_skills_dir  # type: ignore
-        skills_root = a0_skills_dir()
+        # v1.8.37 (audit F11): namespace first - see _config() above.
+        from usr.plugins.skillopt.helpers import sleep_runner as _sr  # type: ignore
+    except ImportError:
+        from helpers import sleep_runner as _sr  # type: ignore
+    try:
+        skills_root = _sr.a0_skills_dir()
     except Exception:
         skills_root = None
     candidates: set[str] = set()

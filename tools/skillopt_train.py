@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 
 from helpers.tool import Response, Tool  # type: ignore
 
@@ -77,10 +78,57 @@ class SkilloptTrain(Tool):
                 ),
                 break_loop=False,
             )
+        # v1.8.47 (re-audit R27): single-flight. A training run is hours
+        # long; launching a second silently doubles CPU/GPU load and both
+        # write the same artifacts. Liveness is decided with
+        # `sleep_runner.is_running`, not `os.kill(pid, 0)` - the latter is
+        # Ctrl+C on Windows.
+        state_path = sleep_runner.runs_dir() / "train_state.json"
+        try:
+            prev = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            prev = {}
+        prev_pid = prev.get("pid") if isinstance(prev, dict) else None
+        if prev_pid:
+            try:
+                _busy = sleep_runner.is_running(int(prev_pid))
+            except Exception:
+                _busy = False
+            if _busy:
+                return Response(
+                    message=(
+                        f"A training run is already in flight (pid={prev_pid}). "
+                        f"Wait for it to finish, or stop that process "
+                        f"first - one at a time."
+                    ),
+                    break_loop=False,
+                )
+
         cmd = [sleep_runner._a0_python(), "-m", "skillopt", "--config", cfg_path]
         log = sleep_runner.runs_dir() / "train.log"
         log_fh = open(log, "ab", buffering=0)
         proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, start_new_session=True)
+        # v1.8.47 (R27): close OUR copy of the handle. `Popen` duplicates
+        # it for the child, so the parent does not need it - and an open
+        # handle also blocks rotation of this log on Windows.
+        try:
+            log_fh.close()
+        except Exception:
+            pass
+        # Record the pid so the next invocation can detect it and an
+        # operator can find it. Atomic, like every other small state file.
+        try:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            _st = state_path.with_suffix(".json.tmp")
+            _st.write_text(json.dumps({
+                "pid": proc.pid,
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "log": str(log),
+                "config": cfg_path,
+            }), encoding="utf-8")
+            os.replace(str(_st), str(state_path))
+        except Exception:
+            pass
         return Response(
             message=(
                 f"Full training run launched: pid={proc.pid}, "

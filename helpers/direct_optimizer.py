@@ -46,6 +46,7 @@ v1.6.0 — FALLBACK ROLE (Solution B):
 from __future__ import annotations
 
 import datetime as _dt
+import logging
 import json
 import os
 import time
@@ -125,6 +126,47 @@ _OPTIMIZER_SYSTEM = (
 )
 
 
+def _call_timeout_s() -> float:
+    """Per-request timeout for `_call_llm`, from config then env.
+
+    v1.8.44 (re-audit R5). Order mirrors `llm_judge`'s knobs: config first
+    (so it is visible and documented in `default_config.yaml`), env second
+    (so an operator can retune without editing the plugin tree), then a
+    conservative default.
+
+    The default is 60 s rather than the SDK's 600 s because this call sits
+    inside the judge's single-slot semaphore: a long timeout is not "slow",
+    it is "the whole judge queue is stopped". A bounded failure lets
+    `llm_judge`'s retry ladder make progress on the next attempt.
+    """
+    val = None
+    try:
+        from usr.plugins.skillopt.helpers import sleep_runner  # type: ignore
+    except Exception:
+        try:
+            from helpers import sleep_runner  # type: ignore
+        except Exception:
+            sleep_runner = None  # type: ignore[assignment]
+    if sleep_runner is not None:
+        try:
+            val = sleep_runner.merged_config().get("llm_call_timeout_s")
+        except Exception:
+            val = None
+    if val is None:
+        val = os.environ.get("SKILLOPT_LLM_TIMEOUT_S")
+    if val is None:
+        return 60.0
+    try:
+        out = float(val)
+    except (TypeError, ValueError):
+        return 60.0
+    # A non-positive timeout would mean "block forever" to httpx, which is
+    # the failure this fixes. Clamp instead.
+    if out <= 0:
+        return 60.0
+    return min(out, 600.0)
+
+
 def _call_llm(prompt: str, model: str, max_tokens: int = 2000, system: str | None = None) -> str:
     """Call the OpenAI-compatible LLM via the openai package.
 
@@ -181,7 +223,29 @@ def _call_llm(prompt: str, model: str, max_tokens: int = 2000, system: str | Non
     except Exception as exc:
         raise RuntimeError("privacy controls unavailable; refusing outbound model call") from exc
     from openai import OpenAI
-    client = OpenAI(base_url=base_url, api_key=api_key)
+
+    # v1.8.44 (re-audit R5): BOUND the call.
+    #
+    # `OpenAI(base_url=..., api_key=...)` inherits the SDK defaults, which are
+    # a 600 s read timeout and 2 internal retries. Multiplied through
+    # `llm_judge`'s own 4 attempts (SKILLOPT_JUDGE_RETRY_MAX) that is roughly
+    # TWO HOURS for one rollout - and `_call_llm` is invoked from inside
+    # `_judge_llm_call`, which holds `BoundedSemaphore(1)`. One
+    # non-responding endpoint therefore blocks every other judge caller, and
+    # `judge_client.judge_rollouts` is a synchronous loop called inline by
+    # `run_sleep_cycle.py`, so a single cycle could hang for the whole backlog.
+    #
+    # `max_retries=0` on purpose: `llm_judge` owns the retry policy, and it
+    # owns it better - it is pacing-aware, bounded by SKILLOPT_JUDGE_RETRY_MAX,
+    # and it backs off on 429. Letting the SDK retry underneath it produced
+    # un-paced nested attempts, which is the 429 storm the burst-protection
+    # layers exist to prevent.
+    #
+    # `ping_judge` already passed a timeout and `max_retries=1`; this is the
+    # production call it claims to mirror exactly.
+    timeout_s = _call_timeout_s()
+    client = OpenAI(base_url=base_url, api_key=api_key,
+                    timeout=timeout_s, max_retries=0)
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -278,6 +342,27 @@ def restore_frontmatter(current: str, improved: str) -> str:
     current_fm, _current_body = _split_frontmatter(current)
     if not current_fm.strip():
         return improved  # nothing to restore from
+    # v2026-10-13: also repair an UNTERMINATED frontmatter opening - the
+    # model emitted `---` but never closed it (weak/truncating models do
+    # this), which the framework-schema gate reports as "Unterminated YAML
+    # frontmatter" and 2 of 13 drain attempts died on during
+    # 2026-10-05..10-13. Repair the same way as the missing case: replace
+    # the broken header with the current skill's frontmatter (name and
+    # description are identity, not prose) and keep the body.
+    if (improved or "").lstrip().startswith("---"):
+        lines = (improved or "").lstrip().splitlines()
+        header_end = None
+        for idx in range(1, len(lines)):
+            if not lines[idx].strip():
+                # first blank line after the opener - frontmatter keys end there
+                header_end = idx
+                break
+        if header_end is None:
+            header_end = len(lines)  # no blank line at all: treat all as broken header
+        body = "\n".join(lines[header_end + 1:]).lstrip("\n")
+        if body.strip():
+            return current_fm.rstrip("\n") + "\n\n" + body
+        return improved  # nothing usable left outside the broken header
     return current_fm.rstrip("\n") + "\n\n" + (improved or "").lstrip("\n")
 
 
@@ -380,7 +465,59 @@ def optimize_skill(skill_name: str, min_rollouts: int = 3, model: str | None = N
     improved = restore_frontmatter(current_skill, improved)
 
     staging_path = sleep_runner.staging_dir() / f"{skill_name}.md"
+    # v1.8.46 (audit R16): redact BEFORE persistence, not only at the live
+    # write. `adopt_write_skill` did redact on the way into
+    # `usr/skills/`, but by then the raw model output had already been
+    # written to `staging/<skill>.md`, copied verbatim into
+    # `staging/adopted/*.md`, and embedded in the summary sidecar's diff
+    # - so the unredacted bytes outlived the fix in three places.
+    #
+    # The contract says redaction applies "both before persistence and
+    # again at every boundary". For model output there was only ever the
+    # second one. Redacting here makes the staged artefact safe for every
+    # later reader, including a human reviewing the diff on the card.
+    _redacted_before_persist = False
+    try:
+        from usr.plugins.skillopt.helpers import privacy as _pv  # type: ignore
+    except Exception:
+        try:
+            from helpers import privacy as _pv  # type: ignore
+        except Exception:
+            _pv = None  # type: ignore[assignment]
+    if _pv is not None:
+        try:
+            if _pv.privacy_settings().get("redact_secrets", True):
+                _clean = _pv.redact_text(improved)
+                if _clean != improved:
+                    improved = _clean
+                    _redacted_before_persist = True
+        except Exception as e:
+            # Never raise on a privacy bug, but never pretend either: a
+            # gate passing is unaffected, and the second gate at the live
+            # write still runs.
+            logging.getLogger(__name__).warning(
+                "pre-persist redaction failed for %s: %s", skill_name, e)
     staging_path.write_text(improved, encoding="utf-8")
+    # v1.8.34: write the proposal summary so the approval UI can show WHAT
+    # changed and WHY instead of only the skill name. Best-effort by
+    # construction (proposal_view.annotate_staged never raises): the write
+    # above already succeeded, so a summary failure must not turn a good
+    # rewrite into a failed cycle. This path has no official gate marker,
+    # so the summary records `official_gated: false` plus a provenance
+    # warning — which is exactly the information a reviewer needs before
+    # approving an ungated local rewrite.
+    try:
+        from usr.plugins.skillopt.helpers import proposal_view  # type: ignore
+    except Exception:
+        try:
+            from helpers import proposal_view  # type: ignore
+        except Exception:
+            proposal_view = None  # type: ignore[assignment]
+    if proposal_view is not None:
+        try:
+            proposal_view.annotate_staged(staging_path, skill=skill_name)
+        except Exception:
+            pass
     critique_path = _write_critique(skill_name, current_skill, improved, len(successes), len(failures), model)
     return {
         "ok": True,
@@ -393,6 +530,12 @@ def optimize_skill(skill_name: str, min_rollouts: int = 3, model: str | None = N
         "improved_size": len(improved),
         "current_size": len(current_skill),
         "model": model,
+        # v1.8.50 (audit G4): the pre-persist redaction flag was computed and
+        # read NOWHERE. The staged document is a persistence boundary exactly
+        # like the live write, so the v1.8.46 contract ("every caller must act
+        # on it") applies here too - a reviewer looking at `staging/<skill>.md`
+        # is looking at redacted bytes, and the audit row must say so.
+        "redacted_before_persist": bool(_redacted_before_persist),
     }
 
 

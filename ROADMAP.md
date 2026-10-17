@@ -4,6 +4,45 @@ This document is the engineering roadmap for the SkillOpt self-evolution plugin.
 
 If you are a new contributor: start with the **Day 3** items. They are the highest-leverage missing pieces, all scoped to a few hundred lines of code each.
 
+## Shipped in v1.8.34 (2026-10-03)
+
+Informed approval and dual-mode operation landed together, because they share
+the same missing plumbing: a staged proposal had no identity in the approval
+ledger, and there was no single switch describing who decides whether a change
+lands.
+
+- **Informed approval.** Every staged proposal gets a bounded
+  `ProposalSummary` (`helpers/proposal_view.py`, schema
+  `skillopt.proposal_summary/1`, sidecar `staging/<skill>.md.summary.json`):
+  intent classification, one-paragraph summary, evidence-anchored rationale,
+  gate evidence, and a unified diff against the live `SKILL.md`.
+  `POST /proposal` serves one proposal for the uncapped view. Intent is
+  advisory and is never read by a gate.
+- **Proposal ↔ decision link.** `staging/` keys on the filename stem and
+  `governance.log` keys on the skill; `find_pending_proposal()` and the
+  optional `proposal_id` / `summary_id` kwargs on `mark_human_decision()` close
+  that gap in both directions, so a card can finally name the document its
+  Approve button refers to.
+- **Dual mode.** `governance.evolution_mode` (`manual` default |
+  `autonomous`) is the single switch; `auto_adopt` is demoted to a legacy
+  alias. `resolve_evolution_mode()` replaces three
+  `bool(cfg.get("auto_adopt", False))` call sites that were wrong in opposite
+  directions. `logs/runs/.autonomous_pause` overrides both.
+- **Bounded autonomy.** 5 adoptions/day, 2/skill/day, optional post-adopt
+  verification with automatic rollback, and a `decided_by: autonomous` audit
+  row through the existing ledger. Optout / immutable / pause / cadence rails
+  are unchanged and asserted under `auto_adopt=True`.
+
+Two adjacent live defects found by the same survey were fixed in the release:
+the settings page's `save()` hard-coded 6 keys while the page declared 13 (five
+rendered controls were silently discarded on every save), and `api/config.py`
+persisted client values verbatim.
+
+Design document, including the reasoning behind the one-resolver decision and
+the default-inert `autonomous_min_evidence_rollouts`:
+[PLAN_informed_approval_autonomous_mode.md](PLAN_informed_approval_autonomous_mode.md).
+Smoke suite: 222/222, 18 new deterministic cases.
+
 ## Current audit and next work (2026-09-26)
 
 This section reflects the local plugin snapshot reviewed on 2026-09-26. The deterministic plugin smoke suite passed all 202 checks after v1.8.29 retention work; no live A0 runtime or provider-backed optimization cycle was exercised.

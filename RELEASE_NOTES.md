@@ -2,6 +2,47 @@
 
 ---
 
+## v1.8.34 - approval you can actually decide on, and autonomy you can bound
+
+> **Manual mode still applies nothing without you, and that is still the
+> default.** Nothing changes for an install that leaves the mode alone.
+>
+> *Informed approval.* Every staged proposal now carries a bounded summary:
+> an intent badge, a one-paragraph summary, rationale bullets tied to recorded
+> evidence, the gate verdict, and a unified diff against the live
+> `SKILL.md`. Before this, the Governance card rendered a skill **name** and
+> the one field built for a summary was `"diff_summary": f"{size} bytes"` —
+> a stringified byte count the template never rendered. Proposals and decisions
+> were also disjoint stores, so no card could say *which* document its Approve
+> button referred to; that link now exists in both directions.
+>
+> *Dual mode.* `governance.evolution_mode` (`manual` | `autonomous`) is the one
+> switch. The pre-existing `auto_adopt` is now a **legacy alias** rather than a
+> second control, because three call sites reading
+> `bool(cfg.get("auto_adopt", False))` were wrong in opposite directions:
+> `auto_adopt:` with no value silently **stopped** the drain, and the string
+> `"false"` silently **started** it. `logs/runs/.autonomous_pause` overrides
+> everything, so autonomy can be frozen without editing config or restarting.
+>
+> *Bounded autonomy.* `auto_adopt_max_per_tick` is 5 and a tick is 30 minutes,
+> so the ceiling on writes to live skills was ~240/day with no daily bound. Now:
+> 5/day, 2/skill/day, optional post-adopt verification with automatic rollback,
+> and every autonomous adoption logged as `decided_by: autonomous` — one
+> ledger, using the discriminator that already existed, so a machine decision
+> stays permanently distinguishable from a human one. Optout, immutable,
+> pause, and cadence rails are unchanged and still win; a test asserts each
+> one under `auto_adopt=True`.
+>
+> *Two adjacent fixes found on the way.* The settings page's `save()` hard-coded
+> six keys while the page declared **thirteen**, so five rendered controls —
+> every `privacy_*` toggle, rollout retention, and the three `replay_evalkit_*`
+> settings — were silently discarded on every save; the same class of defect as
+> the v1.8.2 config wipe. And `api/config.py` persisted client values verbatim,
+> so `"yes"` for a boolean reached every consumer unvalidated.
+>
+> Smoke suite: 222/222 (18 new deterministic cases). Design and the reasoning
+> behind the default-inert choices: `PLAN_informed_approval_autonomous_mode.md`.
+
 ## v1.8.20 - the gated cycle runner completes its first fully healthy lifecycle
 
 > Ingestion -> judge (3/3 valid labels) -> official gate -> summary now

@@ -249,34 +249,101 @@ def _light_parse_yaml(text: str) -> dict[str, Any]:
     return out
 
 
+_DEFAULT_CFG_CACHE: dict[str, Any] = {"mtime": None, "size": None, "parsed": None}
+
+
+def _deep_copy(value: Any) -> Any:
+    """A structural copy of a JSON-ish tree, best-effort.
+
+    v1.8.39 (audit M13): `default_config()` returns a value callers MUTATE
+    (`cfg["x"] = y`, `merged_config()` does `merged.update(reg)` and
+    `dict(sec)` merges), so a shared cached dict would leak state between
+    callers - which is exactly why the original docstring said no cache could
+    be used. The fix is to cache the PARSE and hand out a copy, so the
+    expensive `yaml.safe_load` of a 32 KB / 100+ key file happens once per
+    file change instead of on every call.
+
+    v1.8.47 (re-audit R32): the fallback docstring claimed returning the
+    original "is strictly safer than returning a shared structure" - it IS a
+    shared structure, so on a deepcopy failure a caller mutating the result
+    would corrupt the cached parse for the life of the process. The fallback
+    now rebuilds dicts, lists and tuples (a fresh container at every level)
+    and only returns the value itself for immutables, which cannot be
+    mutated in place.
+    """
+    try:
+        import copy
+        return copy.deepcopy(value)
+    except Exception:
+        pass
+    if isinstance(value, dict):
+        return {k: _deep_copy(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_deep_copy(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_deep_copy(v) for v in value)
+    # Immutables (str, int, bool, None, ...) cannot be mutated in place, so
+    # sharing them is safe.
+    return value
+
+
 def default_config() -> dict[str, Any]:
     """Parse the bundled default_config.yaml as a dict.
 
     v1.8.24 (P2.11): uses PyYAML when it is importable, so the nested
     `budget:` / `cadence:` / `governance:` sections arrive as dicts instead of
-    the empty strings the flat fallback produced. The flat parser remains as a
-    no-dependency fallback; PyYAML ships with Agent Zero, so the nested path is
-    the normal one.
+    the empty strings the light parser produced. The flat parser remains as a
+    no-dependency fallback; PyYAML ships with Agent Zero, so the nested path
+    is the normal one.
 
-    The returned mapping is a fresh dict on every call - callers mutate it
-    (e.g. `cfg["x"] = y` in tests), so a shared module-level cache would leak
-    state between callers.
+    The returned mapping is a fresh, MUTABLE copy on every call - callers
+    mutate it (`cfg["x"] = y` in tests, `merged.update(reg)` in
+    `merged_config`), so handing back a shared cached dict would leak state
+    between callers.
+
+    v1.8.39 (audit M13): the PARSE is now cached on (mtime, size). This sits
+    on the reward-model scoring path (`score_rollout` -> `model_path` ->
+    `merged_config` -> `default_config`), which runs once per finished chat in
+    the harvester and 2xN per real gate, so re-reading and re-parsing 32 KB
+    of YAML that many times is pure waste. The cache key is the file's
+    mtime+size, so editing `default_config.yaml` still takes effect
+    immediately - and a failed stat simply bypasses the cache rather than
+    serving something stale.
     """
     p = plugin_root() / "default_config.yaml"
     if not p.is_file():
         return {}
+    try:
+        st = p.stat()
+        key = (st.st_mtime, st.st_size)
+    except OSError:
+        key = None
+    if key is not None and _DEFAULT_CFG_CACHE["mtime"] == key:
+        cached = _DEFAULT_CFG_CACHE["parsed"]
+        if isinstance(cached, dict):
+            return _deep_copy(cached)
+
     text = p.read_text(encoding="utf-8")
+    parsed: dict[str, Any]
     try:
         import yaml  # type: ignore
     except Exception:
-        return _light_parse_yaml(text)
-    try:
-        parsed = yaml.safe_load(text)
-    except Exception:
-        # A malformed YAML file must not take the loop down; the light parser
-        # is strictly more forgiving.
-        return _light_parse_yaml(text)
-    return parsed if isinstance(parsed, dict) else {}
+        parsed = _light_parse_yaml(text)
+    else:
+        try:
+            loaded = yaml.safe_load(text)
+        except Exception:
+            # A malformed YAML file must not take the loop down; the light
+            # parser is strictly more forgiving.
+            parsed = _light_parse_yaml(text)
+        else:
+            parsed = loaded if isinstance(loaded, dict) else {}
+
+    if key is not None:
+        _DEFAULT_CFG_CACHE["mtime"] = key
+        _DEFAULT_CFG_CACHE["size"] = key[1]
+        _DEFAULT_CFG_CACHE["parsed"] = parsed
+    return _deep_copy(parsed)
 
 
 def _framework_registry_config() -> dict[str, Any]:
@@ -315,6 +382,33 @@ def _framework_registry_config() -> dict[str, Any]:
 
 _FRAMEWORK_CFG_CACHE: dict[str, Any] = {"at": 0.0, "cfg": {}}
 _FRAMEWORK_CFG_TTL = 5.0
+
+
+def invalidate_framework_config_cache() -> None:
+    """Drop the memoised framework plugin-config read.
+
+    v1.8.43 (re-audit R3). **Call this after writing plugin config.**
+
+    The TTL above is only safe for READS. Two consequences made it unsafe
+    for writes:
+
+      - `api/mode.py` builds its response from the config it just wrote and
+        passes it to `resolve_evolution_mode(cfg)` - which prefers the
+        registry whenever the registry yields anything. So the POST response
+        reported the PRE-write mode, and `webui/config.html` rendered that
+        stale value immediately after the operator toggled it.
+      - Worse, in the AUTHORISATION direction: the drain reads the mode
+        through the same cache. After the operator switched autonomy OFF, the
+        drain could keep resolving `autonomous` for up to the TTL and write a
+        live `SKILL.md`. A stale permissive answer on the path to a live file.
+
+    `plugins.clear_plugin_cache()` does NOT clear this memo - it clears the
+    framework's own cache, not ours - so the two must be invalidated
+    together. Every write path in this plugin (the `/mode` route and
+    `api/config.py`) must call both.
+    """
+    _FRAMEWORK_CFG_CACHE["at"] = 0.0
+    _FRAMEWORK_CFG_CACHE["cfg"] = {}
 
 
 def merged_config(framework_config: dict | None = None) -> dict[str, Any]:
@@ -498,15 +592,23 @@ def _move_staged_proposal(src: str | os.PathLike, subdir: str, tag: str) -> Path
     except Exception:
         return None
     # Sidecars travel with the proposal: the official-gate marker (v1.8.1),
-    # and the v1.8.22 real-gate verdict sidecar + frozen held-out tasks
-    # file. Without this, a pending-real-gate proposal consumed or
-    # quarantined by the manual /adopt path would strand its sidecar in
-    # staging top level — and find_pending_real_gate_sidecar() (single
-    # flight) would then block every future real-gate spawn forever.
+    # the v1.8.22 real-gate verdict sidecar + frozen held-out tasks
+    # file, and the v1.8.34 proposal-summary sidecar. Without this, a
+    # pending-real-gate proposal consumed or quarantined by the manual
+    # /adopt path would strand its sidecar in staging top level — and
+    # find_pending_real_gate_sidecar() (single flight) would then block
+    # every future real-gate spawn forever.
+    #
+    # v1.8.34: PROPOSAL_SUMMARY_SUFFIX is in this tuple from the same
+    # commit that introduces it. An orphaned `.summary.json` is the same
+    # failure mode as an orphaned real-gate sidecar, and a proposal whose
+    # summary was left behind would render a summary referencing a
+    # destination that no longer exists.
     for _sidecar, _suffix in (
         (marker, OFFICIAL_GATE_MARKER_SUFFIX),
         (_real_gate_sidecar_path(src_path), REAL_GATE_SIDECAR_SUFFIX),
         (_real_gate_tasks_path(src_path), REAL_GATE_TASKS_SUFFIX),
+        (_proposal_summary_path(src_path), PROPOSAL_SUMMARY_SUFFIX),
     ):
         try:
             if _sidecar.is_file():
@@ -647,10 +749,69 @@ def adopt_write_skill(skill_name: str, proposed: str) -> dict[str, Any]:
        kill mid-write leaves a half-written skill document: a different kind
        of broken, with no clean rollback target either.
 
-    Returns {"ok", "snapshotted", "path"}. On a snapshot failure it returns
-    ok=False WITHOUT writing - a snapshot we could not take must not be
-    followed by an overwrite, because that is the unrecoverable case.
+    Returns {"ok", "snapshotted", "path", "redacted"}. On a snapshot failure
+    it returns ok=False WITHOUT writing - a snapshot we could not take must
+    not be followed by an overwrite, because that is the unrecoverable case.
+
+    v1.8.39 (audit M9): this is also the LAST-CHANCE redaction point for
+    MODEL OUTPUT. `privacy.py` sanitizes rollout INPUT at every provider and
+    replay boundary, and it fails closed there - but the model's RETURNED
+    text was never sanitized, so it flowed `_extract_skill_text` -> staging
+    -> approval -> live `SKILL.md` verbatim. A credential echoed back from a
+    prompt (the classic "here is the config you asked about") therefore
+    became part of a live skill document, and from there part of the system
+    prompt on every later load.
+
+    This function is the single choke point every adopt path goes through
+    (api/adopt.py, tools/skillopt_sleep.py, both auto_loop paths), so
+    redacting here covers all of them at once. It is deliberately the LAST
+    gate rather than the only one: redaction is best-effort by contract, so
+    it must not be the sole defence. `redacted: True` in the result tells
+    the caller the document was changed on the way in, so the audit row can
+    record it.
     """
+    # v1.8.49 (audit X1): an EMPTY document is refused here, in the choke
+    # point, before the snapshot. `fragment_store.restore_default_snapshot`
+    # restores whichever `_default.pre_adopt.md` it finds, and for a skill the
+    # plugin created from nothing that file is legitimately **0 bytes** - which
+    # is the state this very function produces (`current = ""` when the live
+    # file does not exist). A 0-byte file IS a file, so it shadowed every real
+    # `_default.vN.md`: the operator clicked `rollback(skill)`, got
+    # `{"ok": true, "bytes": 0}`, and the live skill was emptied. 16 of this
+    # install's pre_adopt snapshots were already 0 bytes. No legitimate caller
+    # can be affected: `validate_proposal` rejects an empty proposal long
+    # before this, and only `/rollback` arrives with arbitrary bytes.
+    if not (isinstance(proposed, str) and proposed.strip()):
+        return {
+            "ok": False,
+            "error": "refusing to write an empty live skill document",
+            "snapshotted": False,
+            "path": str(safe_skill_md(skill_name)) if skill_name else "",
+            "redacted": False,
+        }
+    redacted = False
+    if isinstance(proposed, str) and proposed:
+        try:
+            from usr.plugins.skillopt.helpers import privacy as _privacy  # type: ignore
+        except Exception:
+            try:
+                from helpers import privacy as _privacy  # type: ignore
+            except Exception:
+                _privacy = None  # type: ignore[assignment]
+        if _privacy is not None:
+            try:
+                settings = _privacy.privacy_settings()
+                if settings.get("redact_secrets", True):
+                    cleaned = _privacy.redact_text(proposed)
+                    if cleaned != proposed:
+                        proposed = cleaned
+                        redacted = True
+            except Exception:
+                # Best-effort by contract: a redaction failure must not block
+                # an adopt that already passed the gate. The alternative -
+                # refusing to write - would let a privacy bug halt evolution.
+                pass
+
     target = safe_skill_md(skill_name)
     current = ""
     if target.is_file():
@@ -661,6 +822,7 @@ def adopt_write_skill(skill_name: str, proposed: str) -> dict[str, Any]:
                 "ok": False,
                 "error": f"could not read the live skill before adopting: {exc}",
                 "path": str(target),
+                "redacted": redacted,
             }
 
     try:
@@ -668,13 +830,31 @@ def adopt_write_skill(skill_name: str, proposed: str) -> dict[str, Any]:
     except Exception:
         from helpers import fragment_store  # type: ignore
 
+    # v1.8.48 (audit T1): `snapshot_default` NEVER raises - it returns
+    # {ok: False, error}. The old `except Exception` around it was therefore
+    # structurally incapable of firing and its return value was discarded,
+    # so a failed snapshot (read-only mount, ENOSPC, permissions) fell
+    # straight through to the live write and answered "snapshotted": True.
+    # That is the unrecoverable case the contract names: /rollback would
+    # have no target. Check the RESULT, and treat an unusable result as a
+    # failure - the callee owns the exception path, the caller owns the
+    # decision.
     try:
-        fragment_store.snapshot_default(skill_name, current)
+        snapshot = fragment_store.snapshot_default(skill_name, current)
     except Exception as exc:
         return {
             "ok": False,
             "error": f"snapshot failed, refusing to overwrite {target}: {exc}",
             "path": str(target),
+            "redacted": redacted,
+        }
+    if not (isinstance(snapshot, dict) and snapshot.get("ok")):
+        _snap_err = (snapshot or {}).get("error") if isinstance(snapshot, dict) else snapshot
+        return {
+            "ok": False,
+            "error": f"snapshot failed, refusing to overwrite {target}: {_snap_err}",
+            "path": str(target),
+            "redacted": redacted,
         }
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -688,9 +868,11 @@ def adopt_write_skill(skill_name: str, proposed: str) -> dict[str, Any]:
                 tmp.unlink()
         except OSError:
             pass
-        return {"ok": False, "error": f"atomic write failed: {exc}", "path": str(target)}
+        return {"ok": False, "error": f"atomic write failed: {exc}",
+                "path": str(target), "redacted": redacted}
 
-    return {"ok": True, "snapshotted": True, "path": str(target)}
+    return {"ok": True, "snapshotted": True, "path": str(target),
+            "redacted": redacted}
 
 
 def framework_schema_errors(proposed: str) -> list[str]:
@@ -942,6 +1124,8 @@ def validate_proposal(
     # official_gated=True (the official engine judges quality and must not
     # override what the user allows us to touch).
     if skill_name:
+        _pol = None
+        _pol_err = None
         try:
             _gov = sys.modules.get("helpers.governance")
             if _gov is None:
@@ -950,61 +1134,134 @@ def validate_proposal(
                 except ImportError:
                     from helpers import governance as _gov
             _pol = _gov.load_skill_policy(skill_name)
+        except Exception as _e:
+            _gov = None  # type: ignore[assignment]
+            _pol_err = _e
+        # v1.8.48 (audit T9): the three scope constraints now evaluate
+        # SEPARATELY. They used to share one `try`, so a single malformed
+        # value (`max_verbosity_delta_ratio: "0.1x"`, copied verbatim from the
+        # operator's policy file) raised, the handler logged at DEBUG, and
+        # `forbid_patterns` + `allowed_fragments` - the strongest operator
+        # constraints, and the ones the contract says outrank the official
+        # engine - never executed at all. A rail that cannot be evaluated must
+        # DEFER (here: refuse), never wave through.
+        if _pol is None:
+            try:
+                import logging as _logging
+                _logging.getLogger("skillopt.sleep_runner").warning(
+                    "[skillopt] policy scope gate could not read the policy for "
+                    "%s; refusing: %s", skill_name, _pol_err)
+            except Exception:
+                pass
+            return False, "policy_scope_unreadable: " + str(_pol_err)
+        try:
             _maxverb = _pol.get("max_verbosity_delta_ratio")
             if _maxverb is not None and current:
                 _ratio = float(_maxverb)
-                if _ratio >= 0 and len(proposed or "") > len(current) * (1.0 + _ratio):
+                if _ratio < 0:
+                    return False, "policy_scope_verbosity_invalid: " + str(_maxverb)
+                if len(proposed or "") > len(current) * (1.0 + _ratio):
                     return False, ("policy_scope_verbosity_exceeded: "
                         + str(len(proposed or "")) + " > "
                         + str(int(len(current) * (1.0 + _ratio))))
+        except (TypeError, ValueError) as _e:
+            try:
+                import logging as _logging
+                _logging.getLogger("skillopt.sleep_runner").warning(
+                    "[skillopt] max_verbosity_delta_ratio unreadable for %s: %s",
+                    skill_name, _e)
+            except Exception:
+                pass
+            return False, "policy_scope_verbosity_unreadable: " + str(_e)
+        try:
             _forbid = _pol.get("forbid_patterns") or []
+            if isinstance(_forbid, str):
+                _forbid = [_forbid]
+            if not isinstance(_forbid, (list, tuple)):
+                raise TypeError("forbid_patterns must be a list")
             for _pat in _forbid:
                 if str(_pat) and str(_pat) in (proposed or ""):
                     return False, "policy_scope_forbidden_pattern: " + str(_pat)
+        except Exception as _e:
+            try:
+                import logging as _logging
+                _logging.getLogger("skillopt.sleep_runner").warning(
+                    "[skillopt] forbid_patterns unreadable for %s: %s",
+                    skill_name, _e)
+            except Exception:
+                pass
+            return False, "policy_scope_forbid_patterns_unreadable: " + str(_e)
+        try:
             _allowed = _pol.get("allowed_fragments") or []
+            if isinstance(_allowed, str):
+                _allowed = [_allowed]
+            if not isinstance(_allowed, (list, tuple)):
+                raise TypeError("allowed_fragments must be a list")
             if _allowed:
                 _md = _gov._skill_dir(skill_name) / "SKILL.md"
-                if _md.is_file():
-                    _fs = sys.modules.get("helpers.fragment_store")
-                    if _fs is None:
-                        try:
-                            from usr.plugins.skillopt.helpers import fragment_store as _fs
-                        except ImportError:
-                            from helpers import fragment_store as _fs
-                    _named = [f for f in _fs.read_fragments(str(_md))
-                        if f.get("id") != "_default"]
-                    if _named:
-                        import tempfile as _tfs
-                        _fdS, _tpS = _tfs.mkstemp(suffix=".md", prefix="skillopt_scope_")
-                        try:
-                            os.close(_fdS)
-                            Path(_tpS).write_text(proposed or "", encoding="utf-8")
-                            _prop = _fs.read_fragments(_tpS)
-                        finally:
-                            try:
-                                os.unlink(_tpS)
-                            except Exception:
-                                pass
-                        _cur = {f.get("id"): f.get("text", "") for f in _named}
-                        _new = {f.get("id"): f.get("text", "") for f in _prop}
-                        for _fid, _ctext in _cur.items():
-                            if _fid in _allowed:
-                                continue
-                            if _new.get(_fid, "") != _ctext:
-                                return False, ("policy_scope_fragment_not_allowed: "
-                                    + str(_fid))
-                        for _fid in _new:
-                            if (_fid not in _cur and _fid != "_default"
-                                    and _fid not in _allowed):
-                                return False, ("policy_scope_new_fragment_not_allowed: "
-                                    + str(_fid))
+                if not _md.is_file():
+                    # v1.8.49 (audit X5): the scope cannot be evaluated
+                    # against a skill that has no live document, so DEFER.
+                    return False, (
+                        "policy_scope_fragments_unevaluable: allowed_fragments "
+                        f"is set but {_md} does not exist, so the constraint "
+                        "cannot be enforced")
+                _fs = sys.modules.get("helpers.fragment_store")
+                if _fs is None:
+                    try:
+                        from usr.plugins.skillopt.helpers import fragment_store as _fs
+                    except ImportError:
+                        from helpers import fragment_store as _fs
+                _named = [f for f in _fs.read_fragments(str(_md))
+                    if f.get("id") != "_default"]
+                if not _named:
+                    # v1.8.49 (audit X5): `read_fragments` returns exactly one
+                    # `_default` entry - the WHOLE file - for a skill with no
+                    # `fragments:` frontmatter, so `_named` is empty for most
+                    # skills. The old `if _named:` silently skipped the
+                    # operator's strongest scope constraint on exactly those
+                    # skills: `allowed_fragments: ["intro"]` bought literally
+                    # nothing. A rail that cannot be evaluated must DEFER, and
+                    # the refusal names the constraint and the skill so the
+                    # operator can see which key to change.
+                    return False, (
+                        "policy_scope_fragments_unevaluable: allowed_fragments "
+                        f"is {_allowed!r} but skill {skill_name!r} declares no "
+                        "named fragments, so the scope cannot be enforced "
+                        "(remove the key to opt out of it)")
+                import tempfile as _tfs
+                _fdS, _tpS = _tfs.mkstemp(suffix=".md", prefix="skillopt_scope_")
+                try:
+                    os.close(_fdS)
+                    Path(_tpS).write_text(proposed or "", encoding="utf-8")
+                    _prop = _fs.read_fragments(_tpS)
+                finally:
+                    try:
+                        os.unlink(_tpS)
+                    except Exception:
+                        pass
+                _cur = {f.get("id"): f.get("text", "") for f in _named}
+                _new = {f.get("id"): f.get("text", "") for f in _prop}
+                for _fid, _ctext in _cur.items():
+                    if _fid in _allowed:
+                        continue
+                    if _new.get(_fid, "") != _ctext:
+                        return False, ("policy_scope_fragment_not_allowed: "
+                            + str(_fid))
+                for _fid in _new:
+                    if (_fid not in _cur and _fid != "_default"
+                            and _fid not in _allowed):
+                        return False, ("policy_scope_new_fragment_not_allowed: "
+                            + str(_fid))
         except Exception as _scope_err:
             try:
                 import logging as _logging
-                _logging.getLogger("skillopt.sleep_runner").debug(
-                    "[skillopt] policy scope gate raised: %s", _scope_err)
+                _logging.getLogger("skillopt.sleep_runner").warning(
+                    "[skillopt] allowed_fragments gate raised for %s; refusing: %s",
+                    skill_name, _scope_err)
             except Exception:
                 pass
+            return False, "policy_scope_fragments_unreadable: " + str(_scope_err)
     # v1.2.0: stage 0.5 - per-fragment gate. Only when skill_path is
     # provided AND fragment_per_fragment_gate is enabled. We read the
     # current fragments, compare each to the proposed (resolved) text,
@@ -1101,8 +1358,36 @@ def validate_proposal(
             return False, "proposed skill has no markdown headers - likely malformed"
         if len(proposed) < min_chars:
             return False, f"proposed skill is too short ({len(proposed)} chars < {min_chars})"
-        if not has_example_block(proposed):
-            return False, "proposed skill has no triple-backtick example block (engine always emits one)"
+        # v2026-10-13 (gate-contract fix): the example-block stage was a hard
+        # requirement for EVERY proposal ("engine always emits one") — true
+        # only for the official Sleep engine. The direct optimizer emits
+        # prose skills and never emits an example block, so in the week
+        # 2026-10-05..10-13 the gate rejected 12 of 13 drain attempts (8 on
+        # exactly this reason) and autonomy - though resolved ON - adopted
+        # nothing. The contract is now engine-conditional:
+        #   - official-gated proposals: ALWAYS required (the official engine
+        #     contract; the operator cannot relax it);
+        #   - direct-engine proposals: required only when the operator opted
+        #     in via `direct_engine_require_example_block` (default false).
+        # The framework-schema gate above (valid YAML frontmatter + name +
+        # description), the header check and min_chars still stand for both.
+        _require_example_block = official_gated
+        if not _require_example_block:
+            _gate_cfg = {}
+            try:
+                _gate_cfg = default_config() or {}
+            except Exception:
+                _gate_cfg = {}
+            _flag = _gate_cfg.get("direct_engine_require_example_block", False)
+            if isinstance(_flag, str):
+                _flag = _flag.strip().lower() in ("true", "1", "yes", "on")
+            _require_example_block = bool(_flag)
+        if _require_example_block and not has_example_block(proposed):
+            return False, (
+                "proposed skill has no triple-backtick example block "
+                "(required for official-engine proposals; direct-engine "
+                "proposals need it only when direct_engine_require_example_block is on)"
+            )
         if current:
             if proposed == current:
                 return False, "proposed skill is byte-identical to current (no-op)"
@@ -1289,6 +1574,17 @@ def launch_sleep_subprocess(
     )
 
     proc = subprocess.Popen(cmd, **popen_kwargs)
+    # v1.8.39 (audit M11): close OUR copy of the log handle now that the child
+    # holds its own. `Popen` duplicates the descriptor, so the parent does not
+    # need to keep it open - and leaving it open leaked one descriptor per
+    # cycle. On Windows that also blocks `rotate_log_if_large` from
+    # `os.replace`-ing the file later, so rotation silently stopped working for
+    # any log that had been written to. Wrapped in try/except because a close
+    # failure must never lose the pid we just spawned.
+    try:
+        log_fh.close()
+    except Exception:
+        pass
     # v1.8.1: enforce the (previously dead) max_runs_retained retention so
     # every cycle doesn't leave a log behind forever. Best-effort.
     try:
@@ -1443,6 +1739,32 @@ def _gate_marker_path(staged_path: str | os.PathLike) -> Path:
     return p.with_suffix(p.suffix + OFFICIAL_GATE_MARKER_SUFFIX)
 
 
+# ----------------------------------------------------------------------- #
+# v1.8.34: proposal-summary sidecar (informed approval)
+# ----------------------------------------------------------------------- #
+#
+# The suffix + path helper live HERE, next to the gate marker, rather than
+# only in helpers/proposal_view.py. Two reasons:
+#   1. `_move_staged_proposal` must carry this sidecar when it consumes or
+#      quarantines a proposal, and that function must not import
+#      proposal_view (which imports sleep_runner) — a circular import.
+#   2. Keeping the authoritative name next to the other sidecar suffixes
+#      means the full sidecar set is readable in one place. The value is
+#      asserted equal to proposal_view.SUMMARY_SUFFIX by the smoke suite,
+#      so the two cannot drift.
+
+PROPOSAL_SUMMARY_SUFFIX = ".summary.json"
+
+
+def _proposal_summary_path(staged_path: str | os.PathLike) -> Path:
+    """`<staging>/<skill>.md` -> `<staging>/<skill>.md.summary.json`.
+
+    Mirrors proposal_view.summary_path; see the note above for why this is
+    duplicated rather than imported."""
+    p = Path(staged_path)
+    return p.with_suffix(p.suffix + PROPOSAL_SUMMARY_SUFFIX)
+
+
 def write_official_gate_marker(
     staged_path: str | os.PathLike,
     *,
@@ -1540,6 +1862,14 @@ def write_real_gate_sidecar(staged_path: str | os.PathLike, payload: dict[str, A
         return None
 
 
+# v1.8.49 (audit X4): how long a pending real-gate sidecar with an
+# UNRECORDED pid is honoured as in flight. The spawn window between writing the
+# placeholder sidecar and `Popen` returning is milliseconds; this is the
+# ceiling that keeps the T6 protection without letting a dead worker's sidecar
+# defer adoption forever.
+PENDING_PID_GRACE_S = 300.0
+
+
 def read_real_gate_sidecar(staged_path: str | os.PathLike) -> dict[str, Any] | None:
     """Return the real-gate sidecar dict for a staged proposal, or None
     when absent/unreadable (a corrupt sidecar is treated as ABSENT: the
@@ -1579,7 +1909,53 @@ def find_pending_real_gate_sidecar() -> dict[str, Any] | None:
                 continue
             if not isinstance(data, dict) or data.get("status") != "pending":
                 continue
-            if is_running(int(data.get("pid") or 0)):
+            # v1.8.48 (audit T6): "pid not recorded yet" and "pid is dead"
+            # are different answers. The spawner writes the pending sidecar
+            # BEFORE `Popen` with an explicit `pid: 0` placeholder and only
+            # fills in the real pid afterwards, so `is_running(0)` answered
+            # False for the whole spawn window and single-flight reported "no
+            # gate in flight" - an adopt could consume the proposal and
+            # orphan the worker's verdict. An UNKNOWN pid is in flight; only a
+            # known-dead pid is not. The dead-pid exemption above is
+            # deliberate and preserved.
+            _pid_raw = data.get("pid")
+            try:
+                _pid = int(_pid_raw or 0)
+            except (TypeError, ValueError):
+                _pid = -1
+            if _pid <= 0:
+                # v1.8.49 (audit X4): the T6 rule needs a ceiling. The
+                # realistic producer is not a narrow race: `Popen` returns a
+                # pid without validating the target, so a worker that dies
+                # instantly (import error, renamed script, bad sys.path) never
+                # rewrites the sidecar and leaves `status: pending, pid: 0`
+                # forever. Nothing else removes it either - the drain's orphan
+                # reaper needs the proposal to be GONE first, and the harvest
+                # timeout is autonomous-only - so in manual mode one such
+                # sidecar deferred EVERY adopt for EVERY skill, permanently.
+                # That is the F8 "defers forever" shape in a new place. Bound
+                # the unknown-pid case by the sidecar's own `started_ts`: a
+                # generous grace window covers any real spawn, and past it the
+                # worker cannot still be starting.
+                #
+                # v1.8.50 (audit G9): the window must also be bounded BELOW.
+                # A future `started_ts` yields a NEGATIVE age, which satisfied
+                # `<= PENDING_PID_GRACE_S` for ever: a clock skewed ahead, or
+                # one sidecar written with a wrong timestamp, would park
+                # adoption for as long as the skew lasts. `0.0 <= age <=` is
+                # the only reading that means "recently started".
+                _started = 0.0
+                for _k in ("started_ts", "started_at", "ts"):
+                    try:
+                        _started = float(data.get(_k) or 0.0)
+                    except (TypeError, ValueError):
+                        _started = 0.0
+                    if _started:
+                        break
+                if _started and 0.0 <= (time.time() - _started) <= PENDING_PID_GRACE_S:
+                    return data
+                continue
+            if is_running(_pid):
                 return data
     except Exception:
         pass
@@ -1645,6 +2021,14 @@ def launch_real_gate_worker(
         **_detached_popen_kwargs(),
     )
     proc = subprocess.Popen(cmd, **popen_kwargs)
+    # v1.8.39 (audit M11): as in launch_sleep_subprocess - the child holds its
+    # own duplicate of the descriptor, so the parent's copy is closed here.
+    # One leaked handle per real-gate spawn, and on Windows an open handle
+    # blocks rotation of that log.
+    try:
+        log_fh.close()
+    except Exception:
+        pass
     try:
         enforce_run_log_retention()
     except Exception:
@@ -1767,7 +2151,17 @@ def _budget_snapshot() -> dict:
     per_skill = {}
     for s in skills:
         try:
-            bt = budget.BudgetTracker(skill_name=s)
+            # v1.8.37 (audit F13): fully wired from the `budget:` block, so
+            # the per-skill status shows the operator's real cap rather than
+            # the module default. Falls back to a default-configured tracker
+            # when the budget gate is switched off, so the status block still
+            # reports something useful. This helper takes no `cfg`, so it
+            # resolves the merged config itself.
+            # v1.8.45 (R10): through the factory even when the gate
+            # is off, so a status read reports the same tracker the
+            # gate would use.
+            bt = budget.tracker_from_config(
+                s, merged_config(), default_when_disabled=True)
             per_skill[s] = bt.get_status()
         except Exception:
             continue

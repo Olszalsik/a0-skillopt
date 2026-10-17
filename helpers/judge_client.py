@@ -174,6 +174,13 @@ def judge_rollout(rollout: dict, model: str | None = None) -> dict[str, Any]:
     err = str(base.get('error') or '')
     if 'json parse' not in err and 'empty' not in err.lower():
         return base
+    # v1.8.44 (re-audit R6): `judge_outcome`'s failure shapes now carry
+    # `model`, so `judge_name` is the judge that actually FAILED. Previously
+    # both failure paths omitted it, `judge_name` was always '', the two
+    # "retry the resolved judge model with a bigger budget" rungs below never
+    # ran, and every such rollout was re-asked of the CHAT-slot model at
+    # 6000 tokens - the most expensive model in the preset - with the label's
+    # provenance misreporting which model judged it.
     judge_name = str(base.get('model') or '')
     candidates: list = []
     if judge_name:
@@ -187,7 +194,14 @@ def judge_rollout(rollout: dict, model: str | None = None) -> dict[str, Any]:
                 last = {'label': None, 'error': 'escalate@' + str(mt) + ': model resolution failed'}
                 continue
             prompt = _lj._build_judge_prompt(rollout)
-            raw = _do._call_llm(prompt, resolved, max_tokens=mt, system=_JUDGE_SYSTEM)
+            # v1.8.44 (R6): through `llm_judge.judge_call`, not
+            # `_do._call_llm` directly. The escalation used to bypass the
+            # in-flight limiter, the SKILLOPT_JUDGE_THROTTLE_S pacing and the
+            # retry policy, while `judge_rollouts` looped it over up to
+            # `limit` rollouts on one thread - an un-paced 429 storm from
+            # precisely the path meant to rescue a failed labelling.
+            raw = _lj.judge_call(prompt, resolved, max_tokens=mt,
+                                 system=_JUDGE_SYSTEM)
             parsed = _lj._parse_judge_response(raw)
         except Exception as e:  # noqa: BLE001
             last = {'label': None, 'error': 'escalate@' + str(mt) + ': ' + type(e).__name__ + ': ' + str(e)[:200]}

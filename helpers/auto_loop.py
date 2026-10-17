@@ -91,9 +91,71 @@ def _load_state() -> dict[str, Any]:
 
 
 def _save_state(state: dict[str, Any]) -> None:
+    """Write the single-writer auto-loop state file. Atomic + fsynced.
+
+    v1.8.35 (audit F6): this was a bare `write_text`, the only non-atomic
+    state write left in the plugin - `cadence.save_per_skill_state`,
+    `budget._save` and `sleep_runner.write_real_gate_sidecar` all already used
+    write-temp + `os.replace`. `Path.write_text` is open-truncate-then-write,
+    so the file is 0 bytes between `open()` and close.
+
+    That matters because there is a concurrent READER on another thread:
+    `get_loop_state()` is called from `api/loop.py` on the HTTP request
+    thread. A torn read there is swallowed by `_load_state`, which returns
+    DEFAULTS - so the counters are not merely stale, they are reset, and
+    `last_rollout_count_at_cycle` returns to 0, which makes the rollout delta
+    exceed the threshold and fire an immediate unscheduled cycle.
+
+    `fsync` before the rename makes the rename durable, not just atomic; the
+    temp file is cleaned up on any failure so a repeated crash cannot litter
+    `logs/runs/`. Never raises - the caller has no better recovery.
+    """
     p = _state_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fp:
+            fp.write(json.dumps(state, ensure_ascii=False, indent=2))
+            fp.flush()
+            try:
+                os.fsync(fp.fileno())
+            except OSError:
+                pass  # not all filesystems support it; atomicity still holds
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            if tmp.is_file():
+                tmp.unlink()
+        except Exception:
+            pass
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    """Coerce to int, defaulting only on absence/unusability - never on 0.
+
+    v1.8.48 (audit A8). `int(cfg.get(k, 5) or 5)` turns a deliberate `0` into
+    5, and the plugin's own contract bans the `or <default>` idiom for a
+    numeric setting. Used for every numeric tick knob that must honour an
+    explicit zero.
+    """
+    if value is None or isinstance(value, bool):
+        return int(default)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _cost_per_call_cents(cfg: dict[str, Any] | None) -> int:
+    """`budget.cost_per_call_cents`, defaulting only on absence.
+
+    v1.8.48 (audit A11). `int(... or 1)` charged 1 per cycle even when the
+    operator set 0, while the tracker built from the SAME key kept 0 and
+    reported 0 in the status - so the cap the operator believes is free still
+    accrued. The gate and the recorder must charge what the tracker reports.
+    """
+    raw = budget.budget_section(cfg or {}).get("cost_per_call_cents")
+    return max(0, _int_or_default(raw, 1))
 
 
 def _record_error(exc: BaseException, where: str) -> None:
@@ -106,14 +168,46 @@ def _record_error(exc: BaseException, where: str) -> None:
     }
     try:
         p = sleep_runner.runs_dir() / LAST_ERROR_FILENAME
-        p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        # v1.8.48 (audit A10): write atomically, like every other file in
+        # `logs/runs/`. This one has two readers OFF the writer thread - the
+        # HTTP status route and the monologue_start warning - and both
+        # degrade to "no error" on a torn read, so precisely when the loop is
+        # failing the banner can read clean.
+        tmp = p.with_name(p.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, indent=2))
+            fh.flush()
+            # v1.8.49 (audit X6): guard the fsync, exactly as the sibling
+            # `_save_state` does. An unguarded `OSError` from a filesystem that
+            # does not support it propagated to the cleanup branch, which
+            # unlinked the temp - so the CURRENT error was discarded and the
+            # banner kept rendering an older one. Losing the write is strictly
+            # better than losing the newest record.
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, p)
     except Exception:
-        pass
+        try:
+            tmp = sleep_runner.runs_dir() / (LAST_ERROR_FILENAME + ".tmp")
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
 
 
 # ----------------------------------------------------------------------- #
 # The daemon thread
 # ----------------------------------------------------------------------- #
+
+class _CadenceDisabled(Exception):
+    """Raised internally when `cadence.enabled` is false.
+
+    Control flow, not an error: it unwinds the cadence block so the
+    budget gate still runs, without logging a scary line.
+    """
+
 
 class AutoLoopThread(threading.Thread):
     """Background thread that periodically runs Sleep + auto-adopt."""
@@ -126,6 +220,12 @@ class AutoLoopThread(threading.Thread):
         # per-tick delta is gone - the trigger baseline is now the PERSISTED
         # state key `last_rollout_count_at_cycle` (survives restarts, only
         # advances when a cycle actually runs). See _tick().
+        # v1.8.35 (audit F5): the rollout-count cache is initialised HERE as
+        # an instance attribute, so `_invalidate_rollout_counts` (now an
+        # instance method) actually clears it. Previously the cache was only
+        # ever created lazily by the first drain, and the invalidation wrote
+        # a class attribute the instance permanently shadowed.
+        self._rollout_counts_cache: dict[str, int] | None = None
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -141,6 +241,11 @@ class AutoLoopThread(threading.Thread):
                 # the dashboard can tell "alive and ticking" apart from a
                 # thread that silently died (last_tick_at goes stale).
                 state["last_tick_at"] = time.time()
+                # v1.8.34: the per-tick rollout-count cache is only valid for
+                # one tick. Dropping it here keeps
+                # `autonomous_min_evidence_rollouts` comparing against live
+                # data rather than whatever the first drain ever saw.
+                self._invalidate_rollout_counts()
                 cfg = self._safe_config()
                 if not cfg:
                     # No config yet - wait and try again. v1.8.18: surface
@@ -166,13 +271,28 @@ class AutoLoopThread(threading.Thread):
                     continue
                 try:
                     self._tick(cfg, state)
+                    # v1.8.50 (audit G3): the sleep interval belongs INSIDE
+                    # this try, not after it. It was `int(cfg.get(k, 1800))`
+                    # evaluated outside any guard, and the exact valueless-YAML
+                    # case (`auto_loop_interval_sec:`) yields `None`, so
+                    # `int(None)` raised TypeError, escaped `_run` entirely and
+                    # killed the ONLY thread that ticks the plugin - nothing
+                    # above it could run again for the life of the process.
+                    # `_int_or_default` tolerates the value AND the structure
+                    # keeps a future coercion mistake from being fatal.
+                    interval = max(60, _int_or_default(
+                        cfg.get("auto_loop_interval_sec"), 1800))
+                    self._sleep(interval)
                 except Exception as e:
                     # Never let the thread die; record so the dashboard can see it
                     self._log(f"tick error: {e}")
                     _record_error(e, "tick")
                     state["last_error"] = f"{type(e).__name__}: {e}"
-                interval = max(60, int(cfg.get("auto_loop_interval_sec", 1800)))
-                self._sleep(interval)
+                    # Fall back to the shipped cadence rather than spinning.
+                    try:
+                        self._sleep(1800)
+                    except Exception:
+                        pass
         finally:
             state["running"] = False
             _save_state(state)
@@ -202,6 +322,15 @@ class AutoLoopThread(threading.Thread):
                     f"auto-loop: rollout retention removed {removed} expired file(s); "
                     f"baseline {base_before_prune} -> {state['last_rollout_count_at_cycle']}"
                 )
+                # v1.8.48 (audit A2): PERSIST it. The nearest `_save_state` is
+                # inside the per-skill cycle branch, which the pruning itself
+                # makes less likely to run (fewer files -> below threshold ->
+                # no cycle). So the log line reported an adjustment that was
+                # never written, and after a restart the stale, too-high base
+                # pinned `new_rollouts` at 0 until `removed + min_new` fresh
+                # rollouts arrived - weeks at a real harvest rate. This is
+                # the F6 class: an intent logged, a state not written.
+                self._save_state(state)
             if retention.get("errors"):
                 self._log(f"auto-loop: rollout retention had {retention['errors']} file error(s)")
         except Exception as e:
@@ -284,9 +413,34 @@ class AutoLoopThread(threading.Thread):
         except Exception as e:
             self._log(f"cycle_history tick entry failed: {e}")
 
-        # 3. Maybe auto-adopt
-        if cfg.get("auto_adopt", False):
+# 3. Maybe auto-adopt (v1.8.34: gated on the resolved operating mode,
+        # not on a bare truthiness test of cfg["auto_adopt"]).
+        try:
+            from usr.plugins.skillopt.helpers import governance as _gov_mode  # type: ignore
+        except Exception:
+            try:
+                from helpers import governance as _gov_mode  # type: ignore
+            except Exception:
+                _gov_mode = None  # type: ignore[assignment]
+        autonomous = False
+        if _gov_mode is not None:
+            try:
+                autonomous = bool(_gov_mode.resolve_evolution_mode()
+                                  .get("autonomous"))
+            except Exception:
+                autonomous = False
+        if autonomous:
             self._auto_adopt(state, cfg)
+        elif cfg.get("auto_adopt", False):
+            # A bare truthy legacy value that the resolver REJECTED (e.g. the
+            # string "false"). Auto-adopting on a value we just called invalid
+            # would be the worst possible outcome, so say so and stay manual
+            # rather than silently draining.
+            self._log(
+                "auto-loop: auto_adopt is set to a value the mode resolver "
+                "rejected - staying in manual mode (see resolve_evolution_mode "
+                "in logs/runs/auto_loop.log)"
+            )
 
     # ----------------------------------------------------------------- #
     # v1.6.0: engine selection + per-skill gating
@@ -376,11 +530,25 @@ class AutoLoopThread(threading.Thread):
                 f"auto-loop: {skill} cycle via {engine_used}: "
                 f"ok={result.get('ok')} {result.get('reason', '')}"
             )
+            if result.get("deferred"):
+                # A timed-out official subprocess is still writing to its
+                # staging area. Do not launch a competing direct cycle or
+                # consume this skill's cadence/budget until it finishes.
+                continue
             # Drain inner-loop suggestions only when the direct path
             # actually consumed them (official path doesn't take prompts).
             # v1.8.1: only the CONSUMED ids are drained; unconsumed ones
             # stay queued for the next cycle.
             if engine_used == "direct" and result.get("ok"):
+                # v1.8.50 (audit G4): act on the pre-persist redaction flag.
+                # The staged bytes a reviewer reads may not be the model's
+                # output; say so in the loop log, so the discrepancy is
+                # discoverable without diffing the provider transcript.
+                if result.get("redacted_before_persist"):
+                    self._log(
+                        f"auto-loop: staged proposal for {skill!r} was "
+                        f"redacted before it was written; the staged "
+                        f"document is not byte-identical to the model output")
                 self._drain_consumed_suggestions(
                     [skill], cfg,
                     consumed_ids=(custom_prompts.get(skill) or {}).get("consumed_ids"),
@@ -427,6 +595,8 @@ class AutoLoopThread(threading.Thread):
                     timeout_s=timeout,
                 )
                 if result.get("ok"):
+                    return {**result, "engine": "official"}
+                if result.get("deferred"):
                     return {**result, "engine": "official"}
                 # v1.6.1: an official gate REJECT is authoritative — the
                 # engine already evaluated the candidate on the held-out
@@ -508,23 +678,54 @@ class AutoLoopThread(threading.Thread):
     ) -> tuple[bool, str]:
         """Per-skill gate: governance + cadence + budget. Defensive.
 
-        On any helper failure we fall through to eligible (a helper bug
-        must never stall evolution), mirroring the fall-through in
-        _auto_adopt's governance check.
+        v1.8.35 (audit F8): helper failure now DEFERS (returns not-eligible)
+        instead of falling through to eligible. The old fall-through made a
+        governance bug indistinguishable from a clean bill of health: optout,
+        immutable, pause, cadence and budget were all skipped for that cycle,
+        and under autonomous mode the drain then wrote a live SKILL.md for a
+        skill the operator had opted out of or paused.
+
+        A stall is recoverable and visible (the reason is returned and
+        `_record_error` fires); a silent write to a live skill is neither.
+        Cadence and budget below keep their own fall-through, because those two
+        only throttle work and cannot authorise it.
         """
         # Governance (opt-out / immutable / rate-limited / approval).
         try:
             from usr.plugins.skillopt.helpers import governance  # type: ignore  # noqa: F401
         except Exception:
             governance = None  # type: ignore[assignment]
+        if governance is None:
+            # Absent governance is a broken install, not a permissive one.
+            self._log(
+                "governance module unavailable; DEFER (not eligible) rather "
+                "than run with every governance rail silently disabled"
+            )
+            return False, "governance_unavailable"
         if governance is not None:
             try:
-                # v1.8.18 (P2.1): the loop's own auto_adopt flag is the
-                # operator's autonomy opt-in - it overrides the per-skill
+                # v1.8.35 (audit F1): called with NO argument on purpose. Passing
+    # `cfg` here fed the merged blob into the resolver, and a merged
+    # blob always contains the shipped `governance.evolution_mode:
+    # manual` - so the default outranked an install whose config.json
+    # says `auto_adopt: true` and autonomy was silently inert. The
+    # operator's autonomy opt-in comes from
+                # governance.resolve_evolution_mode() - the single source of
+                # truth for manual vs autonomous. Do NOT read
+                # cfg["auto_adopt"] directly here: that bare truthiness test
+                # is None for `auto_adopt:` with no value (drain silently
+                # stops) and True for the string "false" (drain silently
+                # starts). The resolver strictly coerces and logs a rejected
+                # value instead.
+                #
+                # Autonomy still only overrides the per-skill
                 # pending-approval block (governance.py step 7). Optout /
-                # immutable / pause markers still win.
+                # immutable / pause / interval / budget markers are all
+                # evaluated ABOVE that step and always win.
                 eligible, reason = governance.check_skill_eligible(
-                    skill, auto_adopt=bool(cfg.get("auto_adopt", False)))
+                    skill,
+                    auto_adopt=bool(governance.resolve_evolution_mode()
+                                    .get("autonomous")))
                 try:
                     governance.mark_decision(skill, eligible, reason)
                 except Exception:
@@ -532,7 +733,30 @@ class AutoLoopThread(threading.Thread):
                 if not eligible:
                     return False, reason
             except Exception as e:
-                self._log(f"governance check failed for {skill!r}: {e}; fall through")
+                # v1.8.35 (audit F8): FAIL CLOSED, not open.
+                #
+                # This used to log "fall through" and continue into
+                # cadence/budget, returning eligible. That made a governance
+                # helper bug indistinguishable from a clean bill of health:
+                # optout, immutable, pause, cadence and budget were ALL
+                # skipped for that cycle, and under autonomous mode the drain
+                # then wrote a live SKILL.md for a skill the operator had
+                # opted out of or paused.
+                #
+                # The contract is explicit - "a rail that cannot be evaluated
+                # must defer, never wave through" - and a machine-written
+                # change to a live file is the case where deferring is
+                # obviously correct. This stalls the cycle rather than
+                # corrupting a skill, and both the log line and the reason
+                # below are the operator's only signal, so they are asserted
+                # by t_v1835_governance_failure_is_fail_closed.
+                self._log(
+                    f"governance check failed for {skill!r}: {e}; "
+                    f"DEFER (not eligible)"
+                )
+                # Module-level function, NOT a method on this class.
+                _record_error(e, "governance")
+                return False, "governance_unavailable"
 
         # Cadence: is this skill due for a cycle yet?
         if cadence is not None:
@@ -545,9 +769,19 @@ class AutoLoopThread(threading.Thread):
                 # DEFAULT_FLOOR_S/DEFAULT_CEILING_S - so an operator tuning
                 # `cadence:` saw no effect and had no way to know why.
                 ccfg = cfg.get("cadence")
+                if not isinstance(ccfg, dict):
+                    ccfg = {}
+                # v1.8.37 (audit F13): `cadence.enabled` was declared and never
+                # read, so switching cadence off had no effect.
+                if not bool(ccfg.get("enabled", True)):
+                    raise _CadenceDisabled()
+                target_n = (
+                    int(ccfg.get("target_rollouts"))
+                    if ccfg.get("target_rollouts") is not None else None
+                )
                 floor_s = (
-                    int(ccfg.get("floor_seconds")) if isinstance(ccfg, dict) and
-                    ccfg.get("floor_seconds") is not None else None
+                    int(ccfg.get("floor_seconds"))
+                    if ccfg.get("floor_seconds") is not None else None
                 )
                 ceiling_s = (
                     int(ccfg.get("ceiling_seconds")) if isinstance(ccfg, dict) and
@@ -558,9 +792,19 @@ class AutoLoopThread(threading.Thread):
                     kwargs["floor_s"] = floor_s
                 if ceiling_s is not None:
                     kwargs["ceiling_s"] = ceiling_s
+                # v1.8.37 (audit F13): `cadence.target_rollouts` was declared
+                # and never passed, so compute_next_run always used its own
+                # DEFAULT_TARGET. This is the "hot" threshold - how many new
+                # rollouts earn the floor interval instead of the ceiling.
+                if target_n is not None:
+                    kwargs["cadence_target"] = target_n
                 next_in_s = cadence.compute_next_run(new_n, **kwargs)
                 if (time.time() - st.get("last_run_at", 0.0)) < next_in_s:
                     return False, f"cadence: not due for {next_in_s}s"
+            except _CadenceDisabled:
+                # Operator switched the cadence gate off: fall through to the
+                # budget gate rather than treating it as an error.
+                pass
             except Exception as e:
                 self._log(f"cadence check failed for {skill!r}: {e}; fall through")
 
@@ -576,15 +820,17 @@ class AutoLoopThread(threading.Thread):
                 # cap (except -> "fall through" = always eligible); in
                 # _mark_skill_cycle it meant spend was never recorded. Accept
                 # dict only; anything else falls back to module defaults.
-                _b = cfg.get("budget")
-                if not isinstance(_b, dict):
-                    _b = {}
-                soft_pct = int(_b.get("soft_warn_pct", 80) or 0)
-                bt = budget.BudgetTracker(skill_name=skill, soft_warn_pct=soft_pct)
-                cost = int(_b.get("cost_per_call_cents", 1) or 1)
-                ok, reason = bt.can_spend(cost)
-                if not ok:
-                    return False, f"budget: {reason}"
+                # v1.8.37 (audit F13): one factory, fully wired from the
+                # `budget:` block. `daily_cap_cents` and `reset_hour_utc` were
+                # declared but never supplied here, so the effective cap was
+                # always the module default. Returns None when
+                # `budget.enabled` is false, which nothing read before.
+                bt = budget.tracker_from_config(skill, cfg)
+                if bt is not None:
+                    cost = _cost_per_call_cents(cfg)
+                    ok, reason = bt.can_spend(cost)
+                    if not ok:
+                        return False, f"budget: {reason}"
             except Exception as e:
                 self._log(f"budget check failed for {skill!r}: {e}; fall through")
 
@@ -611,12 +857,15 @@ class AutoLoopThread(threading.Thread):
                 # cap (except -> "fall through" = always eligible); in
                 # _mark_skill_cycle it meant spend was never recorded. Accept
                 # dict only; anything else falls back to module defaults.
-                _b = cfg.get("budget")
-                if not isinstance(_b, dict):
-                    _b = {}
-                soft_pct = int(_b.get("soft_warn_pct", 80) or 0)
-                bt = budget.BudgetTracker(skill_name=skill, soft_warn_pct=soft_pct)
-                cost = int(_b.get("cost_per_call_cents", 1) or 1)
+                # v1.8.37 (audit F13): same factory as the eligibility gate,
+                # so the tracker that RECORDS spend is configured identically
+                # to the one that REFUSES it. They used to differ.
+                # v1.8.45 (R10): through the factory even in the
+                # disabled case, so "only the factory constructs a
+                # tracker" is literally true rather than aspirational.
+                bt = budget.tracker_from_config(
+                    skill, cfg, default_when_disabled=True)
+                cost = _cost_per_call_cents(cfg)
                 _res = bt.record_spend(cost)
                 if _res.get("soft_warning"):
                     self._log(
@@ -783,10 +1032,11 @@ class AutoLoopThread(threading.Thread):
             return
         self._real_gate_cleanup(state, cfg)
         staged.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-        try:
-            max_per_tick = int(cfg.get("auto_adopt_max_per_tick", 5) or 5)
-        except (TypeError, ValueError):
-            max_per_tick = 5
+        # v1.8.48 (audit A8): `or 5` collapsed an explicit `0` - which an
+        # operator writes to stop unattended writes - back to 5 per tick,
+        # while the `< 1` clamp right below (dead under that idiom) proves
+        # sub-1 values were expected. Default only when absent/unusable.
+        max_per_tick = _int_or_default(cfg.get("auto_adopt_max_per_tick"), 5)
         if max_per_tick < 1:
             max_per_tick = 1
         attempted = adopted = quarantined = skipped = pending = 0
@@ -798,7 +1048,7 @@ class AutoLoopThread(threading.Thread):
                 # One candidate's bug can never stall the drain.
                 self._log(f"auto-loop: staged proposal {src.name!r} attempt failed: {e}")
                 outcome = "skipped"
-            if outcome == "adopted":
+            if outcome.startswith("adopted"):
                 adopted += 1
             elif outcome == "quarantined":
                 quarantined += 1
@@ -918,6 +1168,57 @@ class AutoLoopThread(threading.Thread):
             )
             return None
         tasks_path = sleep_runner._real_gate_tasks_path(src)
+        # v1.8.39 (audit M9): sanitize before PERSISTING, not only before
+        # egress. The frozen held-out task list is whole rollout records frozen
+        # to disk, and the replay worker re-reads it - so an unsanitized
+        # credential in a rollout that was captured before the privacy
+        # controls existed (or that the best-effort redactor missed) was being
+        # written verbatim into `logs/runs/` and then re-injected into a live
+        # agent context. Sanitizing here means the durable artefact is safe
+        # even if every future reader forgets.
+        #
+        # The gate's CONTENT is preserved: BOTH sides of every pair go through the
+        # same transform, so the held-out measurement still compares like with
+        # like. It is not a pure text rewrite, though - at the shipped
+        # defaults `sanitize_rollout_records` POPS each trajectory step's
+        # `args` and `result` (`privacy_include_tool_args` /
+        # `privacy_include_tool_results` both default to false). That is
+        # intended for privacy and it means the frozen records are
+        # STRUCTURALLY lighter than the source rollouts, not merely redacted.
+        # The gate only ever reads `task` / `last_response` / `trajectory`
+        # step text, so the measured content is unchanged.
+        #
+        # v1.8.45 (audit R13): the helper being unimportable used to be a
+        # SILENT skip - the tasks file was written with raw rollout records and
+        # nothing said so. The sibling boundary (`bridge.py`) raises in the
+        # same situation. Now: skip the real gate rather than persist
+        # unsanitized records, and say why.
+        _pv = None
+        try:
+            from usr.plugins.skillopt.helpers import privacy as _pv  # type: ignore
+        except Exception:
+            try:
+                from helpers import privacy as _pv  # type: ignore
+            except Exception:
+                _pv = None  # type: ignore[assignment]
+        if _pv is None:
+            self._log(
+                "real gate: privacy helper unavailable; SKIPPING the real gate "
+                "rather than freezing unsanitized rollout records to disk")
+            return None
+        try:
+            if not _pv.privacy_settings().get("redact_secrets", True):
+                self._log(
+                    "real gate: privacy_redact_secrets is false; freezing the "
+                    "held-out records UNREDACTED by explicit operator request")
+            else:
+                held = _pv.sanitize_rollout_records(held)
+        except Exception as e:
+            self._log(
+                f"real gate: task sanitization FAILED ({type(e).__name__}: {e}); "
+                f"SKIPPING the real gate rather than freezing unsanitized "
+                f"rollout records to disk")
+            return None
         tasks_path.write_text(json.dumps(held, ensure_ascii=False), encoding="utf-8")
         sidecar_path = sleep_runner._real_gate_sidecar_path(src)
         now = time.time()
@@ -967,6 +1268,17 @@ class AutoLoopThread(threading.Thread):
         if str(cfg.get("replay_evalkit_enabled", False)).strip().lower() in {
                 "1", "true", "yes", "on"}:
             knobs.append("--evalkit")
+            evalkit_tasks = str(cfg.get("replay_evalkit_tasks_file") or "").strip()
+            if evalkit_tasks:
+                try:
+                    evalkit_max_tasks = max(1, min(
+                        20, int(cfg.get("replay_evalkit_max_tasks", 4) or 4),
+                    ))
+                    evalkit_tasks = str(Path(evalkit_tasks).expanduser().resolve())
+                    knobs += ["--evalkit-tasks-file", evalkit_tasks]
+                    knobs += ["--evalkit-max-tasks", str(evalkit_max_tasks)]
+                except (OSError, TypeError, ValueError) as exc:
+                    self._log(f"real gate: independent evalkit config invalid: {exc}")
         try:
             launched = sleep_runner.launch_real_gate_worker(
                 skill_name=skill_name,
@@ -986,7 +1298,18 @@ class AutoLoopThread(threading.Thread):
                     pass
             raise
         payload["pid"] = launched.get("pid", 0)
-        sleep_runner.write_real_gate_sidecar(src, payload)
+        # v1.8.48 (audit T7): this write was unchecked while the one three
+        # lines earlier was not. A failure here leaves `pid: 0` in a sidecar
+        # whose worker IS running - and `pid: 0` reads as "not live" to every
+        # consumer, so single-flight would spawn a SECOND gate and the stale
+        # window would park the proposal for hours. Log it loudly; the
+        # proposal stays pending either way (that is the safe direction).
+        if sleep_runner.write_real_gate_sidecar(src, payload) is None:
+            self._log(
+                f"real gate: could not record pid {payload['pid']} for "
+                f"{skill_name}; single-flight and the stale window will "
+                f"mis-report until the worker writes its own sidecar"
+            )
         state["real_gate"] = {
             "skill": skill_name,
             "proposal": Path(str(src)).name,
@@ -1004,8 +1327,17 @@ class AutoLoopThread(threading.Thread):
             if budget is not None:
                 cost = int(cfg.get("replay_real_gate_cost_cents", 6) or 0)
                 if cost:
-                    bt = budget.BudgetTracker(skill_name=skill_name)
-                    bt.record_spend(cost)
+                    # v1.8.45 (re-audit R10): through the factory, with `cfg`.
+                    # This was a bare `BudgetTracker(skill_name=...)`, so the
+                    # REAL GATE accumulated its spend against the MODULE
+                    # DEFAULT cap rather than the operator's - and the drain
+                    # checked against the operator's. Two different budgets
+                    # for one skill, which is exactly what the v1.8.37 F13
+                    # fix removed from nine other call sites and which
+                    # reappeared here because nobody re-grepped.
+                    bt = budget.tracker_from_config(skill_name, cfg)
+                    if bt is not None:
+                        bt.record_spend(cost)
         except Exception as e:
             self._log(f"real gate budget record failed for {skill_name}: {e}")
         self._log(
@@ -1109,9 +1441,35 @@ class AutoLoopThread(threading.Thread):
         target.parent.mkdir(parents=True, exist_ok=True)
         audit = sleep_runner.runs_dir() / "adoptions.log"
         audit.parent.mkdir(parents=True, exist_ok=True)
+        # v1.8.39 (audit M12): adoptions.log grew without bound.
+        # Rotate before appending, like governance.log does.
+        # Best-effort: a rotation failure must never stop an audit
+        # row from being written.
+        try:
+            sleep_runner.rotate_log_if_large(audit)
+        except Exception:
+            pass
 
         if adopt:
             proposed = src.read_text(encoding="utf-8")
+            # v1.8.34: the SAME autonomous rails as the normal drain path.
+            # A real-gate-harvested adoption is still a write to a live
+            # skill, and it is the path an unattended install takes most
+            # often, so leaving it unrailed would bound autonomy only on the
+            # rare path.
+            _defer = self._autonomous_precheck(state, cfg, skill_name,
+                                               Path(str(src)).stem)
+            if _defer:
+                self._log(f"autonomous: deferring harvest-adopt for "
+                          f"{skill_name}: {_defer}")
+                return "skipped"
+            _before = ""
+            try:
+                if target.is_file():
+                    _before = target.read_text(encoding="utf-8",
+                                               errors="replace")
+            except Exception:
+                _before = ""
             # v1.8.24 (P0): snapshot + atomic replace. This path previously
             # called target.write_text() with no backup, so an unattended
             # auto-adopt could not be rolled back.
@@ -1121,12 +1479,61 @@ class AutoLoopThread(threading.Thread):
                     f"adopt aborted for {skill_name}: {_w.get('error')}"
                 )
                 return _w.get("error", "adopt write failed")
+            # v1.8.45 (audit R15): record that output redaction altered the live
+            # document. The flag existed on the writer's result and was read
+            # NOWHERE, so a redacted skill left no trace in any ledger - the
+            # opposite of what `adopt_write_skill`'s own docstring claims.
+            #
+            # v1.8.48 (audit T3): this block was indented BEHIND the `return`
+            # above and duplicated three times, so it never executed and the
+            # harvest path - the one an unattended install takes most often -
+            # recorded nothing. One copy, at the level where it runs.
+            if _w.get("redacted"):
+                self._log(
+                    f"adopted {skill_name}: output redaction altered the "
+                    f"document before it was written (credentials removed)")
+                try:
+                    from usr.plugins.skillopt.helpers import governance as _gov_r  # type: ignore
+                except Exception:
+                    try:
+                        from helpers import governance as _gov_r  # type: ignore
+                    except Exception:
+                        _gov_r = None  # type: ignore[assignment]
+                if _gov_r is not None:
+                    try:
+                        _gov_r.mark_human_decision(
+                            skill_name, True, "redaction-notice",
+                            proposal_id=Path(str(src)).stem,
+                            note="output redaction altered this document before "
+                                 "it was written into the live skill")
+                    except Exception:
+                        pass
+            _rb = self._autonomous_postcheck(cfg, skill_name, _before)
+            if _rb:
+                self._log(f"autonomous: {_rb}")
             try:
                 sleep_runner.clear_official_gate_marker(src)
             except Exception:
                 pass
             state["proposals_adopted"] = int(state.get("proposals_adopted", 0)) + 1
             _save_state(state)
+            # v1.8.34: counters + audit for a genuine autonomous harvest.
+            try:
+                from usr.plugins.skillopt.helpers import governance as _gh  # type: ignore
+                _res = _gh.resolve_evolution_mode()
+            except Exception:
+                _res = None
+            if _res and _res.get("autonomous"):
+                _sum = None
+                try:
+                    from usr.plugins.skillopt.helpers import proposal_view  # type: ignore
+                    _sum = proposal_view.get_summary(src, skill=skill_name)
+                except Exception:
+                    _sum = None
+                _ev = (_sum or {}).get("evidence") or {}
+                self._record_autonomous_adoption(state, skill_name, _ev)
+                self._autonomous_audit(cfg, skill_name, Path(str(src)).stem,
+                                        _sum, _ev)
             entry = {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "skill": skill_name,
@@ -1210,6 +1617,280 @@ class AutoLoopThread(threading.Thread):
             )
         return "quarantined"
 
+    # ----------------------------------------------------------------- #
+    # v1.8.34: autonomous-mode safety rails
+    # ----------------------------------------------------------------- #
+    #
+    # `auto_adopt_max_per_tick` (5) times a 30-minute tick is a theoretical
+    # ~240 writes/day to live SKILL.md files, with no daily bound at all.
+    # That is the single most important thing missing from autonomous mode,
+    # so the rails below bound HOW MUCH autonomy may do, independently of
+    # WHETHER it is allowed to act.
+    #
+    # Every rail here returns a skip, NOT a quarantine: a daily cap that
+    # resets tomorrow or a rollout threshold that will be crossed next week
+    # is exactly the "may become eligible later" case, and the DOX rule is
+    # that governance-style skips stay in staging while rejects and adopts
+    # leave. The proposal must survive to be retried.
+
+    def _autonomous_rails(self, state: dict[str, Any],
+                          cfg: dict[str, Any]) -> tuple[dict, str]:
+        """Resolve the rail config + the resolved mode. Never raises."""
+        try:
+            from usr.plugins.skillopt.helpers import governance  # type: ignore
+        except Exception:
+            try:
+                from helpers import governance  # type: ignore
+            except Exception:
+                return {}, "governance unavailable"
+        try:
+            resolved = governance.resolve_evolution_mode() or {}
+        except Exception:
+            return {}, "mode resolution failed"
+        if not resolved.get("autonomous"):
+            # Manual mode: every rail is inert. Autonomy is what these
+            # bound, and a human clicking Approve is not autonomous.
+            return {}, ""
+        try:
+            rails = governance.autonomous_config(cfg) or {}
+        except Exception:
+            rails = {}
+        return rails, ""
+
+    def _autonomous_precheck(
+        self, state: dict[str, Any], cfg: dict[str, Any], skill_name: str,
+        proposal_id: str,
+    ) -> str:
+        """Reason string when this adoption must be DEFERRED, else "".
+
+        Checked before the write, so a refused adoption leaves the proposal
+        in staging untouched.
+        """
+        rails, err = self._autonomous_rails(state, cfg)
+        if err:
+            return err
+        if not rails:
+            return ""
+        try:
+            today = time.strftime("%Y-%m-%d")
+            counters = state.get("autonomous_adoptions")
+            if not isinstance(counters, dict):
+                counters = {}
+            day = counters.get(today)
+            if not isinstance(day, dict):
+                day = {"count": 0, "skills": {}}
+            per_day = int(rails.get("max_adoptions_per_day", 0) or 0)
+            count = int(day.get("count", 0) or 0)
+            if per_day >= 0 and count >= per_day:
+                return (f"autonomous daily cap reached ({count}/{per_day} "
+                        f"on {today}); stays in staging until the cap resets")
+            per_skill_cap = int(
+                rails.get("max_adoptions_per_skill_per_day", 0) or 0)
+            skills = day.get("skills") if isinstance(day.get("skills"), dict) else {}
+            used = int(skills.get(skill_name, 0) or 0)
+            if per_skill_cap >= 0 and used >= per_skill_cap:
+                return (f"autonomous per-skill cap reached for {skill_name} "
+                        f"({used}/{per_skill_cap} on {today})")
+            min_rollouts = int(rails.get("min_evidence_rollouts", 0) or 0)
+            if min_rollouts > 0:
+                have = self._skill_rollout_count(skill_name)
+                if have is not None and have < min_rollouts:
+                    return (f"insufficient evidence for autonomous adoption: "
+                            f"{have} rollout(s) for {skill_name}, "
+                            f"need {min_rollouts}")
+        except Exception as e:
+            # A rail that cannot be evaluated must DEFER, not wave through:
+            # the safe direction for a machine-written change to a live file.
+            return f"autonomous rail check failed ({type(e).__name__}); deferring"
+        return ""
+
+    def _skill_rollout_count(self, skill_name: str) -> int | None:
+        """Rollouts recorded for this skill. None when uncomputable.
+
+        Cached per TICK, not for the thread's lifetime: the cache lives on
+        the single long-lived AutoLoopThread instance, so without an explicit
+        invalidate the counts would be frozen at whatever the first
+        autonomous drain ever saw - a permanent, invisible staleness that
+        would make `autonomous_min_evidence_rollouts` compare against a
+        snapshot from hours or days earlier. `_invalidate_rollout_counts` is
+        called at the top of `_tick`.
+        """
+        cached = getattr(self, "_rollout_counts_cache", None)
+        if cached is None:
+            cached = {}
+            try:
+                for rp in sleep_runner.rollouts_dir().glob("*.json"):
+                    try:
+                        rec = json.loads(
+                            rp.read_text(encoding="utf-8", errors="replace"))
+                    except Exception:
+                        continue
+                    if not isinstance(rec, dict):
+                        continue
+                    name = str(rec.get("skill_used") or rec.get("skill")
+                               or rec.get("skill_name") or "").strip()
+                    if name:
+                        cached[name] = cached.get(name, 0) + 1
+            except Exception:
+                return None
+            self._rollout_counts_cache = cached
+        return int(cached.get(skill_name, 0))
+
+    def _invalidate_rollout_counts(self) -> None:
+        """Drop the per-tick rollout-count cache.
+
+        v1.8.35 (audit F5): this was a `@staticmethod` assigning
+        `AutoLoopThread._rollout_counts_cache = None`, i.e. a CLASS attribute,
+        while `_skill_rollout_count` reads `getattr(self, ...)` and writes
+        `self._rollout_counts_cache`. Once the instance attribute existed it
+        shadowed the class one permanently, so the per-tick invalidation was a
+        no-op and the cache stayed frozen at whatever the first drain saw -
+        exactly the staleness the comment claimed to prevent. It must be an
+        INSTANCE method for the invalidation to take effect.
+        """
+        self._rollout_counts_cache = None
+
+    def _record_autonomous_adoption(self, state: dict[str, Any],
+                                     skill_name: str,
+                                     evidence: dict | None = None) -> None:
+        """Bump the daily counters in the SINGLE-WRITER state file.
+
+        The auto-loop thread is the only writer of `.auto_loop_state.json`
+        (child DOX, "State files are single-writer"); this goes through the
+        same `_save_state` as every other counter and never opens the file
+        directly.
+        """
+        try:
+            today = time.strftime("%Y-%m-%d")
+            counters = state.get("autonomous_adoptions")
+            if not isinstance(counters, dict):
+                counters = {}
+            # Retain today plus the previous day only, so the block cannot
+            # grow forever in a long-lived install.
+            for stale in [k for k in list(counters) if k < today]:
+                counters.pop(stale, None)
+            day = counters.get(today)
+            if not isinstance(day, dict):
+                day = {"count": 0, "skills": {}}
+            day["count"] = int(day.get("count", 0) or 0) + 1
+            skills = day.get("skills")
+            if not isinstance(skills, dict):
+                skills = {}
+            skills[skill_name] = int(skills.get(skill_name, 0) or 0) + 1
+            day["skills"] = skills
+            day["last_skill"] = skill_name
+            day["last_at"] = time.time()
+            counters[today] = day
+            state["autonomous_adoptions"] = counters
+            _save_state(state)
+        except Exception as e:
+            self._log(f"autonomous counter update failed: {e}")
+
+    def _autonomous_audit(self, cfg: dict[str, Any], skill_name: str,
+                           proposal_id: str, summary: dict | None,
+                           evidence: dict | None) -> None:
+        """Write the `decided_by="autonomous"` governance row.
+
+        Reuses `mark_human_decision` rather than adding a second ledger: its
+        `decided_by` parameter already discriminates human from machine, and
+        one queryable history beats two. A machine decision that is not
+        permanently distinguishable from a human one would make the
+        off-by-default guarantee unverifiable after the fact.
+
+        Best-effort: never raises, never blocks the adoption.
+        """
+        try:
+            from usr.plugins.skillopt.helpers import governance  # type: ignore
+        except Exception:
+            try:
+                from helpers import governance  # type: ignore
+            except Exception:
+                return
+        try:
+            rails = governance.autonomous_config(cfg) or {}
+        except Exception:
+            rails = {}
+        if not rails.get("audit", True):
+            return
+        try:
+            ev = dict(evidence or {})
+            if summary:
+                sdiff = summary.get("diff") or {}
+                ev.setdefault("added_lines", sdiff.get("added_lines"))
+                ev.setdefault("removed_lines", sdiff.get("removed_lines"))
+                intent = summary.get("intent") or {}
+                ev.setdefault("intent", intent.get("category"))
+            resolved = governance.resolve_evolution_mode() or {}
+            governance.mark_human_decision(
+                skill_name, True, "autonomous",
+                proposal_id=proposal_id,
+                note=("mode=%s source=%s intent=%s lift_pp=%s n_held_out=%s"
+                      % (resolved.get("mode"), resolved.get("source"),
+                         ev.get("intent"), ev.get("lift_pp"),
+                         ev.get("n_held_out")))[:500],
+            )
+            self._log(
+                f"autonomous: recorded decided_by=autonomous for "
+                f"{skill_name} proposal {proposal_id} ({ev.get('intent')})"
+            )
+        except Exception as e:
+            self._log(f"autonomous audit write failed for {skill_name}: {e}")
+
+    def _autonomous_postcheck(self, cfg: dict[str, Any], skill_name: str,
+                              before: str) -> str:
+        """Verify the write landed intact; roll back when it did not.
+
+        Returns "" when fine, else a reason describing the rollback. This is
+        a STRUCTURAL verification (file present, non-empty, frontmatter
+        intact), not a re-measurement: it catches a truncated or corrupt
+        write, which is the failure mode an automatic path can least afford
+        to leave in place. Re-running the held-out measurement belongs to the
+        real-gate executor, whose verdict is already required (or
+        deliberately bypassed) upstream.
+        """
+        try:
+            rails, err = self._autonomous_rails({}, cfg)
+            if err or not rails:
+                return ""
+            if not rails.get("require_post_adopt_check", True):
+                return ""
+            try:
+                target = sleep_runner.safe_skill_md(skill_name)
+                text = target.read_text(encoding="utf-8") if target.is_file() else ""
+            except Exception as e:
+                return f"post-adopt verification could not read {skill_name}: {e}"
+            if not text.strip():
+                return self._rollback_autonomous(cfg, skill_name,
+                                                 "post-adopt write is empty")
+            if before and before.strip() and "---\n" in before \
+                    and not text.lstrip().startswith("---"):
+                return self._rollback_autonomous(
+                    cfg, skill_name,
+                    "post-adopt write lost its YAML frontmatter (unloadable)")
+            return ""
+        except Exception as e:
+            self._log(f"post-adopt check failed for {skill_name}: {e}")
+            return ""
+
+    def _rollback_autonomous(self, cfg: dict[str, Any], skill_name: str,
+                             why: str) -> str:
+        """Restore the pre-adopt snapshot. Never raises."""
+        try:
+            from usr.plugins.skillopt.helpers import fragment_store  # type: ignore
+        except Exception:
+            try:
+                from helpers import fragment_store  # type: ignore
+            except Exception:
+                return f"{why}; rollback unavailable"
+        try:
+            res = fragment_store.restore_default_snapshot(skill_name)
+            if res.get("ok"):
+                self._log(f"autonomous ROLLBACK {skill_name}: {why}")
+                return f"{why}; rolled back to the pre-adopt snapshot"
+            return f"{why}; rollback FAILED ({res.get('error')})"
+        except Exception as e:
+            return f"{why}; rollback raised {type(e).__name__}: {e}"
+
     def _adopt_one(self, state: dict[str, Any], cfg: dict[str, Any],
                    src: "os.PathLike | str") -> str:
         """Gate one staged proposal; returns 'adopted' | 'quarantined' | 'skipped'."""
@@ -1249,17 +1930,22 @@ class AutoLoopThread(threading.Thread):
         except Exception:
             from helpers import governance  # type: ignore  # noqa: F401
         try:
-            # v1.8.18 (P2.1): auto_adopt=true is the operator's autonomy
-            # opt-in - it overrides the per-skill pending-approval block.
+            # v1.8.18 (P2.1): autonomy is the operator's opt-in - it
+            # overrides the per-skill pending-approval block.
+            # v1.8.34: the value comes from the single resolver, never from
+            # a bare `bool(cfg.get("auto_adopt", False))`.
+            #
+            # NO TRAILING COMMA HERE - the first version of the P2.1 edit
+            # ended this call in a comma, wrapping the 2-tuple result in a
+            # 1-tuple. The unpack raised "not enough values to unpack
+            # (expected 2, got 1)" on EVERY _auto_adopt call, was silently
+            # swallowed by the except below, so governance logged no
+            # decisions and the gate always fell through. The v1.5.0 smoke
+            # test caught it; keep it that way.
             eligible, gov_reason = governance.check_skill_eligible(
-                # v1.8.18 (P1 fix, 2026-09-22): NO trailing comma here - the
-                # first version of the P2.1 edit ended the call in a comma,
-                # wrapping the 2-tuple result in a 1-tuple, and the unpack
-                # raised "not enough values to unpack (expected 2, got 1)"
-                # on EVERY _auto_adopt call - silently swallowed by the
-                # except below, so governance logged no decisions and the
-                # gate always fell through (the v1.5.0 smoke test caught it).
-                skill_name, auto_adopt=bool(cfg.get("auto_adopt", False)))
+                skill_name,
+                auto_adopt=bool(governance.resolve_evolution_mode()
+                                .get("autonomous")))
             try:
                 governance.mark_decision(skill_name, eligible, gov_reason)
             except Exception:
@@ -1272,8 +1958,38 @@ class AutoLoopThread(threading.Thread):
                 # become eligible later (approval, opt-in, pause lift).
                 return "skipped"
         except Exception as e:
-            # Governance failed: fall through to the gate. Don't crash.
-            self._log(f"governance: {skill_name} check failed: {e}; falling through")
+            # v1.8.42 (re-audit R2): FAIL CLOSED.
+            #
+            # This used to log "fall through" and continue into
+            # `validate_proposal` -> `adopt_write_skill` -> a live write.
+            # `_auto_adopt` calls `_adopt_one` DIRECTLY and never routes
+            # through `_skill_eligible_for_cycle`, so this was the ONLY
+            # governance evaluation on the drain's path to a live
+            # `usr/skills/<n>/SKILL.md`. A raising check - an unreadable
+            # ledger, a `mkdir` on a full disk, an ImportError - therefore
+            # disabled optout, immutable, pause, cadence, budget AND the
+            # human-rejection rail for that proposal, and the drain wrote a
+            # live skill for a skill the operator had opted out of.
+            #
+            # v1.8.35's F8 fix corrected the SIBLING gate
+            # (`_skill_eligible_for_cycle`) and the F8 test drove only that
+            # sibling, so the fix looked complete and was not. That is the
+            # same shape as re-audit R1: a partial fix, covered at the wrong
+            # site.
+            #
+            # "skipped" is the correct outcome, not a new one: a governance
+            # we cannot evaluate is a DEFERRAL, so the proposal STAYS in
+            # staging and may become eligible next tick. It is not a
+            # rejection, and it must never be a write.
+            self._log(
+                f"governance: {skill_name} check FAILED ({e}); DEFER "
+                f"(staying in staging, not writing)"
+            )
+            try:
+                _record_error(e, "governance_adopt_one")
+            except Exception:
+                pass
+            return "skipped"
 
         # v1.8.22: real-gate HARVEST branch. A proposal with a verdict
         # sidecar skips the gate re-run entirely: the spawn-time sidecar
@@ -1286,8 +2002,13 @@ class AutoLoopThread(threading.Thread):
         if rg is not None:
             return self._harvest_real_gate(state, cfg, src, skill_name, rg)
 
+        # v1.8.50 (audit F5): no `target.parent.mkdir()` here. This is the drain's
+        # own path to a live skill, and it created the directory BEFORE the
+        # governance gate ran - so a proposal the gate then refused still left
+        # an empty `usr/skills/<name>/` behind. `adopt_write_skill` creates the
+        # parent itself. v1.8.48 removed exactly this line from the agent tool
+        # (audit U10) and missed the drain; api/adopt.py has never had it.
         target = sleep_runner.safe_skill_md(skill_name)
-        target.parent.mkdir(parents=True, exist_ok=True)
         proposed = src.read_text(encoding="utf-8")
         current = ""
         if target.is_file():
@@ -1327,17 +2048,59 @@ class AutoLoopThread(threading.Thread):
             "target": str(target),
             "proposed_size": len(proposed),
             "current_size": len(current),
-            "passed": ok,
+            # v1.8.45 (re-audit R11): `passed` recorded the GATE's verdict
+            # before anything was written, and every later refusal returned
+            # without correcting it - so a snapshot failure or an ungated
+            # refusal left an audit row asserting a PASSING ADOPTION for a
+            # write that never landed. `api/adopt.py` already wrote a
+            # correction row on refusal; the drain did not.
+            #
+            # The gate verdict moves to its own key, and `passed` /`outcome`
+            # are written by `_audit` from the RESOLVED outcome on every exit.
+            # This dict deliberately carries no `passed` key: `_audit` is the
+            # only writer and always overwrites it, so a value here would be
+            # dead - and a dead `passed` in an audit row is exactly the kind of
+            # field a future reader trusts.
+            "gate_passed": ok,
             "reason": reason,
             "held_out": held_out,
             # v1.8.22: distinguish confirm-pending / bypassed adoptions
             # from adopt-immediately in adoptions.log.
             "real_gate": "bypassed" if official_gated else None,
         }
-        audit = sleep_runner.runs_dir() / "adoptions.log"
-        audit.parent.mkdir(parents=True, exist_ok=True)
-        with open(audit, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        def _audit(outcome: str, *, note: str = "",
+               redacted: bool = False) -> None:
+            """Write the adoption row with the RESOLVED outcome.
+
+            One writer for the row, called on every exit from here - success,
+            refusal, deferral. That is the point: a trail that only records the
+            happy path is not a trail.
+            """
+            row = dict(entry)
+            row["passed"] = outcome.startswith("adopted")
+            row["outcome"] = outcome
+            if note:
+                row["outcome_note"] = note[:300]
+            # v1.8.45 (R15): the writer redacted this document, so the
+            # live skill is NOT byte-identical to what was proposed.
+            # Say so in the trail rather than leaving it implied.
+            if redacted:
+                row["output_redacted"] = True
+            audit = sleep_runner.runs_dir() / "adoptions.log"
+            try:
+                audit.parent.mkdir(parents=True, exist_ok=True)
+                # v1.8.39 (audit M12): adoptions.log grew without bound.
+                try:
+                    sleep_runner.rotate_log_if_large(audit)
+                except Exception:
+                    pass
+                with open(audit, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            except Exception as e:
+                self._log(f"adoption audit write failed for {skill_name}: {e}")
+
+        _audit("proposed")
 
         # v1.8.22: real-gate SPAWN branch. A structurally-valid, direct
         # (non-official-gated) proposal is parked in staging with a
@@ -1425,30 +2188,109 @@ class AutoLoopThread(threading.Thread):
                 f"allow_ungated_direct_adopt: true to accept ungated rewrites, "
                 f"or install skillopt for the authoritative gate."
             )
+            # v1.8.45 (R11): record the refusal, so the trail does not keep
+            # asserting a proposed-but-unwritten adoption.
+            _audit("ungated_blocked")
             return "ungated_blocked"
 
         if ok:
+            # v1.8.34: autonomous rails, checked BEFORE the write so a
+            # deferred adoption leaves the proposal in staging untouched.
+            # Inert in manual mode - these bound machine-written changes.
+            defer = self._autonomous_precheck(state, cfg, skill_name, src.stem)
+            if defer:
+                self._log(f"autonomous: deferring {skill_name}: {defer}")
+                _audit("deferred", note=defer)
+                return "skipped"
+
             # v1.8.24 (P0): snapshot + atomic replace, same reason as the
             # real-gate harvest path above.
+            _current_before = ""
+            try:
+                _t = sleep_runner.safe_skill_md(skill_name)
+                if _t.is_file():
+                    _current_before = _t.read_text(encoding="utf-8",
+                                                   errors="replace")
+            except Exception:
+                _current_before = ""
             _w = sleep_runner.adopt_write_skill(skill_name, proposed)
             if not _w.get("ok"):
                 self._log(f"adopt aborted for {skill_name}: {_w.get('error')}")
+                # v1.8.45 (R11): the write was REFUSED - most commonly a
+                # failed snapshot, which is the unrecoverable case. The
+                # provisional row said `passed: True`; correct it.
+                _audit("refused", note=str(_w.get("error") or "write refused"))
                 return _w.get("error", "adopt write failed")
-            # v1.8.1: the proposal is consumed — clear its provenance marker
-            # so a later manual re-adopt re-runs the full local gate.
+
+            # v1.8.34: post-adopt verification + automatic rollback.
+            rollback_note = self._autonomous_postcheck(cfg, skill_name,
+                                                      _current_before)
+            if rollback_note:
+                self._log(f"autonomous: {rollback_note}")
+                # v1.8.50 (audit F10): a post-adopt ROLLBACK restored the
+                # previous bytes, so the document is no longer what this
+                # adoption wrote - yet the audit row said `adopted` and the
+                # log line said "ADOPTED". Anyone reading the trail to answer
+                # "is the live skill the one the gate approved?" was told
+                # yes. The write DID happen (and the counters are right); the
+                # outcome string has to carry what the file now contains.
+                outcome = "adopted_rolled_back"
+
+            # v1.8.34: the informed-approval evidence, read from the summary
+            # sidecar the staging write already produced. Best-effort: an
+            # absent sidecar must not change what happens next.
+            _summary = None
+            try:
+                from usr.plugins.skillopt.helpers import proposal_view  # type: ignore
+                _summary = proposal_view.get_summary(src, skill=skill_name)
+            except Exception:
+                _summary = None
+            _evidence = (_summary or {}).get("evidence") or {}
+
+            # v1.8.18 (P2.1): the gate marker is cleared AFTER the write, so
+            # the proposal's provenance survives long enough for the summary
+            # and evidence read above.
             try:
                 sleep_runner.clear_official_gate_marker(src)
             except Exception:
                 pass
             state["proposals_adopted"] = int(state.get("proposals_adopted", 0)) + 1
             _save_state(state)
-            self._log(f"auto-loop: ADOPTED {skill_name} ({reason})")
-            outcome = "adopted"
+
+            # v1.8.34: bump the daily counters and write the audit row, but
+            # ONLY when this was genuinely an autonomous adoption. A manual
+            # /adopt must not consume the machine budget.
+            _resolved = None
+            try:
+                from usr.plugins.skillopt.helpers import governance as _g  # type: ignore
+                _resolved = _g.resolve_evolution_mode()
+            except Exception:
+                _resolved = None
+            if _resolved and _resolved.get("autonomous"):
+                self._record_autonomous_adoption(state, skill_name, _evidence)
+                self._autonomous_audit(cfg, skill_name, src.stem, _summary,
+                                        _evidence)
+            self._log(
+                f"auto-loop: ADOPTED {skill_name} ({reason})"
+                + (f" [autonomous; {rollback_note}]" if rollback_note else "")
+            )
+            if not rollback_note:
+                outcome = "adopted"
+            # v1.8.45 (R11): record the RESOLVED outcome. The provisional
+            # row written before the gate said `passed: True` for a write
+            # that had not happened yet; this is the row that means it did.
+            # `outcome` is "adopted_rolled_back" when the post-adopt check
+            # reverted the document (audit F10) - the row template carries no
+            # `passed` key, so the row never claims more than it knows.
+            _audit(outcome, note=rollback_note,
+                   redacted=bool(_w.get("redacted")))
         else:
             state["proposals_rejected"] = int(state.get("proposals_rejected", 0)) + 1
             _save_state(state)
             self._log(f"auto-loop: rejected {skill_name} ({reason})")
             outcome = "rejected"
+            # v1.8.45 (R11): a gate rejection is an outcome too.
+            _audit("rejected", note=reason)
             # v1.3.0 (Day-4 item 6): record this rejection to the
             # failure memory so the next cycle's targeted prompt can
             # learn from it. Best-effort: a failure_memory bug here
@@ -1490,7 +2332,10 @@ class AutoLoopThread(threading.Thread):
         except Exception:
             from helpers import cycle_history  # type: ignore  # noqa: F401
         try:
-            outcome_str = "adopted" if ok else "rejected"
+            # v1.8.50 (audit F10): the RESOLVED outcome, not `ok` - a rolled-back
+            # adoption is an adoption that was reverted, and a reader asking
+            # "what does the live skill contain?" must be able to tell.
+            outcome_str = outcome if outcome else ("adopted" if ok else "rejected")
             gate_reasons_out = [reason] if (reason and not ok) else []
             cycle_history.record_cycle_entry({
                 "skill": skill_name,
@@ -1516,7 +2361,12 @@ class AutoLoopThread(threading.Thread):
         # staging/rejected/: both leave the pending queue, so the drain
         # always advances and a rejected proposal is never re-attempted
         # (identical bytes fail deterministically).
-        if outcome == "adopted":
+        # v1.8.50 (audit F10): prefix, not equality. A post-adopt ROLLBACK still
+        # CONSUMES the proposal and still counts as an adoption - the write
+        # happened and the counters above are right - but its outcome string
+        # carries the revert. An exact comparison here quarantined a proposal
+        # whose only fault was that the safety net caught its own write.
+        if outcome.startswith("adopted"):
             try:
                 moved = sleep_runner.consume_staged_proposal(src)
                 if moved is not None:
@@ -1567,6 +2417,24 @@ def get_loop_state() -> dict[str, Any]:
     snap = sleep_runner.get_status_snapshot()
     state["rollouts_now"] = snap["rollout_count"]
     state["staged_now"] = len(snap["staged_proposals"])
+    # v1.8.34: today's autonomous adoption count + per-skill breakdown, so the
+    # Evolution mode card can show consumption against the daily cap. READ
+    # only - the auto-loop thread remains the single writer of this file.
+    try:
+        counters = state.get("autonomous_adoptions")
+        if isinstance(counters, dict):
+            today = time.strftime("%Y-%m-%d")
+            day = counters.get(today) if isinstance(counters.get(today), dict) else {}
+            state["autonomous_adoptions_today"] = int(day.get("count", 0) or 0)
+            state["autonomous_adoptions_skills_today"] = (
+                day.get("skills") if isinstance(day.get("skills"), dict) else {}
+            )
+        else:
+            state["autonomous_adoptions_today"] = 0
+            state["autonomous_adoptions_skills_today"] = {}
+    except Exception:
+        state["autonomous_adoptions_today"] = 0
+        state["autonomous_adoptions_skills_today"] = {}
     # v1.8.22: real-gate mirror — add a live age so the dashboard can
     # show "pending for Xm" without parsing timestamps client-side.
     rg = state.get("real_gate")
@@ -1782,7 +2650,12 @@ def get_budget_status(skill_name: str | None = None) -> dict:
     """Return the BudgetTracker status for a skill (or global if None)."""
     if budget is None:
         return {"enabled": False, "reason": "budget module not loaded"}
-    bt = budget.BudgetTracker(skill_name=skill_name)
+    # v1.8.37 (audit F13): wired from the `budget:` block, so the dashboard
+    # reports the operator's real cap rather than the module default.
+    # v1.8.45 (R10): see above - the factory, not a direct build.
+    bt = budget.tracker_from_config(
+        skill_name, sleep_runner.merged_config(),
+        default_when_disabled=True)
     return {"enabled": True, **bt.get_status()}
 
 
@@ -1790,7 +2663,11 @@ def can_skill_spend(skill_name: str, cents: int) -> tuple:
     """Check if a skill can spend `cents` more today. Returns (ok, reason)."""
     if budget is None:
         return (True, "")
-    bt = budget.BudgetTracker(skill_name=skill_name)
+    # v1.8.37 (audit F13): same wiring as the gate, so this can never be more
+    # permissive than `_skill_eligible_for_cycle`'s budget check.
+    bt = budget.tracker_from_config(skill_name, sleep_runner.merged_config())
+    if bt is None:
+        return (True, "")   # budget gate disabled
     return bt.can_spend(cents)
 
 
@@ -1798,5 +2675,9 @@ def record_skill_spend(skill_name: str, cents: int) -> dict:
     """Record a spend of `cents` for `skill_name`."""
     if budget is None:
         return {"recorded": 0, "new_total": 0, "day": ""}
-    bt = budget.BudgetTracker(skill_name=skill_name)
+    # v1.8.37 (audit F13): must use the SAME cap as the checker, or spend is
+    # accumulated against a different budget than the one that refused it.
+    bt = budget.tracker_from_config(skill_name, sleep_runner.merged_config())
+    if bt is None:
+        return {"recorded": 0, "new_total": 0, "day": ""}
     return bt.record_spend(cents)

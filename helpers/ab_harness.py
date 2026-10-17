@@ -224,8 +224,14 @@ def _runs_dir() -> Path:
 def _config() -> dict[str, Any]:
     """Read ab_harness_* keys from the merged config + env overrides."""
     try:
-        from helpers.sleep_runner import merged_config
-        cfg = merged_config()
+        # v1.8.37 (audit F11): namespace FIRST. The bare form raised on
+        # every call in the A0 runtime and the except swallowed it, so
+        # every `ab_harness_*` key silently resolved to its default.
+        from usr.plugins.skillopt.helpers import sleep_runner as _sr  # type: ignore
+    except ImportError:
+        from helpers import sleep_runner as _sr  # type: ignore
+    try:
+        cfg = _sr.merged_config()
     except Exception:
         cfg = {}
     out = {
@@ -313,19 +319,33 @@ def _replay_under_skill(rollout: dict[str, Any], skill_text: str) -> float:
     """Approximate a replay: feed [task + response + skill_text] to the
     v1.2.0 reward model and return its success-probability in [0, 1].
 
-    v1.2.0 (Day-3 item 3): if the rollout carries a `fragments_active_text`
-    field (set by the v1.2.0 harvester after reading the v1.2.0 fragment
-    store), use that as the skill context instead of the whole
-    `skill_text`. This gives fragment-aware replay: a rollout that was
-    actually produced with only the `intro` fragment active gets
-    replayed under just `intro` text, not the full SKILL.md. Rollouts
-    without the field fall back to `skill_text` (the v1.1.0 / v1.2.0
-    pre-fragment-store behavior). Until the model is trained, the
-    helper falls back to the v1.1.0 heuristic, which is fine: the
-    harness still detects order-of-magnitude differences between
-    current and proposed skills when they exist, and the
-    `fallback_count` on the status snapshot makes it loud that no
-    real model is doing the work.
+    v1.8.44 (re-audit R7): the ARM'S OWN TEXT IS NOW AUTHORITATIVE.
+
+    The precedence used to be `fragments_active_text or skill_text or ""`,
+    and that made the harness structurally incapable of measuring anything.
+    `run_ab` calls this twice per pair — once with `current_text`, once with
+    `proposed_text` — but `fragments_active_text` overrode BOTH. The v1.2.0
+    harvester sets that field for any skill without a `fragments:` list, and
+    `fragment_store.read_fragments` returns an implicit `_default` fragment
+    whose text is the WHOLE `SKILL.md` for exactly those skills. So for
+    essentially every rollout of every ordinary skill both arms were handed
+    byte-identical input, `score_a == score_b`, `_default_judge_fn` returned
+    `{"verdict": "tie", "confidence": 0.5}`, `lift_pp` was `0.0`, and
+    `validate_proposal` took the `ab_harness_rejected` branch with a reason
+    string that reads like a real measurement. Enabling `ab_harness_enabled`
+    therefore blocked ALL skill evolution.
+
+    The order is now `skill_text` first. Fragment-awareness is preserved for
+    the arm that has no text of its own: when `current_text` is empty (the
+    skill did not exist when the rollout was captured) the fragment snapshot
+    is the best available context. What is NOT preserved is the override,
+    because it made the comparison meaningless — a harness that scores both
+    arms identically is not a conservative harness, it is a broken one.
+
+    Note the judge already scales confidence with the score gap
+    (`min(1.0, abs(diff) * 2.0)`), so once the arms genuinely differ the
+    default judge can clear `min_confidence`; the flat `0.5` was only ever the
+    tie case.
     """
     try:
         # v1.8.1: two-path import — the bare `helpers` resolves to the
@@ -340,10 +360,12 @@ def _replay_under_skill(rollout: dict[str, Any], skill_text: str) -> float:
         # can find the skill and a snippet (when a real model is loaded
         # later, it will see the skill as additional context).
         synthetic = dict(rollout)
-        # Prefer fragment-aware context if present
+        # v1.8.44 (R7): arm text FIRST; the fragment snapshot is only the
+        # fallback. See the docstring — reversing this order silently
+        # disabled the whole harness.
         skill_ctx = (
-            rollout.get("fragments_active_text")
-            or skill_text
+            skill_text
+            or rollout.get("fragments_active_text")
             or ""
         )
         skill_excerpt = skill_ctx[:512]
@@ -418,11 +440,33 @@ def _llm_judge_via_http(
     endpoint = os.environ.get("SKILLOPT_JUDGE_ENDPOINT", "").strip()
     if not endpoint:
         raise RuntimeError("SKILLOPT_JUDGE_ENDPOINT is not set")
+    # v1.8.47 (re-audit R29): this egress posted `task` + `last_response`
+    # raw. It is dormant (nothing calls `set_judge_mode("http")` at boot),
+    # but dormant only by configuration - and `inner_loop`'s comment claims
+    # "every other provider boundary sanitizes and fails closed", which was
+    # false here. Sanitize the rollout first, and REFUSE the call when the
+    # privacy helper is unavailable rather than sending raw text.
+    try:
+        from usr.plugins.skillopt.helpers import privacy as _pv  # type: ignore
+    except ImportError:
+        try:
+            from helpers import privacy as _pv  # type: ignore
+        except ImportError as e:
+            raise RuntimeError(
+                f"privacy helper unavailable ({e}); refusing to post rollout "
+                f"text to SKILLOPT_JUDGE_ENDPOINT unsanitised")
+    try:
+        _safe = _pv.sanitize_rollout(rollout,
+                                     config=_pv.privacy_settings())
+    except Exception as e:
+        raise RuntimeError(
+            f"rollout sanitization failed ({type(e).__name__}: {e}); refusing "
+            f"to post raw rollout text to SKILLOPT_JUDGE_ENDPOINT")
     payload = {
         "model": judge_model,
         "prompt": JUDGE_PROMPT,
-        "task": rollout.get("task", ""),
-        "response": rollout.get("last_response", ""),
+        "task": _safe.get("task", ""),
+        "response": _safe.get("last_response", ""),
         "score_a": score_a,
         "score_b": score_b,
     }
