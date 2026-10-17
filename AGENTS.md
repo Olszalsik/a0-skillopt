@@ -243,12 +243,16 @@ post-mortem (flaky wall-clock pacing assert, already fixed in v1.8.28).
 | C1 | High | `governance._default_policy()` read `<plugin_root>/config.json` directly → 13 governance tests read the live install's operator `default_policy` (`got 'skipped'` / `require_human_approval_pending`); CI green only because CI lacks the file | `helpers/governance.py`, `tests/smoke.py` |
 | C2 | High | the v1.8.34 `/mode` wipe-guard's degraded-read precondition was satisfied by the install's real `config.json` through `api/config.py`'s `CONFIG_PATH`, failing on a live install with the code unchanged | `tests/smoke.py` |
 | C3 | Low | `t_v1818_pacing_deterministic` set `SKILLOPT_JUDGE_THROTHLE_S` (typo) — the deterministic case ran against the 1.5 s default instead of its 0.02 s interval and leaked the junk key into `os.environ` | `tests/smoke.py` |
+| C4 | High | M14 (`t_v1839_banner_cta_is_live`, v1.8.39 backlog) hard-failed when no framework `webui/` tree exists — exactly the nested repo's own CI checkout — so CI run #51 failed **all four matrix jobs 359/360 on one environment fact**, three weeks after the test shipped (the backlog had never run on CI) | `tests/smoke.py` |
 
-Fixes (v1.8.52, suite 358 → **360**, green both with and without a production
-`config.json`): C1 → `governance.default_policy_config_path` seam + suite-wide
-sandbox in `main()`; C2 → `CONFIG_PATH` pointed at a nonexistent tmp path for the
-degraded leg; C3 → the env key spelled correctly. Verified on a container-local
-copy in both directions; the production tree is untouched by a suite run.
+Fixes (v1.8.52 + v1.8.53, suite 358 → **360**, green both with and without a production
+`config.json`; on CI 359 pass + 1 skip): C1 → `governance.default_policy_config_path`
+seam + suite-wide sandbox in `main()`; C2 → `CONFIG_PATH` pointed at a nonexistent tmp
+path for the degraded leg; C3 → the env key spelled correctly; C4 → the WebUI-source
+half of M14 is skipped with a visible note in a bare checkout (plugin-side assertions
+stand on their own; every install/container run still verifies the live contract).
+Verified on a container-local copy in both directions; the production tree is
+untouched by a suite run.
 
 ## Open findings register — SWEEP follow-up 2026-10-05 (closed)
 

@@ -4,6 +4,41 @@ All notable changes to this plugin are documented here. The format is based on [
 
 ---
 
+## [1.8.53] - 2026-10-17
+
+CI fix follow-up, same day as 1.8.52. The first CI run of the whole v1.8.30 → 1.8.52
+tree (run #51) failed **all four matrix jobs on one test** — M14, which was added in
+v1.8.39 in the backlog that had never run on CI. Suite **360 cases**; on CI now
+**359 pass + 1 honest skip of an unfeasible half**, on an install/container still
+**360/360 full**.
+
+### High: M14 required the framework's `webui/` tree that a bare checkout does not have
+
+`t_v1839_banner_cta_is_live` resolves `webui/components/welcome/welcome-store.js`
+three levels above `PLUGIN_ROOT` (with a `/a0` fallback for container copies) and
+**hard-failed the suite** when neither exists — which is exactly the state of the
+nested repo's own CI checkout: the plugin repository contains the plugin, not the
+framework. The identical 4-job failure (run #51: 359/360 on every Python) was that
+environment fact firing three weeks after the test shipped, and it hid any real
+regression behind uniform reds — the same machine-dependency class the S2/M14 sweep
+calls out, and the reason the v1.8.39 test was green locally while CI had never seen
+it.
+
+The live-contract half (does `executeBannerAction` implement the prefix the banners
+dispatch?) is now **skipped with a visible note** when no WebUI source is present —
+a repository layout fact, not a plugin defect — while the plugin-side half (banners
+dispatch an implemented prefix, point at the real settings page, target exists)
+stands on its own everywhere. Every install and container run still verifies the
+contract end to end; the test's purpose was never to work without the WebUI, it was
+to fail HERE when the WebUI renames a CTA — and it still does, wherever the WebUI
+exists.
+
+### Verification
+- Full-contract branch: host tree with the framework `webui/` present — contract
+  asserted (`['open-modal:', 'open-url:']`), OK.
+- Skip branch: a minimal bare-checkout layout with plugin sources only — plugin-side
+  assertions pass, live-contract half skipped with the note, OK.
+
 ## [1.8.52] - 2026-10-17
 
 Suite-hermeticity follow-up. Running the suite on a **live install** (the v1.8.51

@@ -13138,17 +13138,30 @@ def t_v1839_banner_cta_is_live() -> None:
         _fw = Path('/a0/webui/components/welcome/welcome-store.js')
         if _fw.is_file():
             welcome = _fw
-    assert welcome.is_file(), f'cannot verify the CTA contract: {welcome}'
-    js = welcome.read_text(encoding='utf-8')
-    implemented = []
-    for line in js.splitlines():
-        s = line.strip()
-        if s.startswith('if (action.startsWith('):
-            # Keep the trailing colon: it is part of the action prefix, and
-            # stripping it is what made this assertion miss a live contract.
-            implemented.append(s.split('"')[1])
-    assert 'open-modal:' in implemented, (
-        f'the WebUI no longer implements open-modal:; supported: {implemented}')
+    if welcome.is_file():
+        js = welcome.read_text(encoding='utf-8')
+        implemented = []
+        for line in js.splitlines():
+            s = line.strip()
+            if s.startswith('if (action.startsWith('):
+                # Keep the trailing colon: it is part of the action prefix, and
+                # stripping it is what made this assertion miss a live contract.
+                implemented.append(s.split('"')[1])
+        assert 'open-modal:' in implemented, (
+            f'the WebUI no longer implements open-modal:; supported: {implemented}')
+    else:
+        # v1.8.53: a bare checkout (the nested repo's own CI) contains the
+        # plugin but NOT the framework's webui/ tree, so the live-contract
+        # half cannot be verified there. Failing the whole suite for an
+        # environment fact was the same machine-dependency class as S2/M14,
+        # and it hid real regressions behind 4 uniform reds (run #51). The
+        # plugin-side assertions below stand on their own; every install and
+        # container run still verifies the contract end to end.
+        implemented = None
+        print('   SKIP live-contract half (host has no webui/ tree): '
+              'verify on an install or in the container')
+        _ok('plugin-side banner contract verified; WebUI source unavailable, '
+            'live-contract half skipped')
 
     sites = [
         'extensions/python/banners/_10_skillopt_status.py',
@@ -13171,7 +13184,8 @@ def t_v1839_banner_cta_is_live() -> None:
             f'{rel}: the modal path does not point at the settings page')
     target = PLUGIN_ROOT / 'webui' / 'config.html'
     assert target.is_file(), f'the CTA target does not exist: {target}'
-    _ok(f'both banners use an implemented action; supported: {implemented}')
+    if implemented is not None:
+        _ok(f'both banners use an implemented action; supported: {implemented}')
     print(' t_v1839_banner_cta_is_live: OK')
 
 
